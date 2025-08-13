@@ -51,7 +51,7 @@ unval _ = error "tried to unval a non-val"
 
 fixedPointIteration :: (Eq a, Show a) => (a -> a) -> a -> a
 fixedPointIteration f x = if fx == x then x else fixedPointIteration f fx
-  where fx = f x
+  where fx = traceShowId $ f x
 
 optimize :: CompilerConfig -> IRExpr -> IRExpr
 optimize conf = irMap (commonSubexprStage . applyConstStage . assiciativityStage . letInStage . constantDistrStage . simplifyStage . indexStage . distributeConditionals)
@@ -148,7 +148,8 @@ simplify (IRHead (IRCons a _)) = a
 simplify (IRTail (IRCons _ b)) = b
 simplify (IRTFst (IRTCons a _)) = a
 simplify (IRTSnd (IRTCons _ b)) = b
-simplify (IRTCons (IRLambda n a) (IRLambda m b)) | n == m = IRLambda n (IRTCons a b)
+simplify (IRHead (IRConst (VList (ListCont a _)))) = IRConst a
+simplify (IRTail (IRConst (VList (ListCont _ a)))) = IRConst (VList a)
 simplify x = x
 
 countUses :: String -> IRExpr -> Int
@@ -205,7 +206,6 @@ softForceLogic OpDiv left (IRConst (VFloat 0)) = error "tried to divide by zero 
 softForceLogic OpDiv (IRConst (VFloat 0)) _ = IRConst (VFloat 0)
 softForceLogic OpSub left (IRConst (VFloat 0)) = left
 softForceLogic OpSub left right | left == right = IRConst (VFloat 0)
-softForceLogic op left right = IROp op left right
 softForceLogic op left right = IROp op left right     -- Nothing can be done
 
 forceOp :: Operand -> IRValue -> IRValue -> IRValue
@@ -246,7 +246,7 @@ forceUnaryOp _ _ = error "Error during forceUnaryOp optimizer"
 --TODO
 
 forceAnyCheck :: IRExpr -> IRExpr
-forceAnyCheck x | isValue x = IRConst $ VBool (unval x == VAny)
+forceAnyCheck x | isValue x = IRConst $ VBool (unval x == VAny || unval x == VList AnyList)
 forceAnyCheck (IRCons _ _) = IRConst $ VBool False  -- Lists can never be any
 forceAnyCheck (IRTCons _ _) = IRConst $ VBool False -- Tuples can never be any
 forceAnyCheck (IRLeft _) = IRConst $ VBool False -- Eithers can never be any
