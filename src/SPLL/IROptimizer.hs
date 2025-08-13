@@ -51,7 +51,7 @@ unval _ = error "tried to unval a non-val"
 
 fixedPointIteration :: (Eq a, Show a) => (a -> a) -> a -> a
 fixedPointIteration f x = if fx == x then x else fixedPointIteration f fx
-  where fx = traceShowId $ f x
+  where fx = f x
 
 optimize :: CompilerConfig -> IRExpr -> IRExpr
 optimize conf = irMap (commonSubexprStage . applyConstStage . assiciativityStage . letInStage . constantDistrStage . simplifyStage . indexStage . distributeConditionals)
@@ -59,6 +59,7 @@ optimize conf = irMap (commonSubexprStage . applyConstStage . assiciativityStage
     oLvl = optimizerLevel conf
     commonSubexprStage = if False then optimizeCommonSubexpr else id -- Too buggy to use
     applyConstStage = if oLvl >= 2 then applyConstant else id
+    applyToLetInStage = if oLvl >= 2 then applyToLetIn else id
     assiciativityStage = if oLvl >= 2 then optimizeAssociativity else id
     letInStage = if oLvl >= 2 then optimizeLetIns else id
     constantDistrStage = if oLvl >= 2 then evalConstantDistr else id
@@ -95,6 +96,10 @@ distributeIf x = x
 applyConstant :: IRExpr -> IRExpr
 applyConstant (IRInvoke (IRApply (IRLambda varname inExpr) v@(IRConst _))) = replaceAll (IRVar varname) v inExpr
 applyConstant x = x
+
+applyToLetIn :: IRExpr -> IRExpr
+applyToLetIn (IRInvoke (IRApply (IRLambda varname inExpr) v)) | not (isValue v) = IRLetIn varname v inExpr
+applyToLetIn x = x
 
 optimizeAssociativity :: IRExpr -> IRExpr
 -- Associative Addition
