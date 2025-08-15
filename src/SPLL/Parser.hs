@@ -57,7 +57,7 @@ symbol :: String -> Parser String
 symbol = L.symbol sc
 
 reserved :: [String]
-reserved = ["if", "then", "else", "let", "in", "theta", "subtree", "ThetaTree", "Left", "Right"]
+reserved = ["if", "then", "else", "let", "in", "theta", "subtree", "error", "ThetaTree", "Left", "Right"]
 
 keyword :: String -> Parser String
 keyword = L.symbol sc
@@ -117,16 +117,20 @@ letInDestructor (InjF _ "left" [x]) = do
 letInDestructor (InjF _ "right" [x]) = do
   x' <- letInDestructor x
   return $ \v -> x' (sfromRight v)
-letInDestructor (Null _) = return $ \v b -> b -- FIXME Should test whether v is an empty list here
+letInDestructor (Null _) = return $ \v b -> ifThenElse (isNull v) b (Error makeTypeInfo "RHS of letin is longer than LHS")
 letInDestructor (Cons _ x xs) = do
   x' <- letInDestructor x
   xs' <- letInDestructor xs
   return $ \v body -> x' (lhead v) (xs' (ltail v) body)
 letInDestructor _ = fail "LHS of a letIn sould be an identifier or a complex type of identifiers"
 
-
---parens :: Parser a -> Parser a
---parens = between (symbol "(") (symbol ")")
+pError :: Parser Expr
+pError = do
+  keyword "error"
+  char '"'
+  message <- many (noneOf "\"")
+  char '"'
+  return (Error makeTypeInfo message)
 
 pMaybeApply :: Parser Expr
 pMaybeApply = choice [parens pExpr, pVar]
@@ -493,7 +497,8 @@ keywordExpr = dbg "keywordExpr" $ choice [
     pLetIn,
     pLambda,
     pTheta,
-    pSubtree
+    pSubtree,
+    pError
   ] <* sc
 
 -- | Lambda expressions
