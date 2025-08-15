@@ -129,48 +129,42 @@ toIRProbability conf typeEnv (IfThenElse t cond left right) sample = do
   
   -- p(y) = if p_cond < thresh then p_else(y) * (1-p_cond(y)) else if p_cond > 1 - thresh then p_then(y) * p_cond(y) else p_then(y) * p_cond(y) + p_else(y) * (1-p_cond(y))
   let thr = topKThreshold conf
+
+  -- We need to restart the monad stack, because variables inside the branches may not be valid outside
+  -- E.g. if length(a) > 0 then a[0] else ...
+  -- If we were to access a[0] outside of the branch we would error
+  ((mul1Raw, leftBranches), binds1) <- lift (runWriterT (do
+    (leftExpr, leftDim, branches) <- toIRProbability conf typeEnv left sample
+    (IRVar var_condT_p, condTrueDim) `multP` (leftExpr, leftDim) <&> (\x -> (x, branches)))) -- We need the branches outside of this scope. Append it to the tuple
+  let mul1 = bimap (generateLetInExpr binds1) (generateLetInExpr binds1) mul1Raw
+  ((mul2Raw, rightBranches), binds2) <- lift (runWriterT (do
+    (rightExpr, rightDim, branches) <- toIRProbability conf typeEnv right sample
+    (IRVar var_condF_p, condFalseDim) `multP` (rightExpr, rightDim) <&> (\x -> (x, branches)))) -- We need the branches outside of this scope. Append it to the tuple
+  let mul2 = bimap (generateLetInExpr binds2) (generateLetInExpr binds2) mul2Raw
+  -- If probability of this branch is 0 then set the product to 0 manually. This branch could throw an error multiplied by 0
+  let zeroCheck c = IRIf (IROp OpApprox c const0) const0
+  let mul1Zeroed = bimap (zeroCheck condTrueExpr) (zeroCheck condTrueExpr) mul1
+  let mul2Zeroed = bimap (zeroCheck condFalseExpr) (zeroCheck condFalseExpr) mul2
+  (addExpr, addDim) <- mul1Zeroed `addP` mul2Zeroed
+  let branches = (IROp OpPlus condTrueBranches ((IROp OpPlus leftBranches rightBranches)))
   case thr of
     Just thresh -> do
-      (leftExpr, leftDim, leftBranches) <- toIRProbability conf typeEnv left sample
-      (rightExpr, rightDim, rightBranches) <- toIRProbability conf typeEnv right sample
-      mul1 <- (condTrueExpr, condTrueDim) `multP` (leftExpr, leftDim)
-      mul2 <- (condFalseExpr, condFalseDim) `multP` (rightExpr, rightDim)
-      add <- mul1 `addP` mul2
       let returnExpr = IRIf
             (IROp OpLessThan (IRVar var_condT_p) (IRConst (VFloat thresh)))
             -- If probability of this branch is 0 then set the product to 0 manually. This branch could throw an error multiplied by 0
             (IRIf (IROp OpApprox condFalseExpr const0) const0 (fst mul2))
             (IRIf (IROp OpGreaterThan (IRVar var_condT_p) (IRConst (VFloat (1-thresh))))
               (IRIf (IROp OpApprox condTrueExpr const0) const0 (fst mul1))
-              (fst add))
+              addExpr)
       let returnDim = IRIf
             (IROp OpLessThan (IRVar var_condT_p) (IRConst (VFloat thresh)))
             (IRIf (IROp OpApprox condFalseExpr const0) const0 (snd mul2))
             (IRIf (IROp OpGreaterThan (IRVar var_condT_p) (IRConst (VFloat (1-thresh))))
               (IRIf (IROp OpApprox condTrueExpr const0) const0 (snd mul1))
-              (snd add))
-      let branches = (IROp OpPlus condTrueBranches ((IROp OpPlus leftBranches rightBranches)))
-      tell [(var_condT_p, condTrueExpr), (var_condF_p, condFalseExpr)]
+              addDim)
       return (returnExpr, returnDim, branches)
     -- p(y) = p_then(y) * p_cond(y) + p_else(y) * (1-p_cond(y))
     Nothing -> do
-      -- We need to restart the monad stack, because variables inside the branches may not be valid outside
-      -- E.g. if length(a) > 0 then a[0] else ...
-      -- If we were to access a[0] outside of the branch we would error
-      (mul1Raw, binds1) <- lift (runWriterT (do
-        (leftExpr, leftDim, leftBranches) <- toIRProbability conf typeEnv left sample
-        (IRVar var_condT_p, condTrueDim) `multP` (leftExpr, leftDim)))
-      let mul1 = bimap (generateLetInExpr binds1) (generateLetInExpr binds1) mul1Raw
-      (mul2Raw, binds2) <- lift (runWriterT (do
-        (rightExpr, rightDim, rightBranches) <- toIRProbability conf typeEnv right sample
-        (IRVar var_condF_p, condFalseDim) `multP` (rightExpr, rightDim)))
-      let mul2 = bimap (generateLetInExpr binds2) (generateLetInExpr binds2) mul2Raw
-      -- If probability of this branch is 0 then set the product to 0 manually. This branch could throw an error multiplied by 0
-      let zeroCheck c = IRIf (IROp OpApprox c const0) const0
-      let mul1Zeroed = bimap (zeroCheck condTrueExpr) (zeroCheck condTrueExpr) mul1
-      let mul2Zeroed = bimap (zeroCheck condFalseExpr) (zeroCheck condFalseExpr) mul2
-      (addExpr, addDim) <- mul1Zeroed `addP` mul2Zeroed
-      let branches = (IROp OpPlus condTrueBranches ((IROp OpPlus const0 const0)))
       return (addExpr, addDim, branches)
 toIRProbability conf typeEnv (GreaterThan (TypeInfo {rType = t, tags = extras}) left right) sample
   | extras `hasAlgorithm` "greaterThanLeft" = do --p(x | const >= var)
