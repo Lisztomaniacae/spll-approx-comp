@@ -100,29 +100,30 @@ pLetIn = do
   definition <- pExpr
   symbol "in"
   scope <- pExpr
-  destr <- letInDestructor lhs
+  destr <- letInDestructor 0 lhs
   return $ destr definition scope
 
 -- Parses the identifier part of the letIn and constructs a accessors for letIns
 -- Return type is a \v, b -> Let n = v in b
-letInDestructor :: Expr -> Parser (Expr -> Expr -> Expr)
-letInDestructor (Var _ n) = return $ \e -> letIn n e
-letInDestructor (TCons _ a b) = do
-  a' <- letInDestructor a
-  b' <- letInDestructor b
+letInDestructor :: Int -> Expr -> Parser (Expr -> Expr -> Expr)
+letInDestructor n (Var _ name) = return $ letIn name
+letInDestructor n (TCons _ a b) = do
+  a' <- letInDestructor n a
+  b' <- letInDestructor n b
   return $ \v body -> a' (tfst v) (b' (tsnd v) body)
-letInDestructor (InjF _ "left" [x]) = do
-  x' <- letInDestructor x
+letInDestructor n (InjF _ "left" [x]) = do
+  x' <- letInDestructor n x
   return $ \v -> x' (sfromLeft v)
-letInDestructor (InjF _ "right" [x]) = do
-  x' <- letInDestructor x
+letInDestructor n (InjF _ "right" [x]) = do
+  x' <- letInDestructor n x
   return $ \v -> x' (sfromRight v)
-letInDestructor (Null _) = return $ \v b -> ifThenElse (isNull v) b (Error makeTypeInfo "RHS of letin is longer than LHS")
-letInDestructor (Cons _ x xs) = do
-  x' <- letInDestructor x
-  xs' <- letInDestructor xs
-  return $ \v body -> x' (lhead v) (xs' (ltail v) body)
-letInDestructor _ = fail "LHS of a letIn sould be an identifier or a complex type of identifiers"
+letInDestructor n (Null _) = return $ \v b -> ifThenElse (isNull v) b (Error makeTypeInfo "RHS of letin is longer than LHS")
+letInDestructor n (Cons _ x xs) = do
+  x' <- letInDestructor n x
+  xs' <- letInDestructor (n + 1) xs
+  let varName = "p_" ++ show n
+  return $ \v body -> letIn varName v (x' (lhead (var varName)) (xs' (ltail (var varName)) body))
+letInDestructor _ _ = fail "LHS of a letIn sould be an identifier or a complex type of identifiers"
 
 pError :: Parser Expr
 pError = do

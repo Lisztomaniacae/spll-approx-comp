@@ -65,7 +65,7 @@ generateLetInBlock :: CompilerConfig -> (CompilationResult, [(String, IRExpr)]) 
 generateLetInBlock conf codeGen =
   case m of
     (IRLambda _ _) -> (foldr (\(var, val) expr  -> IRLetIn var val expr) m binds) --Dont make tuple out of lambdas, as the snd (and thr) element don't contain information anyway
-    _ -> if countBranches conf && not (isLambda m) then
+    _ -> if countBranches conf && not (isLambda m) then do
             generateLetInExpr binds (IRTCons m (IRTCons dim bc))
           else
             generateLetInExpr binds (IRTCons m dim)
@@ -239,16 +239,28 @@ toIRProbability conf typeEnv (Lambda t name subExpr) sample = do
       let newTypeEnv = (name, (paramRType, False)):typeEnv
       irTuple <- lift (runWriterT (toIRProbability conf newTypeEnv subExpr sample)) <&> generateLetInBlock conf
       return (IRLambda name irTuple, const0, const0)
-toIRProbability conf typeEnv (Apply TypeInfo{rType=rt} l v) sample = do
+toIRProbability conf typeEnv (Apply TypeInfo{rType=rt} l v) sample | pType (getTypeInfo l) == Deterministic && pType (getTypeInfo v) == Deterministic = do
+  vIR <- toIRGenerate typeEnv v
+  lIR <- toIRGenerate typeEnv l -- Dim and BC are irrelevant here
+  -- The result is not a tuple if the return value is a closure
+  case rt of
+    TArrow _ _ -> return (IRApply lIR vIR, const0, const0)
+    _ -> do
+      retExpr <- indicator (IROp OpEq (IRInvoke (IRApply lIR vIR)) sample)
+      return (retExpr, const0, const0)
+toIRProbability conf typeEnv (Apply TypeInfo{rType=rt} l v) sample | pType (getTypeInfo v) == Deterministic = do
   vIR <- toIRGenerate typeEnv v
   (lIR, _, _) <- toIRProbability conf typeEnv l sample -- Dim and BC are irrelevant here. We need to extract these from the return tuple
   -- The result is not a tuple if the return value is a closure
   case rt of
     TArrow _ _ -> return (IRApply lIR vIR, const0, const0)
-    _ -> if countBranches conf then
-           return (IRTFst (IRInvoke (IRApply lIR vIR)), IRTFst (IRTSnd (IRInvoke (IRApply lIR vIR))), IRTSnd (IRTSnd (IRInvoke (IRApply lIR vIR))))
-         else
-           return (IRTFst (IRInvoke (IRApply lIR vIR)), IRTSnd (IRInvoke (IRApply lIR vIR)), const0)
+    _ -> do
+      retVal <- mkVariable "call"
+      tell [(retVal, IRInvoke (IRApply lIR vIR))]
+      if countBranches conf then
+        return (IRTFst (IRVar retVal), IRTFst (IRTSnd (IRVar retVal)), IRTSnd (IRTSnd (IRVar retVal)))
+      else
+        return (IRTFst (IRVar retVal), IRTSnd (IRVar retVal), const0)
 toIRProbability conf typeEnv (Cons _ hdExpr tlExpr) sample = do
   headTuple <- lift (runWriterT (toIRProbabilitySave conf typeEnv hdExpr (IRHead sample))) <&> generateLetInBlock conf
   tailTuple <- lift (runWriterT (toIRProbabilitySave conf typeEnv tlExpr (IRTail sample))) <&> generateLetInBlock conf

@@ -118,7 +118,7 @@ generateExpression (IRUnaryOp op expr) = juliaUnaryOps op ++ "(" ++ generateExpr
 generateExpression (IRTheta expr i) = "(" ++ generateExpression expr ++ ")[1][" ++ show (i + 1) ++ "]"
 generateExpression (IRSubtree expr i) = "(" ++ generateExpression expr ++ ")[2][" ++ show (i + 1) ++ "]"
 generateExpression (IRConst v) = juliaVal v
-generateExpression (IRCons hd tl) = "hcat(" ++ generateExpression hd ++ ", " ++ generateExpression tl ++ ")"
+generateExpression (IRCons hd tl) = "prepend(" ++ generateExpression hd ++ ", " ++ generateExpression tl ++ ")"
 generateExpression (IRElementOf el lst) = "(" ++ generateExpression el ++ " in " ++ generateExpression lst ++ ")"
 generateExpression (IRTCons fs sn) = "T(" ++ generateExpression fs ++ ", " ++ generateExpression sn ++ ")"
 generateExpression (IRHead x) = "head(" ++ generateExpression x ++ ")"
@@ -144,6 +144,7 @@ generateExpression (IREnumSum name enumRange expr) = "sum(map((" ++ name ++ " ->
 generateExpression (IREvalNN name arg) = name ++ "(" ++ generateExpression arg ++ ")"
 generateExpression (IRIndex lst idx) = "(" ++ generateExpression lst ++ ")[" ++ generateExpression idx ++ " + 1]"
 generateExpression (IRLetIn name val body) = "(let " ++ name ++ " = " ++ generateExpression val ++ "; " ++ generateExpression body ++ "end)"
+generateExpression (IRError e) = "throw(\"" ++ e ++ "\")"
 
 generateExpression x = error ("Unknown expression in Julia codegen: " ++ show x)
 

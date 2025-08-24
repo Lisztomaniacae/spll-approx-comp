@@ -153,8 +153,8 @@ simplify (IRHead (IRCons a _)) = a
 simplify (IRTail (IRCons _ b)) = b
 simplify (IRTFst (IRTCons a _)) = a
 simplify (IRTSnd (IRTCons _ b)) = b
-simplify (IRHead (IRConst (VList (ListCont a _)))) = IRConst a
-simplify (IRTail (IRConst (VList (ListCont _ a)))) = IRConst (VList a)
+--simplify (IRHead (IRConst (VList (ListCont a _)))) = IRConst a
+--simplify (IRTail (IRConst (VList (ListCont _ a)))) = IRConst (VList a)
 simplify x = x
 
 countUses :: String -> IRExpr -> Int
@@ -187,6 +187,7 @@ softForceLogic OpAnd left (IRConst (VBool True)) = left
 softForceLogic OpAnd (IRConst (VBool False)) _ = IRConst (VBool False)
 softForceLogic OpAnd _ (IRConst (VBool False)) = IRConst (VBool False)
 softForceLogic OpEq (IRCons _ _) (IRConst (VList EmptyList)) = IRConst $ VBool False
+softForceLogic OpEq (IRConst (VList EmptyList)) (IRCons _ _)  = IRConst $ VBool False
 -- integer arithmetic:
 softForceLogic OpPlus (IRConst (VInt 0)) right = right
 softForceLogic OpPlus left (IRConst (VInt 0)) = left
@@ -214,7 +215,14 @@ softForceLogic OpSub left right | left == right = IRConst (VFloat 0)
 softForceLogic op left right = IROp op left right     -- Nothing can be done
 
 forceOp :: Operand -> IRValue -> IRValue -> IRValue
-forceOp OpEq x y = VBool (x == y)
+forceOp OpEq (VList AnyList) (VList _) = VBool True
+forceOp OpEq (VList _) (VList AnyList) = VBool True
+forceOp OpEq (VList EmptyList) (VList EmptyList) = VBool True
+forceOp OpEq (VList (ListCont VAny _)) (VList (ListCont _ _)) = VBool True
+forceOp OpEq (VList (ListCont _ _)) (VList (ListCont VAny _)) = VBool True
+forceOp OpEq (VList (ListCont a as)) (VList (ListCont b bs)) = forceOp OpEq (VList as) (VList bs)
+forceOp OpEq (VList _) (VList _) = VBool False
+forceOp OpEq a b = VBool $ a == b
 forceOp OpApprox (VFloat x) (VFloat y) = VBool $ abs (x - y) <= floatApproxEqThresh
 forceOp OpMult (VInt x) (VInt y) = VInt (x*y)
 forceOp OpMult (VFloat x) (VFloat y) = VFloat (x*y)

@@ -140,22 +140,30 @@ generate f neurals globalEnv env [] (IROp OpAnd a b) = do
     --(_, VAny) -> return VAny
     _ -> error ("Type error: Or can only evaluate on two booleans: " ++ show (aVal, bVal))
 generate f neurals globalEnv env [] (IROp OpEq a b) = do
-  aVal <- generate f neurals globalEnv env [] a
-  bVal <- generate f neurals globalEnv env [] b
-  case (aVal, bVal) of
-    (VBool af, VBool bf) -> return $ VBool (af == bf)
-    (VFloat af, VFloat bf) -> return $ VBool (af == bf)
-    (VInt af, VInt bf) -> return $ VBool (af == bf)
-    (VList af, VList bf) -> return $ VBool (af == bf)
-    (VTuple af1 af2, VTuple bf1 bf2) -> 
-      let eqAny VAny _ = True
-          eqAny _ VAny = True
-          eqAny a b = a == b in
-            return $ VBool (eqAny af1 bf1 && eqAny af2 bf2)
-    -- Any is not equal to anything
-    (VAny, b) -> return $ VBool False
-    (a, VAny) -> return $ VBool False
-    _ -> error ("Type error: Equals can only evaluate on two values: " ++ show (aVal, bVal))
+  aVal' <- generate f neurals globalEnv env [] a
+  bVal' <- generate f neurals globalEnv env [] b
+  let cmp aVal bVal = case (aVal, bVal) of
+        (VBool af, VBool bf) -> af == bf
+        (VFloat af, VFloat bf) -> af == bf
+        (VInt af, VInt bf) -> af == bf
+        (VList AnyList, VList _) -> True
+        (VList _, VList AnyList) -> True
+        (VList EmptyList, VList EmptyList) -> True
+        (VList (ListCont VAny as), VList (ListCont _ bs)) -> cmp (VList as) (VList bs)
+        (VList (ListCont _ as), VList (ListCont VAny bs)) -> cmp (VList as) (VList bs)
+        (VList (ListCont a as), VList (ListCont b bs)) -> cmp a b && cmp (VList as) (VList bs)
+        (VList _, VList _) -> False
+        (VTuple af1 af2, VTuple bf1 bf2) ->
+          let eqAny VAny _ = True
+              eqAny _ VAny = True
+              eqAny a b = a == b in
+                (eqAny af1 bf1 && eqAny af2 bf2)
+        (VEither af, VEither bf) -> af == bf
+        -- Any is not equal to anything
+        (VAny, b) -> False
+        (a, VAny) -> False
+        _ -> error ("Type error: Equals can only evaluate on two values: " ++ show (aVal, bVal))
+  return $ VBool (cmp aVal' bVal')
 generate f neurals globalEnv env [] (IROp OpApprox a b) = do
   aVal <- generate f neurals globalEnv env [] a
   bVal <- generate f neurals globalEnv env [] b
@@ -323,7 +331,7 @@ generate f neurals globalEnv env args (IRVar name) | "_mock" `isSuffixOf` name &
       return $ evaluateMockNN partPlan symVal
 generate f neurals globalEnv env args (IRVar name) =
   case lookup name env of
-    Just expr -> generate f neurals globalEnv env args expr
+    Just expr -> generate f neurals globalEnv env args expr -- <&> \x -> trace (name ++ " " ++ show x) x
     Nothing -> error ("Variable " ++ name ++ " not declared")
 generate f neurals globalEnv env [] (IREnumSum varname (VList values) expr) = do    --TODO Untested
   foldrM (\(VInt i) acc -> do
