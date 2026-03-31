@@ -1,0 +1,52 @@
+seed: 42
+
+paths:
+  data_root: ./data
+  outputs_root: ./outputs
+  repo_root: ../haskell-dppl-main
+  model_output: ./outputs/models/mnist.pt
+  split_manifest: ./outputs/models/mnist_splits.pt
+  training_metrics_csv: ./outputs/training/training_metrics.csv
+  used_config_copy: ./outputs/config_used.yaml
+
+training:
+  device: auto
+  require_mps: true
+  train_ratio: 0.7
+  test_ratio: 0.2
+  inference_ratio: 0.1
+  accuracy_threshold: 0.95
+  batch_size: 128
+  eval_batch_size: 256
+  num_workers: 0
+  epochs: 8
+  learning_rate: 0.001
+  weight_decay: 0.0
+  normalize:
+    mean: 0.1307
+    std: 0.3081
+  model:
+    input_channels: 1
+    num_classes: 10
+    conv_channels: [32, 64]
+    kernel_size: 3
+    pool_kernel: 2
+    fc_hidden: 128
+    dropout: 0.25
+
+inference:
+  device: auto
+  num_experiments: 200
+  terms_per_sum_min: 1
+  terms_per_sum_max: 5
+  sample_without_replacement_within_experiment: true
+  top_predictions_to_store: 5
+  # In this repo, -k/--topKCutoff is a probability cutoff in [0, 1], not a literal class count.
+  # Use null for exact inference (no pruning).
+  approximation_thresholds: [null, 0.0001, 0.001, 0.01, 0.05, 0.1]
+  force_recompile: false
+  compile_timeout_sec: 600
+  stack_arch: x86_64
+  show_progress: true
+  show_inner_progress: false
+  visualize: true

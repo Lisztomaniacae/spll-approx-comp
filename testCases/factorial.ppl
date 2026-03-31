@@ -1,2 +1,0 @@
-factorial x = if x < 1.5 then 1.0 else factorial (x+(-1.0)) * x
-main x = factorial x
