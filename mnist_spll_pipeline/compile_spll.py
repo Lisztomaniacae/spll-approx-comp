@@ -31,6 +31,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
     stack_arch = ctx.inference_cfg.get("stack_arch")
     if stack_arch is not None:
         stack_arch = str(stack_arch)
+    count_branches = bool(ctx.inference_cfg.get("count_branches", True))
 
     stage_message(1, 2, "Preparing SPLL source programs for configured term counts")
     ensure_programs_for_term_counts(ctx.paths.program_root, term_counts)
@@ -62,6 +63,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
                 force_recompile=force_recompile,
                 timeout_sec=timeout_sec,
                 stack_arch=stack_arch,
+                count_branches=count_branches,
             )
             compile_targets.append(
                 {
@@ -71,6 +73,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
                     "spll_path": str(spll_path),
                     "compiled_program_path": str(compiled_py_path),
                     "python_lib_path": str(compiled_py_path.parent / "pythonLib.py"),
+                    "count_branches": count_branches,
                     "exists": compiled_py_path.exists(),
                 }
             )
@@ -86,6 +89,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
                 "stack_arch": stack_arch,
                 "force_recompile": force_recompile,
                 "compile_timeout_sec": timeout_sec,
+                "count_branches": count_branches,
                 "term_counts": term_counts,
                 "thresholds": thresholds,
                 "paths": ctx.paths.to_json_dict(),

@@ -73,7 +73,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
             )
             started_at = utc_now_iso()
             started = time.perf_counter()
-            posterior_raw = posterior_for_experiment(
+            posterior_trace = posterior_for_experiment(
                 module,
                 image_paths,
                 max_sum=max_sum,
@@ -95,7 +95,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "cutoff": cutoff,
                     "threshold_label": label,
                     "candidate_sums": list(range(max_sum + 1)),
-                    "posterior_raw": [float(value) for value in posterior_raw],
+                    "posterior_raw": [float(value) for value in posterior_trace["posterior_raw"]],
+                    "branch_counts_raw": [None if value is None else int(value) for value in posterior_trace["branch_counts_raw"]],
                     "runtime_sec": float(runtime_sec),
                     "started_at_utc": started_at,
                     "finished_at_utc": finished_at,
@@ -129,6 +130,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "thresholds": thresholds,
                     "num_runs": len(raw_runs),
                     "show_inner_progress": show_inner_progress,
+                    "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "paths": ctx.paths.to_json_dict(),
                 },
             ),
@@ -147,6 +149,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "device": str(device),
                     "thresholds": thresholds,
                     "num_runs": len(raw_runs),
+                    "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "paths": ctx.paths.to_json_dict(),
                 },
             ),

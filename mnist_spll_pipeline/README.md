@@ -33,7 +33,7 @@ Use explicit interpreter paths. Do **not** rely on a shell alias like `python ->
 
 Recommended rule:
 
-- native arm64 stages: use `python3` or the arm venv interpreter explicitly
+- native arm64 stages: use the arm venv interpreter explicitly
 - Rosetta/x86_64 compile: use the x86 venv interpreter explicitly
 
 Examples in this README therefore use:
@@ -159,6 +159,7 @@ This does **not** compute summary metrics yet. It writes broad raw run records t
 - true labels and true sums
 - candidate sums
 - raw posterior values for every candidate
+- raw branch counts for every candidate sum
 - runtime per run
 - compiled program path used for the run
 
@@ -235,6 +236,8 @@ inference:
 - The compile stage expects `stack` to be available on the shell `PATH`.
 - The infer stage does not need Stack, but it will fail if the compiled outputs are missing.
 - The default `terms_per_sum_max` should stay conservative because exact inference gets expensive fast.
+- Branch counts are only available if the SPLL targets were compiled with branch counting enabled.
+- If you turn branch counting on after compiling, you must re-run the compile stage so the generated `program.py` files expose that data.
 
 ## Fast fix for your current compile error
 

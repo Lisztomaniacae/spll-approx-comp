@@ -150,13 +150,14 @@ def ensure_programs_for_term_counts(program_root: Path, term_counts: Sequence[in
 
 
 def compile_spll_program(
-    repo_root: Path,
-    spll_path: Path,
-    output_py_path: Path,
-    cutoff: Optional[float],
-    force_recompile: bool,
-    timeout_sec: int,
-    stack_arch: Optional[str] = None,
+        repo_root: Path,
+        spll_path: Path,
+        output_py_path: Path,
+        cutoff: Optional[float],
+        force_recompile: bool,
+        timeout_sec: int,
+        stack_arch: Optional[str] = None,
+        count_branches: bool = False,
 ) -> None:
     ensure_dir(output_py_path.parent)
     python_lib_src = repo_root / "pythonLib.py"
@@ -174,6 +175,8 @@ def compile_spll_program(
     if stack_arch:
         args += ["--arch", stack_arch]
     args += ["run", "--", "-i", str(spll_path)]
+    if count_branches:
+        args += ["-c"]
     if cutoff is not None:
         args += ["-k", str(cutoff)]
     args += ["compile", "-o", str(output_py_path), "-l", "python"]
@@ -213,18 +216,74 @@ def save_raw_image(image, destination: Path) -> None:
     image.save(destination)
 
 
-def extract_probability(return_value: Any) -> float:
-    if isinstance(return_value, (int, float)):
-        return float(return_value)
+def _get_tuple_item(value: Any, index: int) -> Any:
     try:
-        first = return_value[0]
-        if isinstance(first, (int, float)):
-            return float(first)
+        return value[index]
     except Exception:
         pass
-    if hasattr(return_value, "t1") and isinstance(return_value.t1, (int, float)):
-        return float(return_value.t1)
+    attr_name = "t1" if index == 0 else "t2"
+    if hasattr(value, attr_name):
+        return getattr(value, attr_name)
+    raise TypeError(f"Value does not expose tuple-like index {index}: {value!r}")
+
+
+
+def _to_python_scalar(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if hasattr(value, "item"):
+        try:
+            item = value.item()
+            if isinstance(item, bool):
+                return float(int(item))
+            if isinstance(item, (int, float)):
+                return float(item)
+        except Exception:
+            pass
+    return None
+
+
+
+def extract_probability(return_value: Any) -> float:
+    scalar = _to_python_scalar(return_value)
+    if scalar is not None:
+        return float(scalar)
+
+    try:
+        probability = _get_tuple_item(return_value, 0)
+    except TypeError as exc:
+        raise TypeError(
+            f"Could not extract probability from compiled SPLL return value: {return_value!r}"
+        ) from exc
+
+    scalar = _to_python_scalar(probability)
+    if scalar is not None:
+        return float(scalar)
+
     raise TypeError(f"Could not extract probability from compiled SPLL return value: {return_value!r}")
+
+
+
+def extract_branch_count(return_value: Any) -> Optional[int]:
+    """
+    Compiled SPLL probability calls with branch counting enabled return values shaped like:
+        T(probability, T(0.0, branch_count))
+
+    The branch count is therefore the nested second component: result[1][1] / result.t2.t2.
+    """
+    try:
+        metadata = _get_tuple_item(return_value, 1)
+        branch_count_value = _get_tuple_item(metadata, 1)
+    except TypeError:
+        return None
+
+    scalar = _to_python_scalar(branch_count_value)
+    if scalar is None:
+        raise TypeError(f"Could not extract branch count from compiled SPLL return value: {return_value!r}")
+
+    return int(round(float(scalar)))
 
 
 def build_read_mnist(model_path: Path, device: torch.device, config_path: Path):
@@ -248,16 +307,16 @@ def build_read_mnist(model_path: Path, device: torch.device, config_path: Path):
 
 
 def sample_experiments(
-    raw_dataset: ConcatDataset,
-    inference_indices: Sequence[int],
-    num_experiments: int,
-    terms_min: int,
-    terms_max: int,
-    without_replacement_within_experiment: bool,
-    rng,
-    inputs_root: Path,
-    *,
-    show_progress: bool,
+        raw_dataset: ConcatDataset,
+        inference_indices: Sequence[int],
+        num_experiments: int,
+        terms_min: int,
+        terms_max: int,
+        without_replacement_within_experiment: bool,
+        rng,
+        inputs_root: Path,
+        *,
+        show_progress: bool,
 ) -> List[Dict[str, Any]]:
     experiments: List[Dict[str, Any]] = []
     ensure_dir(inputs_root)
@@ -311,20 +370,25 @@ def sample_experiments(
 
 
 def posterior_for_experiment(
-    module,
-    image_paths: Sequence[str],
-    max_sum: int,
-    *,
-    progress_bar: Optional[TerminalProgressBar] = None,
-    progress_prefix: str = "",
-) -> List[float]:
+        module,
+        image_paths: Sequence[str],
+        max_sum: int,
+        *,
+        progress_bar: Optional[TerminalProgressBar] = None,
+        progress_prefix: str = "",
+) -> Dict[str, List[Optional[float]]]:
     posterior: List[float] = []
+    branch_counts: List[Optional[int]] = []
     for candidate in range(max_sum + 1):
         result = module.main.forward(candidate, *image_paths)
         posterior.append(extract_probability(result))
+        branch_counts.append(extract_branch_count(result))
         if progress_bar is not None:
             progress_bar.update(postfix=f"{progress_prefix} sum={candidate}")
-    return posterior
+    return {
+        "posterior_raw": posterior,
+        "branch_counts_raw": branch_counts,
+    }
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -361,12 +425,12 @@ def verify_compiled_artifacts(paths: PipelinePaths, experiments: List[Dict[str, 
 
 
 def build_compiled_module_loader(
-    paths: PipelinePaths,
-    thresholds: Sequence[Optional[float]],
-    experiments: List[Dict[str, Any]],
-    read_mnist,
-    *,
-    show_progress: bool,
+        paths: PipelinePaths,
+        thresholds: Sequence[Optional[float]],
+        experiments: List[Dict[str, Any]],
+        read_mnist,
+        *,
+        show_progress: bool,
 ):
     verify_compiled_artifacts(paths, experiments, thresholds)
 

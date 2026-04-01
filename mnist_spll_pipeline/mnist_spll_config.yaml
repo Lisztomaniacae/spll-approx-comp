@@ -36,15 +36,17 @@ training:
 
 inference:
   device: auto
-  num_experiments: 75
-  terms_per_sum_min: 5
+  num_experiments: 25
+  terms_per_sum_min: 1
   terms_per_sum_max: 5
   sample_without_replacement_within_experiment: true
   top_predictions_to_store: 5
   # In this repo, -k/--topKCutoff is a probability cutoff in [0, 1], not a literal class count.
   # Use null for exact inference (no pruning).
   approximation_thresholds: [null, 0.0001, 0.001, 0.01, 0.05, 0.1]
-  force_recompile: false
+  # Compile with SPLL's -c/--countBranches so each posterior query also returns a branch count.
+  count_branches: true
+  force_recompile: true
   compile_timeout_sec: 600
   stack_arch: x86_64
   show_progress: true
