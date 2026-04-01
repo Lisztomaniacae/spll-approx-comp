@@ -3,19 +3,18 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, random_split
 
 from mnist_spll_common import (
     build_model,
     checkpoint_payload,
     compute_split_lengths,
-    default_rng,
     ensure_dir,
     load_config,
     load_full_mnist_transformed,
@@ -71,12 +70,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: Adam, devic
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a configurable MNIST CNN for the SPLL pipeline.")
-    parser.add_argument("--config", required=True, help="Path to the shared YAML config.")
-    args = parser.parse_args()
-
-    config = load_config(args.config)
+def run_training(config: Dict[str, Any]) -> None:
     set_seed(int(config.get("seed", 42)))
 
     training_cfg = config["training"]
@@ -195,6 +189,15 @@ def main() -> None:
     print(
         f"Success: best test accuracy {best_test_accuracy:.4%} at epoch {best_epoch} exceeded the threshold {threshold:.4%}."
     )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a configurable MNIST CNN for the SPLL pipeline.")
+    parser.add_argument("--config", required=True, help="Path to the shared YAML config.")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    run_training(config)
 
 
 if __name__ == "__main__":

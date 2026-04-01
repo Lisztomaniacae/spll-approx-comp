@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import ConcatDataset
-from torchvision import datasets, transforms
 import yaml
 
 
@@ -187,7 +186,9 @@ def resolve_device(device_name: str = "auto", require_mps: bool = False) -> torc
     raise ValueError(f"Unsupported device setting: {device_name}")
 
 
-def build_train_transform(config: Dict[str, Any]) -> transforms.Compose:
+def build_train_transform(config: Dict[str, Any]):
+    from torchvision import transforms
+
     normalize_cfg = config["training"].get("normalize", {"mean": 0.1307, "std": 0.3081})
     return transforms.Compose(
         [
@@ -197,11 +198,13 @@ def build_train_transform(config: Dict[str, Any]) -> transforms.Compose:
     )
 
 
-def build_eval_transform(config: Dict[str, Any]) -> transforms.Compose:
+def build_eval_transform(config: Dict[str, Any]):
     return build_train_transform(config)
 
 
 def load_full_mnist_transformed(config: Dict[str, Any], train: bool = True) -> ConcatDataset:
+    from torchvision import datasets
+
     data_root = resolve_path(config, config["paths"]["data_root"])
     transform = build_train_transform(config) if train else build_eval_transform(config)
     ds_train = datasets.MNIST(root=str(data_root), train=True, download=True, transform=transform)
@@ -210,6 +213,8 @@ def load_full_mnist_transformed(config: Dict[str, Any], train: bool = True) -> C
 
 
 def load_full_mnist_raw(config: Dict[str, Any]) -> ConcatDataset:
+    from torchvision import datasets
+
     data_root = resolve_path(config, config["paths"]["data_root"])
     ds_train = datasets.MNIST(root=str(data_root), train=True, download=True, transform=None)
     ds_test = datasets.MNIST(root=str(data_root), train=False, download=True, transform=None)

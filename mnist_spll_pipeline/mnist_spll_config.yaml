@@ -36,8 +36,8 @@ training:
 
 inference:
   device: auto
-  num_experiments: 200
-  terms_per_sum_min: 1
+  num_experiments: 75
+  terms_per_sum_min: 5
   terms_per_sum_max: 5
   sample_without_replacement_within_experiment: true
   top_predictions_to_store: 5
@@ -49,4 +49,3 @@ inference:
   stack_arch: x86_64
   show_progress: true
   show_inner_progress: false
-  visualize: true
