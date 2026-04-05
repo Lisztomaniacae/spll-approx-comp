@@ -4,27 +4,31 @@ paths:
   data_root: ./data
   outputs_root: ./outputs
   repo_root: ../haskell-dppl-main
-  model_output: ./outputs/models/mnist.pt
+  models_root: ./outputs/models
+  model_selection_manifest: ./outputs/models/model_selection_manifest.json
   split_manifest: ./outputs/models/mnist_splits.pt
-  training_metrics_csv: ./outputs/training/training_metrics.csv
+  training_root: ./outputs/training
   used_config_copy: ./outputs/config_used.yaml
 
 training:
   device: auto
   require_mps: true
-  train_ratio: 0.7
-  test_ratio: 0.2
+  train_ratio: 0.5
+  test_ratio: 0.4
   inference_ratio: 0.1
-  accuracy_threshold: 0.95
   batch_size: 128
-  eval_batch_size: 256
+  eval_batch_size: 128
   num_workers: 0
-  epochs: 8
+  epochs: 12
   learning_rate: 0.001
   weight_decay: 0.0
+  selection_mode: nearest
+  target_tolerance: 0.03
   normalize:
     mean: 0.1307
     std: 0.3081
+
+  # Base defaults inherited by each model variant unless overridden below.
   model:
     input_channels: 1
     num_classes: 10
@@ -34,16 +38,56 @@ training:
     fc_hidden: 128
     dropout: 0.25
 
+  # Each variant is trained once and the exported checkpoint is the epoch
+  # whose validation accuracy is closest to target_accuracy.
+  # For low-accuracy targets, max_train_examples acts as a stable underfitting knob,
+  # so you only need light YAML tuning rather than code changes.
+  model_variants:
+    - id: acc30
+      target_accuracy: 0.30
+      epochs: 15
+      target_tolerance: 0.00
+      model:
+        conv_channels: []
+        fc_hidden: 1
+
+    - id: acc50
+      target_accuracy: 0.50
+      max_train_examples: 20000
+      epochs: 15
+      target_tolerance: 0.00
+      model:
+        conv_channels: []
+        fc_hidden: 2
+
+    - id: acc70
+      target_accuracy: 0.70
+      max_train_examples: 20000
+      target_tolerance: 0.00
+      epochs: 15
+      model:
+        conv_channels: []
+        fc_hidden: 3
+
+    - id: acc90
+      target_accuracy: 0.90
+      epochs: 15
+      target_tolerance: 0.00
+      model:
+        conv_channels: []
+        fc_hidden: 8
+        dropout: 0.1
+
 inference:
   device: auto
   num_experiments: 25
-  terms_per_sum_min: 1
+  terms_per_sum_min: 2
   terms_per_sum_max: 5
   sample_without_replacement_within_experiment: true
   top_predictions_to_store: 5
   # In this repo, -k/--topKCutoff is a probability cutoff in [0, 1], not a literal class count.
   # Use null for exact inference (no pruning).
-  approximation_thresholds: [null, 0.0001, 0.001, 0.01, 0.05, 0.1]
+  approximation_thresholds: [null, 0.00, 0.01, 0.05, 0.1, 0.25]
   # Compile with SPLL's -c/--countBranches so each posterior query also returns a branch count.
   count_branches: true
   force_recompile: true

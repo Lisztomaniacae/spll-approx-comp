@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import random
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import ConcatDataset
 import yaml
-
-
 
 
 class TerminalProgressBar:
@@ -235,8 +234,112 @@ def compute_split_lengths(total_size: int, train_ratio: float, test_ratio: float
     return train_len, test_len, inference_len
 
 
-def build_model(config: Dict[str, Any]) -> CNNClassifier:
-    return CNNClassifier(config["training"]["model"])
+def merge_model_config(base_model_cfg: Dict[str, Any], override_model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged = copy.deepcopy(base_model_cfg)
+    if override_model_cfg:
+        merged.update(copy.deepcopy(override_model_cfg))
+    return merged
+
+
+def build_model(config: Dict[str, Any], model_cfg: Optional[Dict[str, Any]] = None) -> CNNClassifier:
+    final_model_cfg = merge_model_config(config["training"].get("model", {}), model_cfg)
+    return CNNClassifier(final_model_cfg)
+
+
+def stable_variant_offset(variant_id: str) -> int:
+    digest = hashlib.sha1(str(variant_id).encode("utf-8")).hexdigest()[:8]
+    return int(digest, 16)
+
+
+def get_model_variants(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    training_cfg = config["training"]
+    raw_variants = training_cfg.get("model_variants")
+    base_model_cfg = copy.deepcopy(training_cfg.get("model", {}))
+
+    if not raw_variants:
+        default_target = training_cfg.get("target_accuracy", training_cfg.get("accuracy_threshold", 0.95))
+        return [
+            {
+                "id": "default",
+                "target_accuracy": float(default_target),
+                "model": base_model_cfg,
+                "epochs": int(training_cfg.get("epochs", 8)),
+                "selection_mode": "nearest",
+            }
+        ]
+
+    if not isinstance(raw_variants, list):
+        raise ValueError("training.model_variants must be a list of mappings.")
+
+    variants: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for raw_variant in raw_variants:
+        if not isinstance(raw_variant, dict):
+            raise ValueError("Each training.model_variants entry must be a mapping.")
+        variant_id = str(raw_variant.get("id", "")).strip()
+        if not variant_id:
+            raise ValueError("Each training.model_variants entry must define a non-empty 'id'.")
+        if variant_id in seen_ids:
+            raise ValueError(f"Duplicate model variant id: {variant_id}")
+        seen_ids.add(variant_id)
+        if "target_accuracy" not in raw_variant:
+            raise ValueError(f"Model variant '{variant_id}' is missing required field 'target_accuracy'.")
+        target_accuracy = float(raw_variant["target_accuracy"])
+        if not (0.0 <= target_accuracy <= 1.0):
+            raise ValueError(f"Variant '{variant_id}' target_accuracy must be in [0, 1], got {target_accuracy}.")
+        selection_mode = str(raw_variant.get("selection_mode", training_cfg.get("selection_mode", "nearest"))).lower()
+        if selection_mode not in {"nearest"}:
+            raise ValueError(
+                f"Variant '{variant_id}' selection_mode must currently be 'nearest', got {selection_mode}."
+            )
+        variant = copy.deepcopy(raw_variant)
+        variant["id"] = variant_id
+        variant["target_accuracy"] = target_accuracy
+        variant["epochs"] = int(raw_variant.get("epochs", training_cfg.get("epochs", 8)))
+        variant["selection_mode"] = selection_mode
+        variant["model"] = merge_model_config(base_model_cfg, raw_variant.get("model", {}))
+        variants.append(variant)
+    return variants
+
+
+def get_models_root(config: Dict[str, Any]) -> Path:
+    paths_cfg = config["paths"]
+    raw = paths_cfg.get("models_root")
+    if raw is None:
+        raw_model_output = paths_cfg.get("model_output")
+        if raw_model_output is None:
+            raw = "./outputs/models"
+        else:
+            raw = str(Path(raw_model_output).parent)
+    return ensure_dir(resolve_path(config, raw))
+
+
+def get_training_root(config: Dict[str, Any]) -> Path:
+    paths_cfg = config["paths"]
+    raw = paths_cfg.get("training_root")
+    if raw is None:
+        raw_metrics_output = paths_cfg.get("training_metrics_csv")
+        if raw_metrics_output is None:
+            raw = "./outputs/training"
+        else:
+            raw = str(Path(raw_metrics_output).parent)
+    return ensure_dir(resolve_path(config, raw))
+
+
+def get_variant_model_output_path(config: Dict[str, Any], variant_id: str) -> Path:
+    return get_models_root(config) / f"{variant_id}.pt"
+
+
+def get_variant_metrics_output_path(config: Dict[str, Any], variant_id: str) -> Path:
+    return get_training_root(config) / f"{variant_id}_training_metrics.csv"
+
+
+def get_model_selection_manifest_path(config: Dict[str, Any]) -> Path:
+    paths_cfg = config["paths"]
+    raw = paths_cfg.get("model_selection_manifest")
+    if raw is None:
+        return get_models_root(config) / "model_selection_manifest.json"
+    return resolve_path(config, raw)
 
 
 def checkpoint_payload(
@@ -245,19 +348,23 @@ def checkpoint_payload(
     config: Dict[str, Any],
     best_epoch: int,
     best_test_accuracy: float,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         "state_dict": model.state_dict(),
         "model_config": copy.deepcopy(config["training"]["model"]),
         "best_epoch": int(best_epoch),
         "best_test_accuracy": float(best_test_accuracy),
         "seed": int(config.get("seed", 42)),
     }
+    if extra:
+        payload.update(copy.deepcopy(extra))
+    return payload
 
 
 def load_checkpoint_model(checkpoint_path: str | Path, config: Dict[str, Any], map_location: str | torch.device = "cpu") -> nn.Module:
     checkpoint = torch.load(checkpoint_path, map_location=map_location)
-    model_cfg = checkpoint.get("model_config", config["training"]["model"])
+    model_cfg = checkpoint.get("model_config", config["training"].get("model", {}))
     model = CNNClassifier(model_cfg)
     model.load_state_dict(checkpoint["state_dict"])
     return model
