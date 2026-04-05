@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +34,9 @@ from mnist_spll_common import (
 )
 
 
+NUM_MNIST_CLASSES = 10
+
+
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -52,6 +55,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
         "loss": total_loss / max(total_examples, 1),
         "accuracy": total_correct / max(total_examples, 1),
     }
+
 
 
 def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: Adam, device: torch.device) -> Dict[str, float]:
@@ -102,30 +106,181 @@ def within_target_tolerance(accuracy: float, target_accuracy: float, tolerance: 
 
 
 
-def maybe_subsample_training_data(train_subset, *, variant: Dict[str, Any], base_seed: int):
-    total_examples = len(train_subset)
-    max_train_examples = variant.get("max_train_examples")
-    train_subset_ratio = variant.get("train_subset_ratio")
+def resolve_requested_examples(
+        total_examples: int,
+        *,
+        variant: Dict[str, Any],
+        max_examples_key: str,
+        ratio_key: str,
+) -> int:
+    max_examples = variant.get(max_examples_key)
+    subset_ratio = variant.get(ratio_key)
 
-    if max_train_examples is not None and train_subset_ratio is not None:
+    if max_examples is not None and subset_ratio is not None:
         raise ValueError(
-            f"Variant '{variant['id']}' sets both max_train_examples and train_subset_ratio; pick only one."
+            f"Variant '{variant['id']}' sets both {max_examples_key} and {ratio_key}; pick only one."
         )
 
-    if train_subset_ratio is not None:
-        requested = int(round(total_examples * float(train_subset_ratio)))
-    elif max_train_examples is not None:
-        requested = int(max_train_examples)
+    if subset_ratio is not None:
+        requested = int(round(total_examples * float(subset_ratio)))
+    elif max_examples is not None:
+        requested = int(max_examples)
     else:
         requested = total_examples
 
-    requested = max(1, min(total_examples, requested))
-    if requested >= total_examples:
-        return train_subset, total_examples
+    return max(1, min(total_examples, requested))
 
-    rng = np.random.default_rng(base_seed + stable_variant_offset(variant["id"]))
-    chosen_local_indices = sorted(rng.choice(total_examples, size=requested, replace=False).tolist())
-    return Subset(train_subset, chosen_local_indices), requested
+
+
+def normalize_label_distribution(
+        raw_distribution: Mapping[Any, Any],
+        *,
+        variant_id: str,
+        field_name: str,
+) -> Dict[int, float]:
+    if not isinstance(raw_distribution, Mapping):
+        raise ValueError(f"Variant '{variant_id}' {field_name} must be a mapping.")
+
+    normalized: Dict[int, float] = {label: 0.0 for label in range(NUM_MNIST_CLASSES)}
+    for raw_label, raw_weight in raw_distribution.items():
+        label = int(raw_label)
+        if not (0 <= label < NUM_MNIST_CLASSES):
+            raise ValueError(f"Variant '{variant_id}' {field_name} contains invalid label {raw_label!r}.")
+        weight = float(raw_weight)
+        if weight < 0.0:
+            raise ValueError(f"Variant '{variant_id}' {field_name} contains a negative weight for label {label}.")
+        normalized[label] = weight
+
+    total_weight = sum(normalized.values())
+    if total_weight <= 0.0:
+        raise ValueError(f"Variant '{variant_id}' {field_name} must assign positive mass to at least one label.")
+    return {label: weight / total_weight for label, weight in normalized.items()}
+
+
+
+def allocate_label_counts(total_examples: int, distribution: Mapping[int, float]) -> Dict[int, int]:
+    raw_targets = {label: float(total_examples) * float(distribution.get(label, 0.0)) for label in range(NUM_MNIST_CLASSES)}
+    counts = {label: int(np.floor(raw_targets[label])) for label in range(NUM_MNIST_CLASSES)}
+    remainder = int(total_examples - sum(counts.values()))
+    if remainder > 0:
+        fractional_order = sorted(
+            range(NUM_MNIST_CLASSES),
+            key=lambda label: (raw_targets[label] - counts[label], -label),
+            reverse=True,
+        )
+        for label in fractional_order[:remainder]:
+            counts[label] += 1
+    return counts
+
+
+
+def build_label_index_pools(base_subset) -> Dict[int, List[int]]:
+    pools: Dict[int, List[int]] = {label: [] for label in range(NUM_MNIST_CLASSES)}
+    for local_idx in range(len(base_subset)):
+        _, label = base_subset[local_idx]
+        pools[int(label)].append(local_idx)
+    return pools
+
+
+
+def summarize_selected_counts(indices: Sequence[int], label_pools: Dict[int, List[int]]) -> Dict[int, int]:
+    reverse_lookup: Dict[int, int] = {}
+    for label, pool in label_pools.items():
+        for local_idx in pool:
+            reverse_lookup[int(local_idx)] = int(label)
+
+    counts = {label: 0 for label in range(NUM_MNIST_CLASSES)}
+    for local_idx in indices:
+        label = reverse_lookup.get(int(local_idx))
+        if label is None:
+            raise RuntimeError(f"Internal error: local index {local_idx} not found in label pools.")
+        counts[label] += 1
+    return counts
+
+
+
+def select_variant_subset(
+        base_subset,
+        *,
+        variant: Dict[str, Any],
+        subset_name: str,
+        max_examples_key: str,
+        ratio_key: str,
+        distribution_key: str,
+        sampling_with_replacement_key: str,
+        base_seed: int,
+        label_index_pools: Dict[int, List[int]],
+):
+    total_examples = len(base_subset)
+    requested = resolve_requested_examples(
+        total_examples,
+        variant=variant,
+        max_examples_key=max_examples_key,
+        ratio_key=ratio_key,
+    )
+    rng_offset = stable_variant_offset(f"{variant['id']}::{subset_name}")
+    rng = np.random.default_rng(base_seed + rng_offset)
+
+    raw_distribution = variant.get(distribution_key)
+    sampling_with_replacement = bool(variant.get(sampling_with_replacement_key, False))
+
+    if raw_distribution is None:
+        if requested >= total_examples and not sampling_with_replacement:
+            selected_indices = list(range(total_examples))
+            selected_subset = base_subset
+        else:
+            selected_indices = rng.choice(total_examples, size=requested, replace=sampling_with_replacement).tolist()
+            selected_subset = Subset(base_subset, selected_indices)
+
+        label_counts = summarize_selected_counts(selected_indices, label_index_pools)
+        return selected_subset, requested, {
+            "mode": "iid_subsample" if requested < total_examples else "full_split",
+            "with_replacement": sampling_with_replacement,
+            "requested_label_distribution": None,
+            "selected_label_counts": label_counts,
+        }
+
+    distribution = normalize_label_distribution(
+        raw_distribution,
+        variant_id=str(variant["id"]),
+        field_name=distribution_key,
+    )
+    target_counts = allocate_label_counts(requested, distribution)
+    selected_indices: List[int] = []
+
+    for label in range(NUM_MNIST_CLASSES):
+        needed = int(target_counts[label])
+        if needed <= 0:
+            continue
+        candidates = label_index_pools[label]
+        if not candidates:
+            raise ValueError(
+                f"Variant '{variant['id']}' requested label {label} in {distribution_key}, "
+                f"but there are no examples for that label in the {subset_name} split."
+            )
+        if not sampling_with_replacement and needed > len(candidates):
+            raise ValueError(
+                f"Variant '{variant['id']}' requests {needed} examples for label {label} in {subset_name}, "
+                f"but only {len(candidates)} are available without replacement. "
+                f"Reduce {max_examples_key}, relax the skew, or enable {sampling_with_replacement_key}."
+            )
+        chosen = rng.choice(candidates, size=needed, replace=sampling_with_replacement).tolist()
+        selected_indices.extend(int(idx) for idx in chosen)
+
+    if len(selected_indices) != requested:
+        raise RuntimeError(
+            f"Internal error: selected {len(selected_indices)} {subset_name} examples, expected {requested}."
+        )
+
+    rng.shuffle(selected_indices)
+    selected_subset = Subset(base_subset, selected_indices)
+    selected_label_counts = {label: int(target_counts[label]) for label in range(NUM_MNIST_CLASSES)}
+    return selected_subset, requested, {
+        "mode": "label_skew",
+        "with_replacement": sampling_with_replacement,
+        "requested_label_distribution": distribution,
+        "selected_label_counts": selected_label_counts,
+    }
 
 
 
@@ -141,13 +296,15 @@ def write_metrics_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def train_variant(
-    *,
-    config: Dict[str, Any],
-    variant: Dict[str, Any],
-    train_subset,
-    validation_subset,
-    device: torch.device,
-    used_config_path: Path,
+        *,
+        config: Dict[str, Any],
+        variant: Dict[str, Any],
+        train_subset,
+        validation_subset,
+        train_label_index_pools: Dict[int, List[int]],
+        validation_label_index_pools: Dict[int, List[int]],
+        device: torch.device,
+        used_config_path: Path,
 ) -> Dict[str, Any]:
     training_cfg = config["training"]
     batch_size = int(variant.get("batch_size", training_cfg.get("batch_size", 128)))
@@ -160,13 +317,31 @@ def train_variant(
     target_tolerance_raw = variant.get("target_tolerance", training_cfg.get("target_tolerance"))
     target_tolerance = None if target_tolerance_raw is None else float(target_tolerance_raw)
 
-    selected_train_subset, selected_train_examples = maybe_subsample_training_data(
+    selected_train_subset, selected_train_examples, train_selection_meta = select_variant_subset(
         train_subset,
         variant=variant,
+        subset_name="train",
+        max_examples_key="max_train_examples",
+        ratio_key="train_subset_ratio",
+        distribution_key="train_label_distribution",
+        sampling_with_replacement_key="train_sampling_with_replacement",
         base_seed=int(config.get("seed", 42)),
+        label_index_pools=train_label_index_pools,
     )
+    selected_validation_subset, selected_validation_examples, validation_selection_meta = select_variant_subset(
+        validation_subset,
+        variant=variant,
+        subset_name="validation",
+        max_examples_key="max_validation_examples",
+        ratio_key="validation_subset_ratio",
+        distribution_key="validation_label_distribution",
+        sampling_with_replacement_key="validation_sampling_with_replacement",
+        base_seed=int(config.get("seed", 42)) + 1_000_000,
+        label_index_pools=validation_label_index_pools,
+    )
+
     train_loader = DataLoader(selected_train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    validation_loader = DataLoader(validation_subset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers)
+    validation_loader = DataLoader(selected_validation_subset, batch_size=eval_batch_size, shuffle=False, num_workers=num_workers)
 
     model = build_model(config, model_cfg=variant["model"]).to(device)
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -187,7 +362,11 @@ def train_variant(
     tolerance_display = f"{target_tolerance:.1%}" if target_tolerance is not None else "disabled"
     print(
         f"\n--- Training model variant '{variant['id']}' "
-        f"(target={target_accuracy:.1%}, tolerance={tolerance_display}, train_examples={selected_train_examples}) ---"
+        f"(target={target_accuracy:.1%}, tolerance={tolerance_display}, "
+        f"train_examples={selected_train_examples}, validation_examples={selected_validation_examples}) ---"
+    )
+    print(
+        f"train_mode={train_selection_meta['mode']} val_mode={validation_selection_meta['mode']}"
     )
     for epoch in range(1, epochs + 1):
         train_metrics = train_one_epoch(model, train_loader, optimizer, device)
@@ -197,6 +376,7 @@ def train_variant(
             "target_accuracy": target_accuracy,
             "epoch": epoch,
             "train_examples": selected_train_examples,
+            "validation_examples": selected_validation_examples,
             "train_loss": train_metrics["loss"],
             "train_accuracy": train_metrics["accuracy"],
             "test_loss": validation_metrics["loss"],
@@ -249,6 +429,13 @@ def train_variant(
             "best_overall_epoch": best_overall_epoch,
             "best_overall_test_accuracy": best_overall_accuracy,
             "train_examples": selected_train_examples,
+            "validation_examples": selected_validation_examples,
+            "train_selection_mode": train_selection_meta["mode"],
+            "validation_selection_mode": validation_selection_meta["mode"],
+            "train_label_distribution": train_selection_meta["requested_label_distribution"],
+            "validation_label_distribution": validation_selection_meta["requested_label_distribution"],
+            "train_label_counts": train_selection_meta["selected_label_counts"],
+            "validation_label_counts": validation_selection_meta["selected_label_counts"],
             "epochs_trained": epochs_trained,
             "target_tolerance": target_tolerance,
             "stopped_early": stopped_early,
@@ -279,6 +466,13 @@ def train_variant(
         "stopped_early": stopped_early,
         "stop_reason": stop_reason,
         "train_examples": selected_train_examples,
+        "validation_examples": selected_validation_examples,
+        "train_selection_mode": train_selection_meta["mode"],
+        "validation_selection_mode": validation_selection_meta["mode"],
+        "train_label_distribution": train_selection_meta["requested_label_distribution"],
+        "validation_label_distribution": validation_selection_meta["requested_label_distribution"],
+        "train_label_counts": train_selection_meta["selected_label_counts"],
+        "validation_label_counts": validation_selection_meta["selected_label_counts"],
         "model_output": str(export_path),
         "metrics_csv": str(metrics_path),
         "model_config": variant["model"],
@@ -310,6 +504,9 @@ def run_training(config: Dict[str, Any]) -> None:
         generator=generator,
     )
 
+    train_label_index_pools = build_label_index_pools(train_subset)
+    validation_label_index_pools = build_label_index_pools(validation_subset)
+
     split_manifest_path = resolve_path(config, paths_cfg["split_manifest"])
     used_config_path = resolve_path(config, paths_cfg.get("used_config_copy", "./outputs/config_used.yaml"))
     manifest_path = get_model_selection_manifest_path(config)
@@ -340,6 +537,8 @@ def run_training(config: Dict[str, Any]) -> None:
                 variant=variant,
                 train_subset=train_subset,
                 validation_subset=validation_subset,
+                train_label_index_pools=train_label_index_pools,
+                validation_label_index_pools=validation_label_index_pools,
                 device=device,
                 used_config_path=used_config_path,
             )

@@ -28,6 +28,37 @@ training:
     mean: 0.1307
     std: 0.3081
 
+  # Extreme broken-prior profile used by the biased variants below.
+  # Distribution: 50% ones, 2% nines, and 6% for each remaining digit.
+  #
+  # Why the biased variants use capped train/validation subsets instead of changing
+  # the global train/test/inference split:
+  # - the current pipeline uses one shared inference holdout for staging experiments,
+  #   so keeping the global split unchanged preserves comparability for the baseline;
+  # - with MNIST's finite class counts, the bottleneck is digit '1', not digit '9'.
+  #
+  # Conservative subset sizes chosen for the biased variants:
+  # - max_train_examples: 7600
+  # - max_validation_examples: 6000
+  #
+  # Required counts under this skew:
+  # - train:      3800 ones, 152 nines
+  # - validation: 3000 ones, 120 nines
+  #
+  # These fit safely inside the expected label counts of the current shared
+  # 50%/40% split while leaving the common 10% inference holdout intact.
+  extreme_biased_label_distribution: &extreme_biased_label_distribution
+    0: 0.06
+    1: 0.50
+    2: 0.06
+    3: 0.06
+    4: 0.06
+    5: 0.06
+    6: 0.06
+    7: 0.06
+    8: 0.06
+    9: 0.02
+
   # Base defaults inherited by each model variant unless overridden below.
   model:
     input_channels: 1
@@ -43,19 +74,25 @@ training:
   # For low-accuracy targets, max_train_examples acts as a stable underfitting knob,
   # so you only need light YAML tuning rather than code changes.
   model_variants:
-    - id: acc30
-      target_accuracy: 0.30
-      epochs: 15
-      target_tolerance: 0.00
-      model:
-        conv_channels: []
-        fc_hidden: 1
-
     - id: acc50
       target_accuracy: 0.50
       max_train_examples: 20000
       epochs: 15
       target_tolerance: 0.00
+      model:
+        conv_channels: [ ]
+        fc_hidden: 2
+
+    - id: acc50_biased_extreme
+      target_accuracy: 0.50
+      epochs: 15
+      target_tolerance: 0.00
+      max_train_examples: 7600
+      max_validation_examples: 6000
+      train_label_distribution: *extreme_biased_label_distribution
+      validation_label_distribution: *extreme_biased_label_distribution
+      train_sampling_with_replacement: false
+      validation_sampling_with_replacement: false
       model:
         conv_channels: []
         fc_hidden: 2
@@ -66,16 +103,45 @@ training:
       target_tolerance: 0.00
       epochs: 15
       model:
-        conv_channels: []
+        conv_channels: [ ]
         fc_hidden: 3
+
+    - id: acc70_biased_extreme
+      target_accuracy: 0.70
+      epochs: 15
+      target_tolerance: 0.00
+      max_train_examples: 7600
+      max_validation_examples: 6000
+      train_label_distribution: *extreme_biased_label_distribution
+      validation_label_distribution: *extreme_biased_label_distribution
+      train_sampling_with_replacement: false
+      validation_sampling_with_replacement: false
+      model:
+        conv_channels: []
+        fc_hidden: 4
 
     - id: acc90
       target_accuracy: 0.90
       epochs: 15
       target_tolerance: 0.00
       model:
-        conv_channels: []
+        conv_channels: [ ]
         fc_hidden: 8
+        dropout: 0.1
+
+    - id: acc90_biased_extreme
+      target_accuracy: 0.90
+      epochs: 15
+      target_tolerance: 0.00
+      max_train_examples: 7600
+      max_validation_examples: 6000
+      train_label_distribution: *extreme_biased_label_distribution
+      validation_label_distribution: *extreme_biased_label_distribution
+      train_sampling_with_replacement: false
+      validation_sampling_with_replacement: false
+      model:
+        conv_channels: []
+        fc_hidden: 7
         dropout: 0.1
 
 inference:
