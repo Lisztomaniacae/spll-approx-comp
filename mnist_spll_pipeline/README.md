@@ -172,12 +172,12 @@ source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml visualize
 ```
 
-This stage reads the raw inference JSON and computes derived outputs on demand:
+This stage reads the raw inference JSON and writes a fuller bundle:
 
-- `detailed_results.csv`
-- `summary_results.csv`
-- `summary_results.json`
-- plots under `visualization/plots`
+- tables under `visualization/tables`
+- main-text figures under `visualization/figures/main_text`
+- appendix/supporting figures under `visualization/figures/appendix`
+- appendix heatmaps under `visualization/figures/appendix/heatmaps`
 
 ### Run all stages
 
@@ -201,10 +201,14 @@ Important files:
 - `staged_experiments.json`
 - `inference_manifest.json`
 - `inference_runs.json`
-- `visualization/detailed_results.csv`
-- `visualization/summary_results.csv`
-- `visualization/summary_results.json`
-- `visualization/plots/*.png`
+- `visualization/tables/detailed_results.csv`
+- `visualization/tables/summary_results.csv`
+- `visualization/tables/summary_results.json`
+- `visualization/tables/overhead_exact_vs_zero_summary.csv`
+- `visualization/tables/model_accuracy_targets.csv`
+- `visualization/figures/main_text/*.png`
+- `visualization/figures/appendix/*.png`
+- `visualization/figures/appendix/heatmaps/*.png`
 
 ## Progress output
 
