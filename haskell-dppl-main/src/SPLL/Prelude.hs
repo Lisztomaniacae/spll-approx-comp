@@ -11,6 +11,7 @@ import Control.Monad.Random (Rand, RandomGen)
 import SPLL.IRCompiler
 import Debug.Trace
 import Data.Either
+import Data.Maybe (isJust)
 import Text.PrettyPrint.Annotated.HughesPJClass
 import PrettyPrint (pPrintProg, pPrintIREnv)
 import Debug.Pretty.Simple
@@ -223,12 +224,16 @@ runGen conf p args = do
   let constArgs = map IRConst args
   generateRand (neurals p) compiled constArgs gen
 
+useGlobalCutoffPrelude :: CompilerConfig -> Bool
+useGlobalCutoffPrelude conf = cutoffMode conf == GlobalCutoff && isJust (topKThreshold conf)
+
 runProb :: CompilerConfig -> Program -> [IRValue] -> IRValue -> IRValue
 runProb _ p _ _ | isLeft (validateProgram p) = error $ fromLeft "" (validateProgram p)
 runProb conf p args x = do
   let compiled = compile conf p
   let Just (prob, _) = probFun (lookupIREnv "main" compiled)
-  let constArgs = map IRConst (x:args)
+  let extraArgs = if useGlobalCutoffPrelude conf then [IRConst (VFloat 1.0)] else []
+  let constArgs = [IRConst x] ++ extraArgs ++ map IRConst args
   let val = generateDet (neurals p) compiled constArgs prob
   case val of
     Right v -> v
@@ -239,7 +244,8 @@ runInteg _ p _ _ _ | isLeft (validateProgram p) = error $ fromLeft "" (validateP
 runInteg conf p args low high = do
   let compiled = compile conf p
   let Just (integ, _) = integFun (lookupIREnv "main" compiled)
-  let constArgs = map IRConst (low:high:args)
+  let extraArgs = if useGlobalCutoff conf then [IRConst (VFloat 1.0)] else []
+  let constArgs = [IRConst low, IRConst high] ++ extraArgs ++ map IRConst args
   let val = generateDet (neurals p) compiled constArgs integ
   case val of
     Right v -> v

@@ -24,6 +24,7 @@ data GlobalOpts = GlobalOpts {
   verbosity :: Int,
   countBranches :: Bool,
   topKCutoff :: Maybe Double,
+  cutoffMode :: CutoffMode,
   optimiziationLevel :: Int,
   commandOpts :: CommandOpts
 }
@@ -56,6 +57,12 @@ readLanguage = str >>= \s -> case map toLower s of
   "j" -> return Julia
   _ -> readerError "Only python or julia are supported as languages"
 
+readCutoffMode :: ReadM CutoffMode
+readCutoffMode = str >>= \s -> case map toLower s of
+  "local" -> return LocalCutoff
+  "global" -> return GlobalCutoff
+  _ -> readerError "Only local or global are supported as cutoff modes"
+
 verbosityParser :: Parser Int
 verbosityParser = length <$> many (flag' () (short 'v' <> help "Increases verbosity"))
 
@@ -86,6 +93,12 @@ parseGlobalOpts = GlobalOpts
             <> short 'k'
             <> help "Probabilities lower than the cutoff will not be considered. Range from 0-1"
             <> metavar "CUTOFF" ))
+        <*> option readCutoffMode
+            ( long "cutoffMode"
+            <> help "How the cutoff is interpreted: local branch probability or global accumulated path mass"
+            <> showDefaultWith (const "local")
+            <> value LocalCutoff
+            <> metavar "MODE" )
         <*> option auto
             ( long "optimizationLevel"
             <> short 'O'
@@ -152,9 +165,9 @@ main = transpile =<< execParser opts
             <> header "Haskell DPPL" )
 
 transpile :: GlobalOpts -> IO ()
-transpile (GlobalOpts {inputFile=inFile, verbosity=verb, Main.countBranches=cb, topKCutoff=tkc, commandOpts=options, optimiziationLevel=oLvl}) = do
+transpile (GlobalOpts {inputFile=inFile, verbosity=verb, Main.countBranches=cb, topKCutoff=tkc, Main.cutoffMode=cm, commandOpts=options, optimiziationLevel=oLvl}) = do
   prog <- parseProgram inFile
-  let conf = (CompilerConfig {SPLL.IntermediateRepresentation.countBranches = cb, topKThreshold = tkc, verbose=verb, optimizerLevel=oLvl})
+  let conf = (CompilerConfig {SPLL.IntermediateRepresentation.countBranches = cb, topKThreshold = tkc, SPLL.IntermediateRepresentation.cutoffMode = cm, verbose=verb, optimizerLevel=oLvl})
   case options of
     CompileOpts{language=lang, outputFile=outFile, trunc=trnc} -> do
       transpiled <- codeGenToLang lang trnc conf prog

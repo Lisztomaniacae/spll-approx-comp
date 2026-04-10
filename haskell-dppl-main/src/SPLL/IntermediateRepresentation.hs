@@ -9,6 +9,7 @@ module SPLL.IntermediateRepresentation (
 , Distribution(..)
 , Varname
 , IRValue
+, CutoffMode(..)
 , CompilerConfig(..)
 , irMap
 , getIRSubExprs
@@ -179,10 +180,14 @@ data IRFunGroup = IRFunGroup {groupName::String, genFun::IRFunDecl, probFun::May
 -- Name, Documentation, Body
 type IRFunDecl = (IRExpr, String)
 
+data CutoffMode = LocalCutoff | GlobalCutoff deriving (Show, Eq, Read)
+
 data CompilerConfig = CompilerConfig {
   -- If set to Just x: All branches with likelihood less than x are discarded.
-  --  Uses local probability of the branch,given that the execution arrives at that branching point
+  -- LocalCutoff uses the probability of the branch given that execution arrives at that branch point.
+  -- GlobalCutoff uses the accumulated path mass reaching that branch point.
   topKThreshold :: Maybe Double,
+  cutoffMode :: CutoffMode,
   countBranches :: Bool,
   verbose :: Int,
   optimizerLevel :: Int

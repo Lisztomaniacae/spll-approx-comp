@@ -229,7 +229,7 @@ prop_any = forAll (elements correctProbValuesTestCases) checkProbAny
 prop_CheckReadmeCodeListing1 :: Property
 prop_CheckReadmeCodeListing1 = ioProperty $ do
   let twoDice = Program [("main", dice 6 #<+># dice 6)] []
-  let conf = CompilerConfig {verbose=0, topKThreshold=Nothing, countBranches=False, optimizerLevel=2}
+  let conf = CompilerConfig {verbose=0, topKThreshold=Nothing, cutoffMode=LocalCutoff, countBranches=False, optimizerLevel=2}
   gen <- evalRandIO (runGen conf twoDice [])
   let VTuple (VFloat prob) (VFloat dim) = runProb conf twoDice [] gen
   -- Original Listing above, Tests below
@@ -252,7 +252,7 @@ prop_CheckReadmeCodeListing1 = ioProperty $ do
 prop_CheckReadmeCodeListing2 :: Property
 prop_CheckReadmeCodeListing2 = ioProperty $ do
   let dist = Program [("main", normal #*# constF 2 #+# constF 1)] []
-  let conf = CompilerConfig {verbose=2, topKThreshold=Nothing, countBranches=False, optimizerLevel=2}
+  let conf = CompilerConfig {verbose=2, topKThreshold=Nothing, cutoffMode=LocalCutoff, countBranches=False, optimizerLevel=2}
   gen <- evalRandIO (runGen conf dist [])
   let VTuple (VFloat prob) (VFloat dim) = runProb conf dist [] gen
   -- Original Listing above, Tests below

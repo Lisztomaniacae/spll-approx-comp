@@ -26,7 +26,7 @@ import Test.QuickCheck hiding (verbose)
 import Debug.Trace
 
 standardCompiler :: CompilerConfig
-standardCompiler = CompilerConfig {countBranches = False, topKThreshold = Nothing, optimizerLevel = 2, verbose = 0}
+standardCompiler = CompilerConfig {countBranches = False, topKThreshold = Nothing, cutoffMode = LocalCutoff, optimizerLevel = 2, verbose = 0}
 
 getAllTestFiles :: IO [(FilePath, FilePath)]
 getAllTestFiles = do

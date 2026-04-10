@@ -168,7 +168,7 @@ tupleFromValue :: Value -> (Value, Value)
 tupleFromValue (VTuple a b) = (a,b)
 tupelFromValue _non_tuple = error "supplied non-tuple value to tuple-shaped NN type."
 
-testConf = CompilerConfig {topKThreshold=Nothing, countBranches=False, verbose=2, optimizerLevel=2}
+testConf = CompilerConfig {topKThreshold=Nothing, cutoffMode=LocalCutoff, countBranches=False, verbose=2, optimizerLevel=2}
 
 test = do
   let irdefs = [makeAutoNeural testConf ("readMNist", TArrow TSymbol TInt, Just $ EnumRange ((VInt 0), (VInt 9)))]

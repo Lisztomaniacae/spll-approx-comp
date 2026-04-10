@@ -154,10 +154,37 @@ generateClass lut (IRFunGroup name gen prob integ doc) = let
 generateFunction :: (String, IRFunDecl) -> [String]
 generateFunction (name, (expr, doc)) = let
   (args, reducedExpr) = unwrapLambdas expr
-  l1 = "def " ++ name ++ "(" ++ intercalate ", " ("self" : args) ++ "):"
-  block = generateStatementBlock reducedExpr
   docLine = "# " ++ doc
-  in [docLine, l1] ++ indentOnce block
+  block = generateStatementBlock reducedExpr
+  in case break (== "acc_prob") args of
+      (prefixArgs, "acc_prob":suffixArgs) ->
+        let
+          l1 = "def " ++ name ++ "(" ++ intercalate ", " ("self" : prefixArgs ++ ["*extra_args"]) ++ "):"
+          compatBlock = generateAccProbCompatibilityBlock name prefixArgs suffixArgs
+        in [docLine, l1] ++ indentOnce (compatBlock ++ block)
+      _ ->
+        let
+          l1 = "def " ++ name ++ "(" ++ intercalate ", " ("self" : args) ++ "):"
+        in [docLine, l1] ++ indentOnce block
+
+
+generateAccProbCompatibilityBlock :: String -> [String] -> [String] -> [String]
+generateAccProbCompatibilityBlock funcName prefixArgs suffixArgs =
+  let
+    fixedCount = length prefixArgs
+    withoutAcc = length suffixArgs
+    withAcc = withoutAcc + 1
+    suffixTuple = intercalate ", " suffixArgs
+    oldStyleAssign = if null suffixArgs then ["acc_prob = 1.0"] else ["acc_prob = 1.0", suffixTuple ++ " = extra_args"]
+    internalStyleAssign = if null suffixArgs then ["acc_prob = extra_args[0]"] else ["acc_prob = extra_args[0]", suffixTuple ++ " = extra_args[1:]"]
+    msg = funcName ++ "() expected " ++ show withoutAcc ++ " old-style arg(s) or " ++ show withAcc ++ " internal arg(s) after the " ++ show fixedCount ++ " fixed parameter(s)"
+  in
+    ["if len(extra_args) == " ++ show withoutAcc ++ ":"] ++
+    indentOnce oldStyleAssign ++
+    ["elif len(extra_args) == " ++ show withAcc ++ ":"] ++
+    indentOnce internalStyleAssign ++
+    ["else:"] ++
+    indentOnce ["raise TypeError(" ++ show msg ++ ")"]
 
 unwrapLambdas :: IRExpr -> ([String], IRExpr)
 unwrapLambdas (IRLambda name rest) = (name:otherNames, plainTree)

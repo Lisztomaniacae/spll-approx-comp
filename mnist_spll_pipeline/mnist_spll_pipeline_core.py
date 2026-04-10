@@ -83,6 +83,31 @@ def get_thresholds(config: Dict[str, Any]) -> List[Optional[float]]:
     return thresholds
 
 
+def normalize_cutoff_mode(mode: Any) -> str:
+    value = str(mode).strip().lower()
+    if value not in {"local", "global"}:
+        raise ValueError(f"Unsupported cutoff mode: {mode}")
+    return value
+
+
+def get_cutoff_modes(config: Dict[str, Any]) -> List[str]:
+    raw_modes = list(config["inference"].get("cutoff_modes", ["local"]))
+    if not raw_modes:
+        raise ValueError("inference.cutoff_modes must contain at least one mode.")
+    ordered: List[str] = []
+    seen = set()
+    for mode in raw_modes:
+        normalized = normalize_cutoff_mode(mode)
+        if normalized not in seen:
+            seen.add(normalized)
+            ordered.append(normalized)
+    return ordered
+
+
+def compiled_program_path(compiled_root: Path, n_terms: int, cutoff_mode: str, cutoff: Optional[float]) -> Path:
+    return compiled_root / normalize_cutoff_mode(cutoff_mode) / f"sum_{int(n_terms):02d}" / threshold_label(cutoff) / "program.py"
+
+
 def get_term_count_bounds(config: Dict[str, Any]) -> Tuple[int, int]:
     inference_cfg = config["inference"]
     terms_min = int(inference_cfg.get("terms_per_sum_min", 1))
@@ -154,6 +179,7 @@ def compile_spll_program(
         spll_path: Path,
         output_py_path: Path,
         cutoff: Optional[float],
+        cutoff_mode: str,
         force_recompile: bool,
         timeout_sec: int,
         stack_arch: Optional[str] = None,
@@ -177,6 +203,7 @@ def compile_spll_program(
     args += ["run", "--", "-i", str(spll_path)]
     if count_branches:
         args += ["-c"]
+    args += ["--cutoffMode", normalize_cutoff_mode(cutoff_mode)]
     if cutoff is not None:
         args += ["-k", str(cutoff)]
     args += ["compile", "-o", str(output_py_path), "-l", "python"]
@@ -412,35 +439,41 @@ def load_staged_experiments(paths: PipelinePaths) -> List[Dict[str, Any]]:
     return experiments
 
 
-def verify_compiled_artifacts(paths: PipelinePaths, experiments: List[Dict[str, Any]], thresholds: Sequence[Optional[float]]) -> None:
+def verify_compiled_artifacts(
+        paths: PipelinePaths,
+        experiments: List[Dict[str, Any]],
+        thresholds: Sequence[Optional[float]],
+        cutoff_modes: Sequence[str],
+) -> None:
     unique_term_counts = sorted({int(exp["n_terms"]) for exp in experiments})
-    for n_terms in unique_term_counts:
-        for cutoff in thresholds:
-            label = threshold_label(cutoff)
-            compiled_py_path = paths.compiled_root / f"sum_{n_terms:02d}" / label / "program.py"
-            if not compiled_py_path.exists():
-                raise FileNotFoundError(
-                    f"Compiled SPLL program missing: {compiled_py_path}. Run the 'compile' step first."
-                )
+    for cutoff_mode in cutoff_modes:
+        for n_terms in unique_term_counts:
+            for cutoff in thresholds:
+                compiled_py_path = compiled_program_path(paths.compiled_root, n_terms, cutoff_mode, cutoff)
+                if not compiled_py_path.exists():
+                    raise FileNotFoundError(
+                        f"Compiled SPLL program missing: {compiled_py_path}. Run the 'compile' step first."
+                    )
 
 
 def build_compiled_module_loader(
         paths: PipelinePaths,
+        cutoff_modes: Sequence[str],
         thresholds: Sequence[Optional[float]],
         experiments: List[Dict[str, Any]],
         read_mnist,
         *,
         show_progress: bool,
 ):
-    verify_compiled_artifacts(paths, experiments, thresholds)
+    verify_compiled_artifacts(paths, experiments, thresholds, cutoff_modes)
 
     unique_targets = sorted(
-        {(int(exp["n_terms"]), cutoff) for exp in experiments for cutoff in thresholds},
-        key=lambda item: (item[0], item[1] is not None, float(item[1] or -1.0)),
+        {(normalize_cutoff_mode(mode), int(exp["n_terms"]), cutoff) for exp in experiments for mode in cutoff_modes for cutoff in thresholds},
+        key=lambda item: (item[0], item[1], item[2] is not None, float(item[2] or -1.0)),
     )
     total_targets = len(unique_targets)
     loaded_targets = 0
-    compiled_modules: Dict[Tuple[int, Optional[float]], Any] = {}
+    compiled_modules: Dict[Tuple[int, str, Optional[float]], Any] = {}
     load_bar = TerminalProgressBar(
         total_targets,
         desc="Load compiled",
@@ -448,21 +481,22 @@ def build_compiled_module_loader(
         enabled=show_progress and total_targets > 0,
     )
 
-    def get_module(n_terms: int, cutoff: Optional[float]):
+    def get_module(n_terms: int, cutoff_mode: str, cutoff: Optional[float]):
         nonlocal loaded_targets
-        key = (int(n_terms), cutoff)
+        normalized_mode = normalize_cutoff_mode(cutoff_mode)
+        key = (int(n_terms), normalized_mode, cutoff)
         cached = compiled_modules.get(key)
         if cached is not None:
             return cached
 
         label = threshold_label(cutoff)
-        compiled_py_path = paths.compiled_root / f"sum_{int(n_terms):02d}" / label / "program.py"
-        module_name = f"spll_{int(n_terms)}_{label}_{hashlib.sha1(str(compiled_py_path).encode()).hexdigest()[:10]}"
+        compiled_py_path = compiled_program_path(paths.compiled_root, int(n_terms), normalized_mode, cutoff)
+        module_name = f"spll_{normalized_mode}_{int(n_terms)}_{label}_{hashlib.sha1(str(compiled_py_path).encode()).hexdigest()[:10]}"
         module = import_compiled_module(compiled_py_path, module_name)
         setattr(module, "readMNist", read_mnist)
         compiled_modules[key] = module
         loaded_targets += 1
-        load_bar.update(postfix=f"terms={int(n_terms)}, mode={label}")
+        load_bar.update(postfix=f"cutoff_mode={normalized_mode}, terms={int(n_terms)}, cutoff={label}")
         return module
 
     def finish_loading() -> None:
@@ -504,6 +538,7 @@ def build_experiment_source_bundle(config: Dict[str, Any], paths: PipelinePaths)
         "config_path": str(config.get("_config_path", "")),
         "paths": paths.to_json_dict(),
         "thresholds": get_thresholds(config),
+        "cutoff_modes": get_cutoff_modes(config),
         "term_counts": get_configured_term_counts(config),
     }
 
