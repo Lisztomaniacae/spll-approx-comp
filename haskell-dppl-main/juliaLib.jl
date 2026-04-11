@@ -1,6 +1,6 @@
 module JuliaSPPLLib
 
-export density_IRUniform, density_IRNormal, cumulative_IRUniform, cumulative_IRNormal, isAny, InferenceList, EmptyInferenceList, AnyInferenceList, ConsInferenceList, length, getindex, head, tail, prepend, isclose, T,==
+export density_IRUniform, density_IRNormal, cumulative_IRUniform, cumulative_IRNormal, isAny, InferenceList, EmptyInferenceList, AnyInferenceList, ConsInferenceList, length, getindex, head, tail, prepend, mapList, eq, isPossible, isclose, indexOf, listProd, T, Either, Left, Right, fromLeft, fromRight, multiValueToValueList,==
 
 
 function isAny(x)
@@ -53,6 +53,38 @@ function eq(a, b)
     end
 end
 
+function isPossible(multiVal, expr)
+    tag = multiVal[1]
+    if tag == "D"
+        return expr in multiVal[2]
+    elseif tag == "T" && expr isa T
+        sub = multiVal[2]
+        return isPossible(sub[1], expr.t1) && isPossible(sub[2], expr.t2)
+    elseif tag == "E" && expr isa Left
+        return isPossible(multiVal[2][1], fromLeft(expr))
+    elseif tag == "E" && expr isa Right
+        return isPossible(multiVal[2][2], fromRight(expr))
+    elseif tag == "A"
+        foundConstr = false
+        for c in multiVal[2]
+            cName = c[1]
+            cMultiFields = c[2]
+            if string(typeof(expr)) == cName
+                foundConstr = true
+                fieldsyms = fieldnames(typeof(expr))
+                for (mf, fs) in zip(cMultiFields, fieldsyms)
+                    if !isPossible(mf, getfield(expr, fs))
+                        return false
+                    end
+                end
+            end
+        end
+        return foundConstr
+    else
+        error("Unknown multiVal tag: " * string(multiVal))
+    end
+end
+
 struct T
     t1
     t2
@@ -75,8 +107,57 @@ Base.:(==)(other::Any, t::T) = begin
     return eq(t.t1, other.t1) && eq(t.t2, other.t2)
 end
 
+Base.:(<)(other::Any, t::T) = begin
+    if !(other isa T)
+        throw(ValueError("Cannot compare Tuple with non-Tuple"))
+    end
+    return other.t1 < t.t1 && other.t2 < t.t2
+end
 
+Base.:(>)(other::Any, t::T) = begin
+    if !(other isa T)
+        throw(ValueError("Cannot compare Tuple with non-Tuple"))
+    end
+    return other.t1 > t.t1 && other.t2 > t.t2
+end
 
+abstract type Either end
+
+struct Left <: Either 
+    val
+end
+struct Right <: Either 
+    val
+end
+Base.:(==)(other::Any, l::Left) = begin
+     if !(other isa Left)
+        return false
+    end
+    return eq(l.val, other.val)
+end
+
+Base.:(==)(other::Any, r::Right) = begin
+     if !(other isa Right)
+        return false
+    end
+    return eq(r.val, other.val)
+end
+
+function fromLeft(l::Either)
+    if !(l isa Left)
+        throw("parameter is not a Left: " + l)
+    else
+        return l.val
+    end
+end
+
+function fromRight(r::Either)
+    if !(r isa Right)
+        throw("parameter is not a Right: " + r)
+    else
+        return r.val
+    end
+end
 
 abstract type InferenceList end
 
@@ -144,6 +225,26 @@ Base.:(==)(other::Any, l::InferenceList) = begin
     return eq(l.value, other.value) && l.next == other.next
 end
 
+Base.:(<)(other::Any, l::InferenceList) = begin
+    if !(other isa InferenceList)
+        throw(ValueError("Cannot compare InferenceList with non-InferenceList"))
+    end
+    if !(l isa InferenceList)
+        throw(ValueError("Cannot compare InferenceList with non-InferenceList"))
+    end
+    return (head(other) < head(l)) && (tail(other) < tail(l))
+end
+
+Base.:(>)(other::Any, l::InferenceList) = begin
+    if !(other isa InferenceList)
+        throw(ValueError("Cannot compare InferenceList with non-InferenceList"))
+    end
+    if !(l isa InferenceList)
+        throw(ValueError("Cannot compare InferenceList with non-InferenceList"))
+    end
+    return (head(other) > head(l)) && (tail(other) > tail(l))
+end
+
 function prepend(x, xs :: InferenceList) :: InferenceList
     return ConsInferenceList(x, xs)
 end
@@ -153,6 +254,16 @@ function head(lst::ConsInferenceList)
 end
 function tail(lst::ConsInferenceList)
     lst.next
+end
+
+function mapList(f, lst::EmptyInferenceList)
+    return lst
+end
+
+function mapList(f, lst::ConsInferenceList)
+    val = f(head(lst))
+    rst = mapList(f, tail(lst))
+    return ConsInferenceList(val, rst)
 end
 
 function indexOf(sample, lst::InferenceList)
@@ -166,8 +277,36 @@ function indexOf(sample, lst::InferenceList)
     end
 end
 
+function listProd(lst::InferenceList)
+    prod(lst)
+end
+
 function isclose(a::Float64, b::Float64)
     return abs(a - b) <= 10e-10
+end
+
+function multiValueToValueList(multiVal)
+    if multiVal[1] == "D"
+        return multiVal[2]
+    elseif multiVal[1] == "T"
+        cart = collect(Iterators.product(multiValueToValueList(multiVal[2][1]), multiValueToValueList(multiVal[2][2])))
+        return [T(x[1], x[2]) for x in cart]
+    elseif multiVal[1] == "E"
+        lefts = [Left(x) for x in multiValueToValueList(multiVal[2][1])]
+        rights = [Right(x) for x in multiValueToValueList(multiVal[2][2])]
+        return vcat(lefts, rights)
+    elseif multiVal[1] == "A"
+        result = []
+        for c in multiVal[2]
+            cName = c[1]
+            cFields = [multiValueToValueList(f) for f in c[2]]
+            cart = collect(Iterators.product(cFields...))
+            append!(result, [eval(Symbol(cName))(x...) for x in cart])
+        end
+        return result
+    else
+        error("Unknown multiVal tag: " * string(multiVal[1]))
+    end
 end
 
 end

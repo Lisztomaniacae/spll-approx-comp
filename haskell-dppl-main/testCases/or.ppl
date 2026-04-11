@@ -1,1 +1,0 @@
-main = (Uniform < 0.75) || (Uniform < 0.2)

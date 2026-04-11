@@ -1,1 +1,0 @@
-main thetas = Uniform + (theta (subtree thetas @ 0) @ 1)

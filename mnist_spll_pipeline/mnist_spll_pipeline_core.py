@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import inspect
 
 import torch
 from torch.utils.data import ConcatDataset
@@ -91,7 +92,7 @@ def normalize_cutoff_mode(mode: Any) -> str:
 
 
 def get_cutoff_modes(config: Dict[str, Any]) -> List[str]:
-    raw_modes = list(config["inference"].get("cutoff_modes", ["local"]))
+    raw_modes = list(config["inference"].get("cutoff_modes", ["global"]))
     if not raw_modes:
         raise ValueError("inference.cutoff_modes must contain at least one mode.")
     ordered: List[str] = []
@@ -105,7 +106,8 @@ def get_cutoff_modes(config: Dict[str, Any]) -> List[str]:
 
 
 def compiled_program_path(compiled_root: Path, n_terms: int, cutoff_mode: str, cutoff: Optional[float]) -> Path:
-    return compiled_root / normalize_cutoff_mode(cutoff_mode) / f"sum_{int(n_terms):02d}" / threshold_label(cutoff) / "program.py"
+    return compiled_root / normalize_cutoff_mode(cutoff_mode) / f"sum_{int(n_terms):02d}" / threshold_label(
+        cutoff) / "program.py"
 
 
 def get_term_count_bounds(config: Dict[str, Any]) -> Tuple[int, int]:
@@ -203,7 +205,6 @@ def compile_spll_program(
     args += ["run", "--", "-i", str(spll_path)]
     if count_branches:
         args += ["-c"]
-    args += ["--cutoffMode", normalize_cutoff_mode(cutoff_mode)]
     if cutoff is not None:
         args += ["-k", str(cutoff)]
     args += ["compile", "-o", str(output_py_path), "-l", "python"]
@@ -211,7 +212,7 @@ def compile_spll_program(
     completed = subprocess.run(
         args,
         cwd=str(repo_root),
-        capture_output=True,
+        # capture_output=True,
         text=True,
         timeout=timeout_sec,
     )
@@ -254,7 +255,6 @@ def _get_tuple_item(value: Any, index: int) -> Any:
     raise TypeError(f"Value does not expose tuple-like index {index}: {value!r}")
 
 
-
 def _to_python_scalar(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         return float(int(value))
@@ -270,7 +270,6 @@ def _to_python_scalar(value: Any) -> Optional[float]:
         except Exception:
             pass
     return None
-
 
 
 def extract_probability(return_value: Any) -> float:
@@ -290,7 +289,6 @@ def extract_probability(return_value: Any) -> float:
         return float(scalar)
 
     raise TypeError(f"Could not extract probability from compiled SPLL return value: {return_value!r}")
-
 
 
 def extract_branch_count(return_value: Any) -> Optional[int]:
@@ -396,22 +394,32 @@ def sample_experiments(
     return experiments
 
 
+
 def posterior_for_experiment(
         module,
-        image_paths: Sequence[str],
-        max_sum: int,
+        image_paths,
+        max_sum,
         *,
-        progress_bar: Optional[TerminalProgressBar] = None,
-        progress_prefix: str = "",
-) -> Dict[str, List[Optional[float]]]:
-    posterior: List[float] = []
-    branch_counts: List[Optional[int]] = []
+        progress_bar=None,
+        progress_prefix="",
+):
+    posterior = []
+    branch_counts = []
+
+    sig = inspect.signature(module.main.forward)
+    expects_acc_prob = "acc_prob" in sig.parameters
+
     for candidate in range(max_sum + 1):
-        result = module.main.forward(candidate, *image_paths)
+        if expects_acc_prob:
+            result = module.main.forward(candidate, 1.0, *image_paths)
+        else:
+            result = module.main.forward(candidate, *image_paths)
+
         posterior.append(extract_probability(result))
         branch_counts.append(extract_branch_count(result))
         if progress_bar is not None:
             progress_bar.update(postfix=f"{progress_prefix} sum={candidate}")
+
     return {
         "posterior_raw": posterior,
         "branch_counts_raw": branch_counts,
@@ -468,7 +476,8 @@ def build_compiled_module_loader(
     verify_compiled_artifacts(paths, experiments, thresholds, cutoff_modes)
 
     unique_targets = sorted(
-        {(normalize_cutoff_mode(mode), int(exp["n_terms"]), cutoff) for exp in experiments for mode in cutoff_modes for cutoff in thresholds},
+        {(normalize_cutoff_mode(mode), int(exp["n_terms"]), cutoff) for exp in experiments for mode in cutoff_modes for
+         cutoff in thresholds},
         key=lambda item: (item[0], item[1], item[2] is not None, float(item[2] or -1.0)),
     )
     total_targets = len(unique_targets)
@@ -506,7 +515,8 @@ def build_compiled_module_loader(
     return get_module, finish_loading
 
 
-def build_stage_metadata(config: Dict[str, Any], stage_name: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def build_stage_metadata(config: Dict[str, Any], stage_name: str, extra: Optional[Dict[str, Any]] = None) -> Dict[
+    str, Any]:
     payload: Dict[str, Any] = {
         "stage": stage_name,
         "created_at_utc": utc_now_iso(),
@@ -557,11 +567,10 @@ def sample_and_save_staged_experiments(config: Dict[str, Any], ctx: PipelineCont
         num_experiments=num_experiments,
         terms_min=terms_min,
         terms_max=terms_max,
-        without_replacement_within_experiment=bool(ctx.inference_cfg.get("sample_without_replacement_within_experiment", True)),
+        without_replacement_within_experiment=bool(
+            ctx.inference_cfg.get("sample_without_replacement_within_experiment", True)),
         rng=rng,
         inputs_root=ctx.paths.inputs_root,
         show_progress=ctx.show_progress,
     )
     return experiments
-
-

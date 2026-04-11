@@ -17,13 +17,16 @@
 #
 # resolver: ./custom-snapshot.yaml
 # resolver: https://example.com/snapshots/2018-01-01.yaml
-resolver:
-  url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/12.yaml
-packages:
-  - .
-extra-deps:
-  - transformers-supply-0.1.0
-arch: x86_64
+resolver: lts-22.9
+
+# Use GHC from nixpkgs (ghc967) via shell.nix; disable stack's own nix
+# integration which would try to auto-detect a removed ghcXXX attribute.
+nix:
+  enable: false
+
+system-ghc: true
+compiler-check: newer-minor
+
 # User packages to be built.
 # Various formats can be used as shown in the example below.
 #
@@ -41,6 +44,7 @@ packages:
 #
 extra-deps:
   - transformers-supply-0.1.0
+  - partial-order-0.2.0.0
 # - acme-missiles-0.3
 # - git: https://github.com/commercialhaskell/stack.git
 #   commit: e7b331f14bcffb8367cd58fbfc8b40ec7642100a

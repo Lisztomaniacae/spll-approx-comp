@@ -1,2 +1,0 @@
-distr x=2.0*Uniform+x
-main=distr 5.0
