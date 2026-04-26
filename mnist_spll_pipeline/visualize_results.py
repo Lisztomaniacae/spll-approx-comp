@@ -884,7 +884,7 @@ def plot_pareto_tradeoff(
         ax.set_xlabel("Median inference runtime (s)")
         ax.set_ylabel("Sum accuracy (%)")
         ax.set_xscale("log")
-        ax.set_ylim(0, 82)
+        ax.set_ylim(0, 100)
         ax.grid(alpha=0.4)
 
     finish_panel_grid(fig, axes, len(model_ids))
