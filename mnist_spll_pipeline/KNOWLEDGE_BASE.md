@@ -1,0 +1,630 @@
+# MNIST SPLL Pipeline Knowledge Base
+
+This file is the living architectural memory for the Python-side MNIST + SPLL thesis pipeline.
+It is intended for future assistant sessions and future human changes. Read it before changing the
+pipeline.
+
+> **Maintenance rule:** every patch and every code change that affects the MNIST SPLL pipeline MUST update this knowledge base in the same patch so future work reflects the actual current behavior.
+
+## 1. Scope And Non-Scope
+
+### In scope
+
+This knowledge base covers the Python experiment pipeline under:
+
+```text
+mnist_spll_pipeline/
+```
+
+The pipeline exists to support the thesis comparison between exact and approximate inference on MNIST digit addition. The important experimental dimensions are:
+
+- trained MNIST model variant / achieved digit accuracy;
+- number of digit terms in a sum;
+- exact inference versus approximate pruning threshold;
+- runtime and branch-count cost;
+- sum accuracy and posterior-quality metrics;
+- additional true-sum-only traces, which isolate what happens to the expected candidate.
+
+### Out of scope by default
+
+Do **not** modify the Haskell/SPLL implementation under:
+
+```text
+haskell-dppl-main/
+```
+
+unless the user explicitly asks for it. The Python pipeline treats that folder as an external compiler/toolchain dependency. The normal interaction with it is through Stack and generated Python artifacts.
+
+## 2. Current Architecture Snapshot
+
+The pipeline is stage-based. The intended conceptual order is:
+
+```text
+train -> compile -> stage -> infer -> visualize
+```
+
+The current orchestration entrypoint is:
+
+```text
+mnist_spll_pipeline/run_spll_pipeline.py
+```
+
+After the architecture-deepening refactor, this entrypoint lazy-loads only the selected stage module via `load_stage_fn(...)`. This avoids importing all stage-specific dependencies when running a single stage. It does **not** yet make the compile stage dependency-free, because `compile_spll.py` still imports shared modules that themselves import PyTorch.
+
+### Core files
+
+| File | Role | Notes |
+|---|---|---|
+| `run_spll_pipeline.py` | Main stage dispatcher | Uses lazy imports. `STAGES` maps stage names to `(module_name, function_name)`. |
+| `train_mnist.py` | Trains all configured MNIST model variants | Owns train/validation subset selection and checkpoint export. |
+| `compile_spll.py` | Generates and compiles SPLL programs | Uses `compiled_program_path(...)` as the canonical artifact path helper. |
+| `stage_experiments.py` | Samples digit-addition inputs from fixed inference split | Writes raw PNG inputs and `staged_experiments.json`. |
+| `infer_experiments.py` | Inference stage orchestration | Iterates model variants and creates `InferenceRunEngine` instances. |
+| `inference_engine.py` | Deepened inference-run module | Owns full-posterior query, true-candidate query, timing, and raw run schema. |
+| `visualize_results.py` | Metrics, tables, and figures | Large file; contains both metric derivation and plotting. |
+| `mnist_spll_pipeline_core.py` | Shared pipeline helpers | Paths, SPLL program generation, compilation wrapper, module loading, inference helpers, JSON helpers. |
+| `mnist_spll_common.py` | Shared config/model/data utilities | Config loading, path resolution, CNN model, MNIST loading, model variant config. |
+| `run_spll_sum_experiments.py` | Legacy wrapper | Kept for compatibility, but should not be the preferred entrypoint. See known caveat below. |
+| `mnist_spll_config.yaml` | Joint config | Drives all stages. Some old-looking keys may be inert; see config caveats. |
+
+## 3. High-Level Data Flow
+
+```text
+mnist_spll_config.yaml
+        |
+        v
+train_mnist.py
+        |-- outputs/models/mnist_splits.pt
+        |-- outputs/models/model_<variant>.pt
+        |-- outputs/models/model_selection_manifest.json
+        |
+        v
+compile_spll.py
+        |-- outputs/spll_experiments/generated/spll_programs/sum_XX.spll
+        |-- outputs/spll_experiments/generated/compiled_python/global/sum_XX/<threshold_label>/program.py
+        |-- outputs/spll_experiments/compile_manifest.json
+        |
+        v
+stage_experiments.py
+        |-- outputs/spll_experiments/inputs/experiment_XXXX/*.png
+        |-- outputs/spll_experiments/staged_experiments.json
+        |
+        v
+infer_experiments.py + inference_engine.py
+        |-- outputs/spll_experiments/inference_manifest.json
+        |-- outputs/spll_experiments/inference_runs.json
+        |
+        v
+visualize_results.py
+        |-- outputs/spll_experiments/visualization/tables/*.csv
+        |-- outputs/spll_experiments/visualization/tables/*.json
+        |-- outputs/spll_experiments/visualization/figures/**/*.png
+```
+
+`outputs/spll_experiments/inference_runs.json` is the most important raw empirical artifact. Visualization should derive metrics from it instead of rerunning inference.
+
+## 4. Environment And Platform Workflow
+
+The project is normally used on Apple Silicon with two environments:
+
+| Stage | Preferred environment | Reason |
+|---|---|---|
+| `train` | native arm64 Python venv | Uses PyTorch/MPS for model training. |
+| `compile` | Rosetta/x86_64 shell and venv | Stack/GHC/SPLL compilation has historically been more reliable here. |
+| `stage` | native arm64 Python venv | Uses torchvision/Pillow/MNIST data handling. |
+| `infer` | native arm64 Python venv | Uses PyTorch/MPS for MNIST neural callback during compiled SPLL execution. |
+| `visualize` | native arm64 Python venv | Uses NumPy/matplotlib and saved JSON/CSV data. |
+
+### Important environment caveats
+
+1. Use explicit interpreter paths, not a shell alias such as `python -> /opt/homebrew/bin/python@3.11`.
+2. Lazy stage loading means `run_spll_pipeline.py compile` no longer imports every stage file. However, the compile stage still imports shared modules that currently import `torch`, so the x86 compile environment may still need PyTorch installed until shared imports are split further.
+3. `stack` must be available on `PATH` for the compile stage.
+4. The compile stage uses `paths.repo_root` from YAML to find the local SPLL/NeST checkout and `pythonLib.py`.
+5. Running `all` in one command is less robust on Apple Silicon because stages prefer different CPU architectures/environments. Prefer explicit stage-by-stage commands.
+
+### Canonical commands
+
+From `mnist_spll_pipeline/`:
+
+```bash
+./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml train
+```
+
+```bash
+arch -x86_64 zsh -f
+source .venv-spll-x86/bin/activate
+./.venv-spll-x86/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml compile
+```
+
+```bash
+./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml stage
+./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml infer
+./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml visualize
+```
+
+## 5. Config Semantics And Caveats
+
+The config is loaded by `mnist_spll_common.load_config(...)`. Loading injects two internal keys:
+
+- `_config_path`: absolute path to the YAML file;
+- `_config_dir`: parent directory of the YAML file.
+
+Path resolution should go through `resolve_path(config, raw_path)`, so relative paths stay relative to the YAML file rather than the current shell directory.
+
+### Inference config
+
+Important keys under `inference:`:
+
+| Key | Meaning |
+|---|---|
+| `num_experiments` | Number of staged MNIST sum experiments sampled from the fixed inference split. |
+| `terms_per_sum_min`, `terms_per_sum_max` | Inclusive term-count range. A separate SPLL program is generated for each term count. |
+| `sample_without_replacement_within_experiment` | If true, one staged sum does not reuse the same inference example twice. |
+| `top_predictions_to_store` | Number of top posterior candidates serialized in detailed visualization rows. |
+| `approximation_thresholds` | List of thresholds. `null` means exact/no pruning. Numeric values mean approximate pruning thresholds. |
+| `count_branches` | If true, SPLL compilation uses `-c` and compiled probability calls return branch metadata. |
+| `force_recompile` | If false and a compiled `program.py` already exists, compile can skip regeneration. |
+| `compile_timeout_sec` | Timeout for the Stack compilation subprocess. |
+| `stack_arch` | Optional architecture argument for Stack, e.g. `x86_64`. |
+| `show_progress`, `show_inner_progress` | Control outer and inner terminal progress bars. |
+
+### Approximation threshold semantics
+
+The SPLL compiler flag `-k/--topKCutoff` is a probability cutoff in `[0, 1]`. It is **not** a literal top-k count.
+
+Current interpretation:
+
+- `null` in YAML -> exact baseline, no pruning flag passed to SPLL;
+- `0.0` -> approximate code path with zero cutoff; useful for measuring overhead of the approximation machinery versus exact;
+- positive numbers such as `0.01`, `0.05`, `0.1`, `0.25` -> approximate pruning runs.
+
+### Cutoff mode caveat
+
+The Python pipeline currently uses only the accumulated global path-mass cutoff. `get_cutoff_modes(config)` always returns:
+
+```python
+["global"]
+```
+
+The YAML may still contain a `cutoff_modes:` key for historical reasons, but it is no longer a real user-facing knob. Do not reintroduce local/global branching unless the experiment design explicitly needs it and all artifact paths, visualization grouping, and documentation are updated.
+
+### Training config and biased variants
+
+Training uses configured `model_variants`. Each variant is trained and the exported checkpoint is chosen by the epoch whose validation accuracy is closest to `target_accuracy`.
+
+Current biased variants use:
+
+- an extreme broken-prior training distribution;
+- a uniform validation distribution;
+- the same global inference holdout as other variants.
+
+This design intentionally keeps inference comparable across biased and unbiased models while making the trained model priors distorted.
+
+### Naming caveat: test versus validation
+
+The code often uses `test` names for what is functionally the model-selection validation split. For example:
+
+- config key `test_ratio` controls the validation/model-selection split;
+- checkpoint field `selected_test_accuracy` means selected validation accuracy;
+- split manifest key `test_indices` means validation indices.
+
+When writing thesis text, prefer “validation/model-selection accuracy” unless the artifact field name is being discussed directly.
+
+## 6. Stage Details
+
+### 6.1 Training stage
+
+Entrypoint:
+
+```text
+train_mnist.run_training(config)
+```
+
+Main responsibilities:
+
+1. seed Python/NumPy/PyTorch;
+2. resolve device, usually MPS on Apple Silicon;
+3. load full MNIST train+test as one concatenated dataset;
+4. split it into train, validation, and inference subsets using configured ratios and seed;
+5. build label-index pools for train and validation subsets;
+6. train every configured model variant;
+7. save a split manifest, per-variant checkpoints, per-epoch metrics CSVs, and a model-selection manifest.
+
+Important training functions:
+
+| Function | Role |
+|---|---|
+| `compute_split_lengths(...)` | Validates ratios and computes train/validation/inference sizes. |
+| `get_model_variants(...)` | Normalizes/inherits model variant config. |
+| `select_variant_subset(...)` | Applies per-variant label distribution and max-example constraints. |
+| `train_variant(...)` | Trains one model variant and exports selected checkpoint. |
+| `choose_epoch_nearest_target(...)` | Chooses checkpoint by closest validation accuracy to target. |
+
+Training caveats:
+
+- Target accuracy is a selection target, not a guarantee.
+- Low-accuracy variants are produced mostly through smaller models, limited examples, and early/nearest checkpoint selection.
+- `require_mps: true` will fail if MPS is unavailable.
+- Validation can be distribution-controlled separately from training, which is important for biased variants.
+
+### 6.2 Compile stage
+
+Entrypoint:
+
+```text
+compile_spll.run_compile_stage(config)
+```
+
+Main responsibilities:
+
+1. derive thresholds, term counts, and fixed cutoff mode;
+2. write one SPLL source program per term count;
+3. compile each `(cutoff_mode, n_terms, threshold)` target;
+4. copy `pythonLib.py` beside each generated `program.py`;
+5. write `compile_manifest.json`.
+
+Canonical compiled artifact path:
+
+```text
+outputs/spll_experiments/generated/compiled_python/global/sum_XX/<threshold_label>/program.py
+```
+
+The canonical path helper is:
+
+```python
+compiled_program_path(compiled_root, n_terms, cutoff_mode, cutoff)
+```
+
+Do not duplicate this path formula in callers.
+
+SPLL program generation currently creates explicit left-associated addition:
+
+```spll
+main x0 x1 x2 = ((readMNist(x0) ++ readMNist(x1)) ++ readMNist(x2))
+```
+
+Keep this explicit unless SPLL parser/semantics are rechecked. Parser or operator-associativity assumptions should not be guessed.
+
+Compilation command shape:
+
+```bash
+stack [--arch x86_64] run -- -i <sum_XX.spll> [-c] [-k <cutoff>] compile -o <program.py> -l python
+```
+
+Compile caveats:
+
+- `null` cutoff does not pass `-k`.
+- `count_branches: true` passes `-c`.
+- If `force_recompile` is false and `program.py` exists, compilation is skipped; `pythonLib.py` is still copied if missing.
+- The Python pipeline does not inspect or modify Haskell internals during this stage.
+
+### 6.3 Stage-experiments stage
+
+Entrypoint:
+
+```text
+stage_experiments.run_stage_experiments(config)
+```
+
+Main responsibilities:
+
+1. load the fixed inference split from `mnist_splits.pt`;
+2. load raw MNIST images without tensor transforms;
+3. sample `num_experiments` term counts uniformly from the configured inclusive term range;
+4. sample MNIST examples from the inference split;
+5. save each selected image as a PNG under `inputs/experiment_XXXX/`;
+6. write `staged_experiments.json`.
+
+Each staged experiment contains:
+
+```json
+{
+  "experiment_id": 1,
+  "n_terms": 3,
+  "global_indices": [123, 456, 789],
+  "image_paths": [".../term_00_...png", "..."],
+  "labels": [5, 7, 1],
+  "true_sum": 13
+}
+```
+
+Staging caveats:
+
+- The staged experiments are sampled from the fixed inference split, not from train or validation.
+- `true_sum` is the sum of the ground-truth MNIST labels, not the model prediction.
+- If `sample_without_replacement_within_experiment` is true, one experiment will not use the same inference sample twice, but different experiments may reuse the same sample.
+
+### 6.4 Inference stage
+
+Entrypoint:
+
+```text
+infer_experiments.run_inference_stage(config)
+```
+
+Deepened boundary:
+
+```text
+inference_engine.InferenceRunEngine
+```
+
+Main responsibilities split:
+
+| Layer | Responsibility |
+|---|---|
+| `infer_experiments.py` | Load model variants, checkpoints, staged experiments, device, compiled-module loader, and write final manifests. |
+| `inference_engine.py` | Execute one or many inference runs and produce stable raw run records. |
+| `mnist_spll_pipeline_core.py` | Load compiled modules, patch `readMNist`, evaluate candidate sums, extract probabilities/branch counts. |
+
+`build_read_mnist(...)` loads the selected MNIST checkpoint and returns a callback that maps image paths to class probabilities. The compiled SPLL module is imported dynamically, then its `readMNist` symbol is replaced with this callback.
+
+For each model variant, staged experiment, cutoff mode, and threshold, inference does two conceptually separate measurements:
+
+1. **Full posterior query:** evaluate every candidate sum from `0` through `9 * n_terms`.
+2. **True-candidate query:** additionally evaluate only the expected true sum, e.g. for labels `5` and `7`, evaluate candidate `12` alone.
+
+The full posterior runtime is stored as `runtime_sec`. The true-candidate-only runtime is stored separately as `true_candidate_runtime_sec`. Do not add them together unless you explicitly want total measurement overhead of the instrumentation.
+
+Raw run schema highlights:
+
+| Field | Meaning |
+|---|---|
+| `model_id` | Configured model variant ID. |
+| `target_accuracy` | Target accuracy from config. |
+| `selected_epoch` | Epoch selected for exported checkpoint. |
+| `selected_test_accuracy` | Selected validation accuracy, despite the field name. |
+| `experiment_id` | Staged experiment ID. |
+| `cutoff_mode` | Currently always `global`. |
+| `n_terms` | Number of MNIST digits in the sum. |
+| `cutoff` | `null`, `0.0`, or positive cutoff. |
+| `threshold_label` | Stable label such as `exact`, `cutoff_0p01`. |
+| `candidate_sums` | All queried candidate sums, normally `[0, ..., 9 * n_terms]`. |
+| `posterior_raw` | Raw, unnormalized probability/mass for each candidate. |
+| `branch_counts_raw` | Branch count per candidate, or `null` values if unavailable. |
+| `runtime_sec` | Full posterior query runtime only. |
+| `true_candidate_sum` | Ground-truth sum queried separately. |
+| `true_candidate_probability_raw` | Raw probability for the true-sum-only query. |
+| `true_candidate_branch_count` | Branch count for the true-sum-only query. |
+| `true_candidate_runtime_sec` | Runtime for the true-sum-only query. |
+| `labels`, `global_indices`, `image_paths` | Provenance for the staged input. |
+| `compiled_program_path` | Exact compiled program used. |
+
+Branch-count extraction caveat:
+
+Compiled SPLL probability calls with branch counting enabled are expected to return a nested tuple-like value shaped approximately like:
+
+```text
+T(probability, T(0.0, branch_count))
+```
+
+`extract_branch_count(...)` reads the nested second component. If the structure is missing, it returns `None`. If the structure exists but cannot be converted to a scalar, it raises.
+
+### 6.5 Visualization stage
+
+Entrypoint:
+
+```text
+visualize_results.run_visualization_stage(config)
+```
+
+Main responsibilities:
+
+1. read `staged_experiments.json` and `inference_runs.json`;
+2. derive detailed rows from raw runs;
+3. summarize by cutoff mode, model, term count, and threshold;
+4. add exact-baseline deltas;
+5. write CSV/JSON tables;
+6. write main-text and appendix figures.
+
+Important metric derivation functions:
+
+| Function | Role |
+|---|---|
+| `prepare_detailed_rows(...)` | Converts raw run records into per-run metrics. |
+| `summarize_groups(...)` | Aggregates detailed rows into summary metrics. |
+| `add_exact_baseline_columns(...)` | Adds speedup, runtime ratio, accuracy delta, branch-count delta, and true-candidate deltas versus exact. |
+| `heatmap_specs()` | Defines appendix heatmaps. |
+| `plot_*` functions | Produce specific figure files. |
+
+Core detailed metrics:
+
+| Metric | Meaning |
+|---|---|
+| `predicted_sum` | Candidate with maximum normalized posterior probability. |
+| `correct` | Whether `predicted_sum == true_sum`. |
+| `confidence` | Normalized posterior probability of `predicted_sum`. |
+| `posterior_mass` | Sum of raw posterior values before normalization. |
+| `posterior_entropy` | Entropy of normalized posterior. |
+| `output_pool` | Count of candidates with raw mass greater than `EPS`. |
+| `output_pool_fraction` | `output_pool / candidate_count`. |
+| `total_branch_count` | Sum of available per-candidate branch counts. |
+| `zero_mass` | Whether posterior mass collapsed to zero. |
+| `true_candidate_survived` | Whether raw true-candidate probability is greater than `EPS`. |
+| `true_candidate_branch_fraction_of_total` | True-candidate branch count divided by total branch count, when defined. |
+| `true_candidate_runtime_fraction_of_full` | True-candidate runtime divided by full posterior runtime, when defined. |
+
+Collapse-rate caveat:
+
+In the current visualization code, “collapse rate” means the average of `zero_mass`, i.e. the fraction of runs whose full raw posterior mass is zero or less. It is **not** the complement of accuracy, survival rate, or output-pool fraction.
+
+Exact-baseline caveat:
+
+Exact-baseline deltas are computed within the same `(cutoff_mode, model_id, n_terms)` group. If the exact row is missing for a group, deltas become `NaN`.
+
+## 7. Current Known Caveats / Sharp Edges
+
+Keep these visible. They are useful future patch targets.
+
+1. **Legacy wrapper likely needs update after lazy stage loading.** `run_spll_sum_experiments.py` imports `STAGES` from `run_spll_pipeline.py`, but `STAGES` now contains `(module_name, function_name)` tuples rather than callable functions. Prefer `run_spll_pipeline.py`; if the legacy wrapper must be kept working, update it to use `load_stage_fn(...)` and update this knowledge base in that same patch.
+2. **Shared imports are still too heavy.** `compile_spll.py` lazy-loads as a stage, but imports `mnist_spll_pipeline_core.py` and `mnist_spll_common.py`, which import PyTorch. The compile environment may still need PyTorch until compile-only helpers are separated from neural/data helpers.
+3. **Visualization is still shallow/large.** `visualize_results.py` combines metric derivation, aggregation, plotting style, plot layout, and output writing. Future changes should deepen metrics before adding more plot-specific complexity.
+4. **Raw config dict remains the main cross-stage interface.** A future `ExperimentPlan` object would reduce string-key coupling and make tests cleaner.
+5. **`selected_test_accuracy` naming is misleading.** It means selected validation/model-selection accuracy.
+6. **True-candidate tracing is extra work.** It is intentionally separate data, not part of the original posterior run. Keep `runtime_sec` and `true_candidate_runtime_sec` separate.
+7. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`.
+8. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
+9. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
+
+## 8. Patch Discipline For Future Work
+
+Before making a patch:
+
+1. Read this file.
+2. Identify which stage or boundary owns the requested behavior.
+3. Avoid touching `haskell-dppl-main/` unless explicitly requested.
+4. Prefer changing one deep boundary over scattering small helper edits across stages.
+5. Preserve artifact schemas unless the user explicitly accepts migration cost.
+6. Decide whether old outputs need deletion/regeneration after the patch.
+
+Every patch should include:
+
+- code changes;
+- this file updated if behavior, workflow, schemas, commands, caveats, or architecture changed;
+- verification notes for what was checked;
+- a clear `git apply` command in the final response.
+
+Recommended verification commands from repo root:
+
+```bash
+git apply --check <patch-file.patch>
+```
+
+```bash
+python - <<'PY'
+import ast
+from pathlib import Path
+for path in Path('mnist_spll_pipeline').glob('*.py'):
+    ast.parse(path.read_text())
+print('all mnist_spll_pipeline/*.py files parse')
+PY
+```
+
+When local dependencies are available, prefer stage-level smoke checks over helper-only checks:
+
+```bash
+./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml stage
+./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml visualize
+```
+
+Only run heavy training/inference if the user asks or if the change genuinely requires it.
+
+## 9. Architectural Design Guidelines
+
+Use John Ousterhout-style deep modules: small interface, substantial hidden implementation.
+
+### Good direction
+
+- A stage script should orchestrate one stage, not own low-level schema details.
+- A deep module should own a stable boundary, such as “execute inference run and produce raw record.”
+- Callers should not duplicate path formulas, threshold labels, or raw JSON field construction.
+- Tests should assert behavior at module boundaries, not tiny internal helper details.
+
+### Avoid
+
+- Adding another helper function just to make one line testable while leaving the real call sequence untested.
+- Passing raw config dicts deeper than necessary.
+- Duplicating artifact paths in multiple files.
+- Letting visualization-specific choices change metric semantics silently.
+- Renaming artifact fields casually; saved JSON/CSV files are analysis inputs.
+
+### Current best refactor targets
+
+1. **Experiment plan module.** Convert raw YAML config into a typed `ExperimentPlan` containing paths, thresholds, term counts, model variants, and compile targets.
+2. **Visualization metrics module.** Split metric derivation from plotting so tables can be boundary-tested without matplotlib.
+3. **Compile artifact manager.** Move SPLL source generation, artifact pathing, Stack invocation, and manifest rows behind a small compile API.
+4. **Stage experiment repository.** Represent staged experiments as typed records instead of ad-hoc dicts.
+5. **Training variant planner.** Deepen biased/unbiased subset selection and checkpoint-selection semantics into a testable plan.
+
+## 10. Testing Strategy Guidelines
+
+Follow the principle: replace, do not layer.
+
+When a deep boundary test exists, delete or avoid redundant tests that only mirror internal helper steps.
+
+Suggested boundary tests:
+
+| Boundary | Test idea |
+|---|---|
+| `InferenceRunEngine` | Use a fake compiled module and fake module loader to assert full-posterior fields, true-candidate fields, branch-count handling, and runtime fields exist. |
+| Config/experiment plan | Given a small YAML fixture, assert thresholds, labels, paths, term counts, model variants, and compile targets. |
+| Staging | With a tiny fake dataset and temp directory, assert deterministic staged JSON shape and correct `true_sum`. |
+| Compile artifact manager | With fake command runner/temp repo, assert generated source, output paths, skip behavior, `pythonLib.py` copy, and manifest rows. |
+| Visualization metrics | Given tiny raw runs, assert detailed and summary metrics, exact deltas, collapse rate, and true-candidate metrics without creating plots. |
+
+Prefer local stand-ins:
+
+- fake compiled module with `main.forward(...)`;
+- temp filesystem roots;
+- tiny fake datasets;
+- small JSON fixtures.
+
+Avoid real MNIST downloads, real Stack compilation, and full model training in unit tests.
+
+## 11. Formatting Guidelines For This Knowledge Base
+
+Use predictable Markdown so future assistants can patch it safely.
+
+### Structure rules
+
+- Keep top-level sections numbered with `## N. Title`.
+- Add subsections with `### N.x Title` only when the section is long.
+- Use tables for path maps, schema fields, metrics, and stage responsibilities.
+- Use fenced code blocks for commands, artifact paths, JSON examples, and SPLL examples.
+- Prefer relative repo paths such as `mnist_spll_pipeline/inference_engine.py` over machine-specific absolute paths.
+- Put caveats near the workflow they affect, and also summarize major ones in `Current Known Caveats / Sharp Edges`.
+- When behavior changes, update the specific section and the caveat list if applicable.
+
+### Wording rules
+
+- Write current behavior in present tense.
+- Mark uncertain or unverified claims explicitly.
+- Do not claim a stage was run unless it was actually run.
+- Distinguish exact behavior from thesis interpretation.
+- When a field name is misleading but fixed for compatibility, document both the field name and the intended meaning.
+
+### Patch-note rules
+
+When a patch changes behavior, add a short note in the relevant section. Do not create a separate changelog unless the user asks; this file should stay organized by concept rather than by date.
+
+Minimum update examples:
+
+- New raw inference field -> update `Raw run schema highlights` and visualization metric notes.
+- New figure/table -> update visualization outputs and metric descriptions.
+- New config key -> update config table and caveats.
+- New stage command -> update workflow commands.
+- New architecture boundary -> update architecture snapshot and design guidelines.
+
+## 12. Response Guidelines For Future Assistants
+
+The user usually wants practical patches, not GitHub issue management.
+
+Prefer this response shape for code changes:
+
+1. short summary of what changed;
+2. link to a downloadable `.patch` file;
+3. exact command:
+
+```bash
+git apply <patch-file.patch>
+```
+
+4. verification performed, honestly stated.
+
+Avoid creating GitHub issues or PRs unless the user explicitly asks. If asked for architectural planning, it is fine to propose candidates, but once the user says to act, produce a concrete patch.
+
+## 13. Glossary
+
+| Term | Meaning in this pipeline |
+|---|---|
+| Exact | SPLL compilation/inference with `cutoff = null`, no `-k` pruning flag. |
+| Approximate | SPLL compilation/inference with numeric pruning threshold passed via `-k`. |
+| `0.0` cutoff | Approximate code path with zero cutoff; useful for overhead comparison, not identical to exact. |
+| Global cutoff | Current accumulated global path-mass pruning mode; fixed pipeline policy. |
+| Candidate sum | One possible output sum from `0` to `9 * n_terms`. |
+| Full posterior | Querying every candidate sum for one staged experiment. |
+| True candidate | The ground-truth sum from labels, queried separately after the full posterior. |
+| Output pool | Number of candidate sums with raw posterior mass greater than `EPS`. |
+| Collapse rate | Fraction of runs where the full posterior raw mass is zero or less. |
+| Branch count | Compiler-provided internal branch count when SPLL is compiled with `-c`. |
+| Selected test accuracy | Existing field name for selected validation/model-selection accuracy. |

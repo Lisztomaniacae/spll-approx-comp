@@ -15,6 +15,11 @@ This pipeline is split into distinct stage files plus one orchestration entrypoi
 - `mnist_spll_common.py`: shared model/config utilities.
 - `mnist_spll_config.yaml`: joint config for all stages.
 
+
+## Living knowledge base
+
+Detailed architecture notes, workflow caveats, output schemas, and future patch discipline live in [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md). Any patch that changes the MNIST SPLL pipeline should update that file in the same patch.
+
 ## Approximation reminder
 
 In this repo, `-k/--topKCutoff` is **not** a literal top-k class count. It is a **probability cutoff in the range 0..1** that prunes low-probability branches during inference. Exact inference is represented by `null` in `approximation_thresholds`.

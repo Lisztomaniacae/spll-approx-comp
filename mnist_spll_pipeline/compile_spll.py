@@ -8,6 +8,7 @@ from mnist_spll_pipeline_core import (
     build_pipeline_context,
     build_stage_metadata,
     compile_spll_program,
+    compiled_program_path,
     ensure_programs_for_term_counts,
     get_configured_term_counts,
     get_cutoff_modes,
@@ -57,7 +58,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
             spll_path = ctx.paths.program_root / f"sum_{n_terms:02d}.spll"
             for cutoff in thresholds:
                 label = threshold_label(cutoff)
-                compiled_py_path = ctx.paths.compiled_root / cutoff_mode / f"sum_{n_terms:02d}" / label / "program.py"
+                compiled_py_path = compiled_program_path(ctx.paths.compiled_root, n_terms, cutoff_mode, cutoff)
                 compile_spll_program(
                     repo_root=repo_root,
                     spll_path=spll_path,

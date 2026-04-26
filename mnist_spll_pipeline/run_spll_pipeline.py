@@ -1,36 +1,44 @@
 from __future__ import annotations
 
 import argparse
-from typing import Callable, Dict
+from importlib import import_module
+from typing import Callable, Dict, Tuple
 
-from compile_spll import run_compile_stage
-from infer_experiments import run_inference_stage
 from mnist_spll_common import load_config
-from stage_experiments import run_stage_experiments
-from train_mnist import run_training
-from visualize_results import run_visualization_stage
 
 
 StageFn = Callable[[dict], None]
+StageSpec = Tuple[str, str]
 
 
-STAGES: Dict[str, StageFn] = {
-    "train": run_training,
-    "compile": run_compile_stage,
-    "stage": run_stage_experiments,
-    "infer": run_inference_stage,
-    "visualize": run_visualization_stage,
+STAGES: Dict[str, StageSpec] = {
+    "train": ("train_mnist", "run_training"),
+    "compile": ("compile_spll", "run_compile_stage"),
+    "stage": ("stage_experiments", "run_stage_experiments"),
+    "infer": ("infer_experiments", "run_inference_stage"),
+    "visualize": ("visualize_results", "run_visualization_stage"),
 }
 
 ORDER = ["train", "compile", "stage", "infer", "visualize"]
 
 
+def load_stage_fn(stage_name: str) -> StageFn:
+    """Import only the selected stage and its dependencies.
+
+    The compile stage is often run from a different environment than train/infer
+    on Apple Silicon. Lazy loading keeps that stage from importing torch,
+    torchvision, matplotlib, or other dependencies owned by unrelated stages.
+    """
+
+    module_name, function_name = STAGES[stage_name]
+    module = import_module(module_name)
+    return getattr(module, function_name)
+
 
 def run_all(config: dict) -> None:
     for stage_name in ORDER:
         print(f"\n=== Running stage: {stage_name} ===", flush=True)
-        STAGES[stage_name](config)
-
+        load_stage_fn(stage_name)(config)
 
 
 def main() -> None:
@@ -54,7 +62,7 @@ def main() -> None:
     if args.stage == "all":
         run_all(config)
     else:
-        STAGES[args.stage](config)
+        load_stage_fn(args.stage)(config)
 
 
 if __name__ == "__main__":
