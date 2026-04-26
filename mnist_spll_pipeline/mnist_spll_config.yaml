@@ -41,12 +41,13 @@ training:
   # - max_train_examples: 7600
   # - max_validation_examples: 6000
   #
-  # Required counts under this skew:
-  # - train:      3800 ones, 152 nines
-  # - validation: 3000 ones, 120 nines
+  # Required train counts under this skew:
+  # - train: 3800 ones, 152 nines
   #
-  # These fit safely inside the expected label counts of the current shared
-  # 50%/40% split while leaving the common 10% inference holdout intact.
+  # Validation for these variants is balanced with max_validation_examples=6000,
+  # so it requests 600 examples per digit. These counts fit safely inside the
+  # expected label counts of the current shared 50%/40% split while leaving the
+  # common 10% inference holdout intact.
   extreme_biased_label_distribution: &extreme_biased_label_distribution
     0: 0.06
     1: 0.50
@@ -58,6 +59,21 @@ training:
     7: 0.06
     8: 0.06
     9: 0.02
+
+  # Validation profile for biased variants. Training keeps the broken-prior
+  # distribution above, but validation is intentionally uniform so model
+  # selection reflects balanced digit quality instead of the biased prior.
+  uniform_label_distribution: &uniform_label_distribution
+    0: 0.10
+    1: 0.10
+    2: 0.10
+    3: 0.10
+    4: 0.10
+    5: 0.10
+    6: 0.10
+    7: 0.10
+    8: 0.10
+    9: 0.10
 
   # Base defaults inherited by each model variant unless overridden below.
   model:
@@ -78,52 +94,53 @@ training:
       target_accuracy: 0.50
       max_train_examples: 20000
       epochs: 15
-      target_tolerance: 0.00
+      target_tolerance: 0.01
       model:
         conv_channels: [ ]
         fc_hidden: 2
 
     - id: acc50_biased_extreme
       target_accuracy: 0.50
-      epochs: 15
-      target_tolerance: 0.00
-      max_train_examples: 7600
+      epochs: 45
+      target_tolerance: 0.01
+      max_train_examples: 4000
       max_validation_examples: 6000
       train_label_distribution: *extreme_biased_label_distribution
-      validation_label_distribution: *extreme_biased_label_distribution
-      train_sampling_with_replacement: false
-      validation_sampling_with_replacement: false
-      model:
-        conv_channels: []
-        fc_hidden: 2
-
-    - id: acc70
-      target_accuracy: 0.70
-      max_train_examples: 20000
-      target_tolerance: 0.00
-      epochs: 15
-      model:
-        conv_channels: [ ]
-        fc_hidden: 3
-
-    - id: acc70_biased_extreme
-      target_accuracy: 0.70
-      epochs: 15
-      target_tolerance: 0.00
-      max_train_examples: 7600
-      max_validation_examples: 6000
-      train_label_distribution: *extreme_biased_label_distribution
-      validation_label_distribution: *extreme_biased_label_distribution
+      validation_label_distribution: *uniform_label_distribution
       train_sampling_with_replacement: false
       validation_sampling_with_replacement: false
       model:
         conv_channels: []
         fc_hidden: 4
 
+    - id: acc70
+      target_accuracy: 0.70
+      max_train_examples: 9000
+      target_tolerance: 0.01
+      epochs: 15
+      model:
+        conv_channels: [ ]
+        fc_hidden: 4
+
+    - id: acc70_biased_extreme
+      target_accuracy: 0.70
+      epochs: 45
+      target_tolerance: 0.01
+      max_train_examples: 6000
+      max_validation_examples: 6000
+      train_label_distribution: *extreme_biased_label_distribution
+      validation_label_distribution: *uniform_label_distribution
+      train_sampling_with_replacement: false
+      validation_sampling_with_replacement: false
+      model:
+        conv_channels: []
+        fc_hidden: 6
+
     - id: acc90
       target_accuracy: 0.90
       epochs: 15
-      target_tolerance: 0.00
+      target_tolerance: 0.01
+      max_train_examples: 12000
       model:
         conv_channels: [ ]
         fc_hidden: 8
@@ -131,24 +148,24 @@ training:
 
     - id: acc90_biased_extreme
       target_accuracy: 0.90
-      epochs: 15
-      target_tolerance: 0.00
+      epochs: 45
+      target_tolerance: 0.01
       max_train_examples: 7600
       max_validation_examples: 6000
       train_label_distribution: *extreme_biased_label_distribution
-      validation_label_distribution: *extreme_biased_label_distribution
+      validation_label_distribution: *uniform_label_distribution
       train_sampling_with_replacement: false
       validation_sampling_with_replacement: false
       model:
         conv_channels: []
-        fc_hidden: 7
+        fc_hidden: 12
         dropout: 0.1
 
 inference:
   device: auto
-  num_experiments: 1000
+  num_experiments: 300
   terms_per_sum_min: 2
-  terms_per_sum_max: 5
+  terms_per_sum_max: 4
   sample_without_replacement_within_experiment: true
   top_predictions_to_store: 5
   # In this repo, -k/--topKCutoff is a probability cutoff in [0, 1], not a literal class count.

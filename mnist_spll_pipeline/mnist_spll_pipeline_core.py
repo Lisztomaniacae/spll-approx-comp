@@ -395,6 +395,30 @@ def sample_experiments(
 
 
 
+def evaluate_candidate_sum(
+        module,
+        image_paths,
+        candidate_sum: int,
+        *,
+        expects_acc_prob: Optional[bool] = None,
+) -> Dict[str, Any]:
+    if expects_acc_prob is None:
+        sig = inspect.signature(module.main.forward)
+        expects_acc_prob = "acc_prob" in sig.parameters
+
+    candidate = int(candidate_sum)
+    if expects_acc_prob:
+        result = module.main.forward(candidate, 1.0, *image_paths)
+    else:
+        result = module.main.forward(candidate, *image_paths)
+
+    return {
+        "candidate_sum": candidate,
+        "probability_raw": float(extract_probability(result)),
+        "branch_count": extract_branch_count(result),
+    }
+
+
 def posterior_for_experiment(
         module,
         image_paths,
@@ -410,13 +434,15 @@ def posterior_for_experiment(
     expects_acc_prob = "acc_prob" in sig.parameters
 
     for candidate in range(max_sum + 1):
-        if expects_acc_prob:
-            result = module.main.forward(candidate, 1.0, *image_paths)
-        else:
-            result = module.main.forward(candidate, *image_paths)
+        candidate_trace = evaluate_candidate_sum(
+            module,
+            image_paths,
+            candidate,
+            expects_acc_prob=expects_acc_prob,
+        )
 
-        posterior.append(extract_probability(result))
-        branch_counts.append(extract_branch_count(result))
+        posterior.append(candidate_trace["probability_raw"])
+        branch_counts.append(candidate_trace["branch_count"])
         if progress_bar is not None:
             progress_bar.update(postfix=f"{progress_prefix} sum={candidate}")
 

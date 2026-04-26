@@ -201,6 +201,28 @@ def quantile(values: Iterable[float], q: float) -> float:
 
 
 
+
+
+def finite_float_values(items: Iterable[Dict[str, Any]], key: str) -> List[float]:
+    values: List[float] = []
+    for item in items:
+        try:
+            value = float(item.get(key, float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def mean_or_nan(values: Sequence[float]) -> float:
+    return mean(values) if values else float("nan")
+
+
+def median_or_nan(values: Sequence[float]) -> float:
+    return median(values) if values else float("nan")
+
+
 def summarize_groups(
         rows: List[Dict[str, Any]],
         group_keys: Sequence[str],
@@ -214,6 +236,8 @@ def summarize_groups(
     for items in grouped.values():
         first = items[0]
         runtimes = [float(item["runtime_sec"]) for item in items]
+        true_candidate_runtimes = finite_float_values(items, "true_candidate_runtime_sec")
+        true_candidate_branch_counts = finite_float_values(items, "true_candidate_branch_count")
         result: Dict[str, Any] = {key: first[key] for key in group_keys}
         result.update(
             {
@@ -235,6 +259,24 @@ def summarize_groups(
                 "mean_posterior_mass": mean(float(item["posterior_mass"]) for item in items),
                 "zero_mass_rate": mean(float(item["zero_mass"]) for item in items),
                 "mean_candidate_count": mean(float(item["candidate_count"]) for item in items),
+                "mean_true_candidate_runtime_sec": mean_or_nan(true_candidate_runtimes),
+                "median_true_candidate_runtime_sec": median_or_nan(true_candidate_runtimes),
+                "true_candidate_runtime_q25_sec": quantile(true_candidate_runtimes, 0.25),
+                "true_candidate_runtime_q75_sec": quantile(true_candidate_runtimes, 0.75),
+                "mean_true_candidate_probability_raw": mean(
+                    float(item["true_candidate_probability_raw"]) for item in items
+                ),
+                "mean_true_candidate_normalized_probability": mean(
+                    float(item["true_candidate_normalized_probability"]) for item in items
+                ),
+                "mean_true_candidate_branch_count": mean_or_nan(true_candidate_branch_counts),
+                "true_candidate_survival_rate": mean(float(item["true_candidate_survived"]) for item in items),
+                "mean_true_candidate_branch_fraction_of_total": mean_or_nan(
+                    finite_float_values(items, "true_candidate_branch_fraction_of_total")
+                ),
+                "mean_true_candidate_runtime_fraction_of_full": mean_or_nan(
+                    finite_float_values(items, "true_candidate_runtime_fraction_of_full")
+                ),
             }
         )
         summary.append(result)
@@ -260,6 +302,7 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
     for row in summary_rows:
         baseline = baseline_by_group.get(tuple(row[key] for key in keys_wo_threshold))
         runtime = float(row["median_runtime_sec"])
+        true_runtime = float(row.get("median_true_candidate_runtime_sec", float("nan")))
         if baseline is None:
             row["speedup_vs_exact"] = float("nan")
             row["runtime_ratio_vs_exact"] = float("nan")
@@ -268,6 +311,12 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
             row["output_pool_fraction_delta_vs_exact"] = float("nan")
             row["branch_count_delta_vs_exact"] = float("nan")
             row["collapse_rate_delta_vs_exact"] = float("nan")
+            row["true_candidate_speedup_vs_exact"] = float("nan")
+            row["true_candidate_runtime_ratio_vs_exact"] = float("nan")
+            row["true_candidate_probability_delta_vs_exact"] = float("nan")
+            row["true_candidate_normalized_probability_delta_vs_exact"] = float("nan")
+            row["true_candidate_branch_count_delta_vs_exact"] = float("nan")
+            row["true_candidate_survival_rate_delta_vs_exact"] = float("nan")
             continue
 
         baseline_runtime = float(baseline["median_runtime_sec"])
@@ -283,6 +332,30 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
         )
         row["collapse_rate_delta_vs_exact"] = float(row["zero_mass_rate"]) - float(baseline["zero_mass_rate"])
 
+        baseline_true_runtime = float(baseline.get("median_true_candidate_runtime_sec", float("nan")))
+        row["true_candidate_speedup_vs_exact"] = (
+            float(baseline_true_runtime / true_runtime)
+            if baseline_true_runtime > 0 and true_runtime > 0
+            else float("nan")
+        )
+        row["true_candidate_runtime_ratio_vs_exact"] = (
+            float(true_runtime / baseline_true_runtime)
+            if baseline_true_runtime > 0 and true_runtime > 0
+            else float("nan")
+        )
+        row["true_candidate_probability_delta_vs_exact"] = float(
+            row["mean_true_candidate_probability_raw"]
+        ) - float(baseline["mean_true_candidate_probability_raw"])
+        row["true_candidate_normalized_probability_delta_vs_exact"] = float(
+            row["mean_true_candidate_normalized_probability"]
+        ) - float(baseline["mean_true_candidate_normalized_probability"])
+        row["true_candidate_branch_count_delta_vs_exact"] = float(
+            row["mean_true_candidate_branch_count"]
+        ) - float(baseline["mean_true_candidate_branch_count"])
+        row["true_candidate_survival_rate_delta_vs_exact"] = float(
+            row["true_candidate_survival_rate"]
+        ) - float(baseline["true_candidate_survival_rate"])
+
 
 
 def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
@@ -294,8 +367,49 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
         confidence = float(posterior[predicted_sum]) if posterior else 0.0
         branch_counts = [int(value) for value in run.get("branch_counts_raw", []) if value is not None]
         output_pool = int(sum(1 for value in posterior_raw if float(value) > EPS))
-        candidate_count = int(len(run.get("candidate_sums", [])))
+        candidate_sums = [int(value) for value in run.get("candidate_sums", [])]
+        candidate_count = int(len(candidate_sums))
         posterior_mass = float(sum(posterior_raw))
+        true_sum = int(run["true_sum"])
+
+        true_candidate_sum = int(run.get("true_candidate_sum", true_sum))
+        try:
+            true_candidate_index = candidate_sums.index(true_candidate_sum)
+        except ValueError:
+            true_candidate_index = true_candidate_sum if 0 <= true_candidate_sum < len(posterior_raw) else -1
+
+        fallback_true_probability = (
+            float(posterior_raw[true_candidate_index])
+            if 0 <= true_candidate_index < len(posterior_raw)
+            else 0.0
+        )
+        fallback_true_normalized_probability = (
+            float(posterior[true_candidate_index])
+            if 0 <= true_candidate_index < len(posterior)
+            else 0.0
+        )
+        raw_branch_counts = list(run.get("branch_counts_raw", []))
+        fallback_true_branch_count = (
+            raw_branch_counts[true_candidate_index]
+            if 0 <= true_candidate_index < len(raw_branch_counts)
+            else None
+        )
+        true_candidate_probability_raw = float(
+            run.get("true_candidate_probability_raw", fallback_true_probability)
+        )
+        true_candidate_normalized_probability = (
+            float(true_candidate_probability_raw / posterior_mass) if posterior_mass > 0 else 0.0
+        )
+        if "true_candidate_probability_raw" not in run:
+            true_candidate_normalized_probability = fallback_true_normalized_probability
+
+        true_candidate_branch_count_raw = run.get("true_candidate_branch_count", fallback_true_branch_count)
+        true_candidate_branch_count = (
+            float("nan") if true_candidate_branch_count_raw is None else int(true_candidate_branch_count_raw)
+        )
+        total_branch_count = int(sum(branch_counts))
+        true_candidate_runtime_sec = float(run.get("true_candidate_runtime_sec", float("nan")))
+
         detailed_rows.append(
             {
                 "model_id": run["model_id"],
@@ -307,9 +421,9 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "threshold_label": run["threshold_label"],
                 "cutoff": run["cutoff"],
                 "n_terms": int(run["n_terms"]),
-                "true_sum": int(run["true_sum"]),
+                "true_sum": true_sum,
                 "predicted_sum": predicted_sum,
-                "correct": int(predicted_sum == int(run["true_sum"])),
+                "correct": int(predicted_sum == true_sum),
                 "runtime_sec": float(run["runtime_sec"]),
                 "confidence": confidence,
                 "posterior_mass": posterior_mass,
@@ -317,10 +431,26 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "candidate_count": candidate_count,
                 "output_pool": output_pool,
                 "output_pool_fraction": (float(output_pool) / candidate_count) if candidate_count > 0 else 0.0,
-                "total_branch_count": int(sum(branch_counts)),
+                "total_branch_count": total_branch_count,
                 "mean_branch_count": float(mean(branch_counts)) if branch_counts else 0.0,
                 "max_branch_count": int(max(branch_counts)) if branch_counts else 0,
                 "zero_mass": int(posterior_mass <= 0.0),
+                "true_candidate_sum": true_candidate_sum,
+                "true_candidate_probability_raw": true_candidate_probability_raw,
+                "true_candidate_normalized_probability": true_candidate_normalized_probability,
+                "true_candidate_branch_count": true_candidate_branch_count,
+                "true_candidate_runtime_sec": true_candidate_runtime_sec,
+                "true_candidate_survived": int(true_candidate_probability_raw > EPS),
+                "true_candidate_branch_fraction_of_total": (
+                    float(true_candidate_branch_count / total_branch_count)
+                    if total_branch_count > 0 and math.isfinite(float(true_candidate_branch_count))
+                    else float("nan")
+                ),
+                "true_candidate_runtime_fraction_of_full": (
+                    float(true_candidate_runtime_sec / float(run["runtime_sec"]))
+                    if float(run["runtime_sec"]) > 0 and math.isfinite(true_candidate_runtime_sec)
+                    else float("nan")
+                ),
                 "labels": str(run["labels"]),
                 "global_indices": str(run["global_indices"]),
                 "image_paths": str(run["image_paths"]),
@@ -442,9 +572,14 @@ def format_speedup(value: float) -> str:
 def format_cell_value(value: float, fmt: str, metric_key: str | None = None) -> str:
     if math.isnan(value):
         return "—"
-    if metric_key == "median_runtime_sec":
+    if metric_key in {"median_runtime_sec", "median_true_candidate_runtime_sec"}:
         return format_runtime_seconds(value)
-    if metric_key in {"speedup_vs_exact", "runtime_ratio_vs_exact"}:
+    if metric_key in {
+        "speedup_vs_exact",
+        "runtime_ratio_vs_exact",
+        "true_candidate_speedup_vs_exact",
+        "true_candidate_runtime_ratio_vs_exact",
+    }:
         return format_speedup(value)
     return format(value, fmt)
 
@@ -581,6 +716,45 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Speedup vs exact baseline by model, term count, and cutoff",
             colorbar_label="Speedup vs exact (log scale)",
             filename="heatmap_speedup_by_model.png",
+            cmap_name="viridis",
+            higher_is_better=True,
+            use_log_norm=True,
+            fmt=".2f",
+        ),
+        HeatmapSpec(
+            key="mean_true_candidate_normalized_probability",
+            title="Mean normalized probability assigned to the true sum",
+            colorbar_label="P(true sum | candidates)",
+            filename="heatmap_true_candidate_probability_by_model.png",
+            cmap_name="viridis",
+            higher_is_better=True,
+            fixed_range=(0.0, 1.0),
+            fmt=".2f",
+        ),
+        HeatmapSpec(
+            key="true_candidate_survival_rate",
+            title="True-sum survival rate by model, term count, and cutoff",
+            colorbar_label="Survival rate",
+            filename="heatmap_true_candidate_survival_by_model.png",
+            cmap_name="viridis",
+            higher_is_better=True,
+            fixed_range=(0.0, 1.0),
+            fmt=".2f",
+        ),
+        HeatmapSpec(
+            key="mean_true_candidate_branch_count",
+            title="Mean branch count for the true-sum query",
+            colorbar_label="True-sum branch count",
+            filename="heatmap_true_candidate_branch_count_by_model.png",
+            cmap_name="viridis_r",
+            higher_is_better=False,
+            fmt=".0f",
+        ),
+        HeatmapSpec(
+            key="true_candidate_speedup_vs_exact",
+            title="True-sum-only speedup vs exact baseline",
+            colorbar_label="True-sum speedup vs exact (log scale)",
+            filename="heatmap_true_candidate_speedup_by_model.png",
             cmap_name="viridis",
             higher_is_better=True,
             use_log_norm=True,
@@ -945,6 +1119,86 @@ def plot_pareto_tradeoff(
 
 
 
+def plot_true_candidate_metric_vs_cutoff(
+        summary_rows: List[Dict[str, Any]],
+        term_counts: Sequence[int],
+        threshold_order: Sequence[str],
+        output_path: Path,
+        *,
+        metric_key: str,
+        ylabel: str,
+        title: str,
+        biased_only: bool | None = None,
+        yscale: str | None = None,
+        ylim: Tuple[float, float] | None = None,
+) -> None:
+    if not summary_rows:
+        return
+
+    model_styles = build_model_styles(summary_rows)
+    model_ids = ordered_model_ids(summary_rows)
+    if biased_only is not None:
+        model_ids = [mid for mid in model_ids if is_biased_model_id(mid) == biased_only]
+    approx_thresholds = non_exact_threshold_labels(threshold_order)
+    if not approx_thresholds or not model_ids:
+        return
+
+    x = np.arange(len(approx_thresholds), dtype=float)
+    x_labels = [pretty_threshold_label(label) for label in approx_thresholds]
+
+    nrows, ncols = term_panel_grid(term_counts)
+    fig, axes_grid = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(5.9 * ncols, 4.5 * nrows),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    axes = list(axes_grid.flatten())
+
+    for ax, n_terms in zip(axes, term_counts):
+        for model_id in model_ids:
+            rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
+            row_by_label = {str(row["threshold_label"]): row for row in rows}
+            y = np.array([
+                float(row_by_label[label].get(metric_key, float("nan"))) if label in row_by_label else np.nan
+                for label in approx_thresholds
+            ])
+            color = model_styles[model_id]["color"]
+            ax.plot(
+                x,
+                y,
+                marker="o",
+                markersize=4,
+                color=color,
+                linewidth=1.8,
+                alpha=0.98,
+                label=model_styles[model_id]["label"],
+            )
+        ax.set_title(f"{int(n_terms)} terms")
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels)
+        ax.set_xlabel("Cutoff")
+        ax.set_ylabel(ylabel)
+        if yscale is not None:
+            ax.set_yscale(yscale)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.grid(alpha=0.45)
+
+    finish_panel_grid(fig, axes, len(term_counts))
+    if axes:
+        if biased_only is None:
+            legend_title = "Models"
+        else:
+            legend_title = "Biased models" if biased_only else "Unbiased models"
+        axes[0].legend(loc="upper left", title=legend_title, fontsize=9, title_fontsize=10)
+    fig.suptitle(title, fontsize=15)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+    plt.close(fig)
+
+
+
 def plot_runtime_vs_cutoff(
         summary_rows: List[Dict[str, Any]],
         term_counts: Sequence[int],
@@ -1276,6 +1530,11 @@ def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order:
         "- runtime_vs_cutoff_biased_by_terms.png",
         "- overhead_exact_vs_zero_cutoff_by_terms.png",
         "- accuracy_delta_vs_exact_by_terms.png",
+        "- true_candidate_runtime_vs_cutoff_unbiased_by_terms.png",
+        "- true_candidate_runtime_vs_cutoff_biased_by_terms.png",
+        "- true_candidate_branch_count_vs_cutoff_by_terms.png",
+        "- true_candidate_survival_vs_cutoff_by_terms.png",
+        "- true_candidate_probability_vs_cutoff_by_terms.png",
         "- heatmap_branch_count_by_model.png",
         "- heatmap_collapse_rate_by_model.png",
         "",
@@ -1284,6 +1543,10 @@ def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order:
         "- heatmap_accuracy_by_model.png",
         "- heatmap_output_pool_by_model.png",
         "- heatmap_speedup_by_model.png",
+        "- heatmap_true_candidate_probability_by_model.png",
+        "- heatmap_true_candidate_survival_by_model.png",
+        "- heatmap_true_candidate_branch_count_by_model.png",
+        "- heatmap_true_candidate_speedup_by_model.png",
         "",
         "Table outputs:",
         "- detailed_results.csv",
@@ -1398,6 +1661,57 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             term_counts=term_counts,
             threshold_order=threshold_order,
             output_path=mode_main_dir / "accuracy_delta_vs_exact_by_terms.png",
+        )
+        plot_true_candidate_metric_vs_cutoff(
+            summary_rows=mode_rows,
+            term_counts=term_counts,
+            threshold_order=threshold_order,
+            output_path=mode_main_dir / "true_candidate_runtime_vs_cutoff_unbiased_by_terms.png",
+            metric_key="median_true_candidate_runtime_sec",
+            ylabel="Median true-sum-only runtime (s)",
+            title="True-sum-only runtime vs pruning threshold — unbiased models",
+            biased_only=False,
+            yscale="log",
+        )
+        plot_true_candidate_metric_vs_cutoff(
+            summary_rows=mode_rows,
+            term_counts=term_counts,
+            threshold_order=threshold_order,
+            output_path=mode_main_dir / "true_candidate_runtime_vs_cutoff_biased_by_terms.png",
+            metric_key="median_true_candidate_runtime_sec",
+            ylabel="Median true-sum-only runtime (s)",
+            title="True-sum-only runtime vs pruning threshold — biased models",
+            biased_only=True,
+            yscale="log",
+        )
+        plot_true_candidate_metric_vs_cutoff(
+            summary_rows=mode_rows,
+            term_counts=term_counts,
+            threshold_order=threshold_order,
+            output_path=mode_main_dir / "true_candidate_branch_count_vs_cutoff_by_terms.png",
+            metric_key="mean_true_candidate_branch_count",
+            ylabel="Mean true-sum branch count",
+            title="True-sum branch count vs pruning threshold",
+        )
+        plot_true_candidate_metric_vs_cutoff(
+            summary_rows=mode_rows,
+            term_counts=term_counts,
+            threshold_order=threshold_order,
+            output_path=mode_main_dir / "true_candidate_survival_vs_cutoff_by_terms.png",
+            metric_key="true_candidate_survival_rate",
+            ylabel="True-sum survival rate",
+            title="True-sum survival rate vs pruning threshold",
+            ylim=(0.0, 1.05),
+        )
+        plot_true_candidate_metric_vs_cutoff(
+            summary_rows=mode_rows,
+            term_counts=term_counts,
+            threshold_order=threshold_order,
+            output_path=mode_main_dir / "true_candidate_probability_vs_cutoff_by_terms.png",
+            metric_key="mean_true_candidate_normalized_probability",
+            ylabel="Mean normalized true-sum probability",
+            title="Probability assigned to the true sum vs pruning threshold",
+            ylim=(0.0, 1.05),
         )
 
         overhead_rows = plot_overhead_exact_vs_zero(

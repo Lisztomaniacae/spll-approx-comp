@@ -20,6 +20,7 @@ from mnist_spll_pipeline_core import (
     build_compiled_module_loader,
     build_pipeline_context,
     build_read_mnist,
+    evaluate_candidate_sum,
     build_stage_metadata,
     get_cutoff_modes,
     get_thresholds,
@@ -102,10 +103,19 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     )
                     runtime_sec = time.perf_counter() - started
                     finished_at = utc_now_iso()
+
+                    true_candidate_sum = int(experiment["true_sum"])
+                    true_started_at = utc_now_iso()
+                    true_started = time.perf_counter()
+                    true_candidate_trace = evaluate_candidate_sum(module, image_paths, true_candidate_sum)
+                    true_candidate_runtime_sec = time.perf_counter() - true_started
+                    true_finished_at = utc_now_iso()
+
                     per_run_bar.finish(
                         postfix=(
                             f"model={model_id}, cutoff_mode={cutoff_mode}, exp={experiment['experiment_id']:04d}, "
-                            f"terms={n_terms}, cutoff={label}, runtime={runtime_sec:.2f}s"
+                            f"terms={n_terms}, cutoff={label}, runtime={runtime_sec:.2f}s, "
+                            f"true_sum_runtime={true_candidate_runtime_sec:.4f}s"
                         )
                     )
                     raw_runs.append(
@@ -132,6 +142,16 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                             "runtime_sec": float(runtime_sec),
                             "started_at_utc": started_at,
                             "finished_at_utc": finished_at,
+                            "true_candidate_sum": int(true_candidate_trace["candidate_sum"]),
+                            "true_candidate_probability_raw": float(true_candidate_trace["probability_raw"]),
+                            "true_candidate_branch_count": (
+                                None
+                                if true_candidate_trace["branch_count"] is None
+                                else int(true_candidate_trace["branch_count"])
+                            ),
+                            "true_candidate_runtime_sec": float(true_candidate_runtime_sec),
+                            "true_candidate_started_at_utc": true_started_at,
+                            "true_candidate_finished_at_utc": true_finished_at,
                             "true_sum": int(experiment["true_sum"]),
                             "labels": [int(v) for v in experiment["labels"]],
                             "global_indices": [int(v) for v in experiment["global_indices"]],
@@ -166,6 +186,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "num_runs": len(raw_runs),
                     "show_inner_progress": show_inner_progress,
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
+                    "true_candidate_trace": True,
                     "paths": ctx.paths.to_json_dict(),
                 },
             ),
@@ -186,6 +207,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "thresholds": thresholds,
                     "num_runs": len(raw_runs),
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
+                    "true_candidate_trace": True,
                     "paths": ctx.paths.to_json_dict(),
                 },
             ),
