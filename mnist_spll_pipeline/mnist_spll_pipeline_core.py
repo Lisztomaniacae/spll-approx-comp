@@ -92,17 +92,10 @@ def normalize_cutoff_mode(mode: Any) -> str:
 
 
 def get_cutoff_modes(config: Dict[str, Any]) -> List[str]:
-    raw_modes = list(config["inference"].get("cutoff_modes", ["global"]))
-    if not raw_modes:
-        raise ValueError("inference.cutoff_modes must contain at least one mode.")
-    ordered: List[str] = []
-    seen = set()
-    for mode in raw_modes:
-        normalized = normalize_cutoff_mode(mode)
-        if normalized not in seen:
-            seen.add(normalized)
-            ordered.append(normalized)
-    return ordered
+    # The thesis pipeline now uses only the accumulated global path-mass cutoff.
+    # Keep this helper so older stage code and saved metadata can still talk about
+    # a cutoff mode, but do not expose it as a YAML knob anymore.
+    return ["global"]
 
 
 def compiled_program_path(compiled_root: Path, n_terms: int, cutoff_mode: str, cutoff: Optional[float]) -> Path:
