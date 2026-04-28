@@ -37,6 +37,7 @@ from spll_training_core import (
     validate_probability_and_loss,
     write_csv_header,
     write_failure_report,
+    zero_anchor_from_model,
 )
 from mnist_spll_common import ensure_dir, resolve_device
 
@@ -70,22 +71,45 @@ def _run_preflight(
     loss_epsilon: float,
 ) -> None:
     model.train()
-    optimizer.zero_grad(set_to_none=True)
-    case = generate_sum_case(split_manifest, base_seed=seed, n_terms=n_terms, step=1, split="train")
-    p_true, _branch_count = call_true_sum(module, int(case["true_sum"]), case["global_indices"])
-    if not isinstance(p_true, torch.Tensor) or not p_true.requires_grad:
-        raise RuntimeError(
-            "Generated SPLL artifact returned a probability that is not a differentiable torch.Tensor."
+    max_probe_steps = 50
+    last_zero_mass = False
+    for probe_step in range(1, max_probe_steps + 1):
+        optimizer.zero_grad(set_to_none=True)
+        case = generate_sum_case(
+            split_manifest,
+            base_seed=seed,
+            n_terms=n_terms,
+            step=probe_step,
+            split="train",
         )
-    loss = -torch.log(p_true + loss_epsilon)
-    validate_probability_and_loss(p_true, loss, step=0)
-    loss.backward()
-    norm = grad_norm(model)
-    if norm <= 0.0:
-        raise RuntimeError(
-            "Preflight differentiability check failed: no finite nonzero parameter gradient was produced."
+        p_true, _branch_count = call_true_sum(
+            module,
+            int(case["true_sum"]),
+            case["global_indices"],
+            allow_pruned_zero=True,
+            zero_anchor=zero_anchor_from_model(model),
         )
-    optimizer.zero_grad(set_to_none=True)
+        if not isinstance(p_true, torch.Tensor) or not p_true.requires_grad:
+            raise RuntimeError(
+                "Generated SPLL artifact returned a probability that is not a differentiable torch.Tensor."
+            )
+        loss = -torch.log(p_true + loss_epsilon)
+        validate_probability_and_loss(p_true, loss, step=0)
+        loss.backward()
+        norm = grad_norm(model)
+        if norm > 0.0:
+            optimizer.zero_grad(set_to_none=True)
+            return
+        last_zero_mass = tensor_to_float(p_true) <= 0.0
+
+    reason = (
+        "only fully pruned zero-mass cases were observed"
+        if last_zero_mass
+        else "no nonzero gradient was produced"
+    )
+    raise RuntimeError(
+        f"Preflight differentiability check failed after {max_probe_steps} probe cases: {reason}."
+    )
 
 
 def _evaluate_sum_probe(
@@ -108,7 +132,12 @@ def _evaluate_sum_probe(
                 step=probe_step,
                 split="validation",
             )
-            p_true, _branch_count = call_true_sum(module, int(case["true_sum"]), case["global_indices"])
+            p_true, _branch_count = call_true_sum(
+                module,
+                int(case["true_sum"]),
+                case["global_indices"],
+                allow_pruned_zero=True,
+            )
             masses.append(tensor_to_float(p_true))
     return float(sum(masses) / len(masses)) if masses else None
 
@@ -270,9 +299,21 @@ def _train_one_run(
         else:
             for step in range(1, max_steps + 1):
                 model.train()
-                case = generate_sum_case(split_manifest, base_seed=seed, n_terms=n_terms, step=step, split="train")
+                case = generate_sum_case(
+                    split_manifest,
+                    base_seed=seed,
+                    n_terms=n_terms,
+                    step=step,
+                    split="train",
+                )
                 optimizer.zero_grad(set_to_none=True)
-                p_true, branch_count = call_true_sum(module, int(case["true_sum"]), case["global_indices"])
+                p_true, branch_count = call_true_sum(
+                    module,
+                    int(case["true_sum"]),
+                    case["global_indices"],
+                    allow_pruned_zero=True,
+                    zero_anchor=zero_anchor_from_model(model),
+                )
                 if not isinstance(p_true, torch.Tensor) or not p_true.requires_grad:
                     raise RuntimeError(f"Detached/non-tensor probability returned at training step {step}.")
                 loss = -torch.log(p_true + loss_epsilon)

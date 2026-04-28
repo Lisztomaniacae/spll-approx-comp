@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import math
+import numbers
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -399,25 +400,85 @@ def load_compiled_training_module(path: Path, n_terms: int, mode_name: str):
     return import_compiled_module(path, module_name)
 
 
-def _as_probability_tensor(return_value: Any) -> torch.Tensor:
+def _is_numeric_zero(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, numbers.Real):
+        return float(value) == 0.0
+    return False
+
+
+def _is_zero_tensor(value: torch.Tensor) -> bool:
+    if value.numel() != 1:
+        return False
+    return float(value.detach().cpu().item()) == 0.0
+
+
+def _pruned_zero_tensor(zero_anchor: Optional[torch.Tensor]) -> torch.Tensor:
+    if zero_anchor is not None:
+        return zero_anchor * 0.0
+    return torch.tensor(0.0, dtype=torch.float32)
+
+
+def zero_anchor_from_model(model: nn.Module) -> torch.Tensor:
+    for param in model.parameters():
+        if param.requires_grad:
+            return param.sum() * 0.0
+    raise RuntimeError("Cannot build a differentiable zero anchor: model has no trainable parameters.")
+
+
+def _as_probability_tensor(
+    return_value: Any,
+    *,
+    allow_pruned_zero: bool = False,
+    zero_anchor: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     if isinstance(return_value, torch.Tensor):
+        if (
+            allow_pruned_zero
+            and zero_anchor is not None
+            and not return_value.requires_grad
+            and _is_zero_tensor(return_value)
+        ):
+            return _pruned_zero_tensor(zero_anchor)
         return return_value
+    if allow_pruned_zero and _is_numeric_zero(return_value):
+        return _pruned_zero_tensor(zero_anchor)
+
     probability = _get_tuple_item(return_value, 0)
     if isinstance(probability, torch.Tensor):
+        if (
+            allow_pruned_zero
+            and zero_anchor is not None
+            and not probability.requires_grad
+            and _is_zero_tensor(probability)
+        ):
+            return _pruned_zero_tensor(zero_anchor)
         return probability
+    if allow_pruned_zero and _is_numeric_zero(probability):
+        return _pruned_zero_tensor(zero_anchor)
+
     raise TypeError(
         "Generated SPLL artifact returned a non-tensor probability. "
-        "Pipeline II requires a differentiable torch.Tensor probability."
+        "Pipeline II requires a differentiable torch.Tensor probability, except for literal zero "
+        "returned by a fully pruned true-sum path."
     )
 
 
-def call_true_sum(module: Any, true_sum: int, indices: Sequence[int]) -> Tuple[torch.Tensor, Optional[int]]:
+def call_true_sum(
+    module: Any,
+    true_sum: int,
+    indices: Sequence[int],
+    *,
+    allow_pruned_zero: bool = False,
+    zero_anchor: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[int]]:
     sig = inspect.signature(module.main.forward)
     if "acc_prob" in sig.parameters:
         result = module.main.forward(int(true_sum), 1.0, *[int(v) for v in indices])
     else:
         result = module.main.forward(int(true_sum), *[int(v) for v in indices])
-    p_true = _as_probability_tensor(result)
+    p_true = _as_probability_tensor(result, allow_pruned_zero=allow_pruned_zero, zero_anchor=zero_anchor)
     branch_count = extract_branch_count(result)
     return p_true, branch_count
 

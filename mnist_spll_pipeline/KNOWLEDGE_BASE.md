@@ -708,6 +708,8 @@ inference_modes:
 
 Branch counting is enabled by default as sanity metadata. The loss uses only the probability component of the generated return value.
 
+A fully pruned true-sum path may return a literal Python `0.0` from the generated artifact instead of a tensor. Pipeline II treats this as a legitimate zero-mass pruning event, converts it to a model-connected zero tensor for `-log(epsilon)` training, logs `zero_true_mass=1`, and produces a zero-gradient optimizer step. Nonzero scalar probabilities are still invalid because they would indicate a detached generated-artifact path.
+
 ### 14.6 Milestones, traces, and stopping
 
 Pipeline II trains from sum labels only, but milestones are held-out digit accuracy thresholds. Digit labels are never used in the loss.
@@ -722,13 +724,20 @@ Important run artifacts:
 - `checkpoints/milestone_*.pt`: first crossing snapshots;
 - `checkpoints/final.pt`: final snapshot.
 
+Visualization behavior:
+
+- `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final digit accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
+- Main-text Pipeline II trace figures use rolling means by default so noisy per-step losses and masses do not dominate the thesis-facing plot. Raw traces are still exported to appendix figures with `_raw_trace` in the file name.
+- Milestone figures keep unreached modes visible via summary tables and a plot footnote instead of silently pretending missing modes do not exist.
+- Wall-clock milestone plots may use a log y-axis when values span more than about 5x; tick labels should remain readable scalar seconds, not opaque scientific notation.
+
 ### 14.7 Safety rails
 
 Pipeline II should fail loudly rather than silently produce invalid training results. The train stage should abort if:
 
 - generated artifacts are missing;
-- the generated probability is not a differentiable torch tensor;
-- the preflight gradient check fails;
+- the generated probability is not a differentiable torch tensor, except for literal zero from a fully pruned true-sum path;
+- the preflight gradient check cannot find at least one nonzero-gradient case across its probe cases;
 - probability/loss becomes NaN, infinite, or negative;
 - gradients contain NaN or infinity.
 
