@@ -1,0 +1,74 @@
+seed: 42
+seeds: [42]
+show_progress: true
+
+paths:
+  data_root: ./data
+  output_root: ./outputs/spll_training
+  repo_root: ../haskell-dppl-main
+
+data:
+  # Pipeline II uses only the official MNIST train partition, then creates one
+  # globally materialized equal-count-per-digit 80/20 split.
+  split_seed: 42
+  train_fraction: 0.8
+  normalize:
+    mean: 0.1307
+    std: 0.3081
+  augmentation: none
+  image_cache_device: device   # device | cpu
+  image_cache_strategy: lru    # none | lru
+  image_cache_max_items: 4096
+
+model:
+  input_channels: 1
+  num_classes: 10
+  conv_channels: [32, 64]
+  kernel_size: 3
+  pool_kernel: 2
+  fc_hidden: 128
+  dropout: 0.25
+
+optimizer:
+  name: adam
+  learning_rate: 0.001
+  weight_decay: 0.0
+
+training:
+  device: auto
+  require_mps: true
+  max_steps: 1000000
+  loss_epsilon: 1.0e-12
+
+validation:
+  interval_steps: 100
+  digit_eval_batch_size: 256
+  milestones: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  stop_at_highest_milestone: true
+  sum_probe:
+    enabled: true
+    num_cases: 100
+
+schedule:
+  preview_size: 20
+
+experiments:
+  - n_terms: 2
+    enabled: true
+    max_steps: 1000000
+
+inference_modes:
+  - name: exact
+    top_k_cutoff: null
+  - name: approx_0p01
+    top_k_cutoff: 0.01
+  - name: approx_0p05
+    top_k_cutoff: 0.05
+  - name: approx_0p1
+    top_k_cutoff: 0.1
+
+compile:
+  count_branches: true
+  force_recompile: true
+  timeout_sec: 3600
+  stack_arch: x86_64

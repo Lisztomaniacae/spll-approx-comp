@@ -120,12 +120,46 @@ class CNNClassifier(nn.Module):
         return self.classifier(x)
 
 
+def _deep_merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge YAML configs with dict recursion and list replacement."""
+
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_config(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def load_config(config_path: str | Path) -> Dict[str, Any]:
     config_path = Path(config_path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
     if not isinstance(cfg, dict):
         raise ValueError("Top-level YAML config must be a mapping.")
+
+    extends_value = cfg.get("extends")
+    if extends_value:
+        base_path = Path(str(extends_value))
+        if not base_path.is_absolute():
+            base_path = config_path.parent / base_path
+        base_path = base_path.expanduser().resolve()
+        with base_path.open("r", encoding="utf-8") as handle:
+            base_cfg = yaml.safe_load(handle)
+        if not isinstance(base_cfg, dict):
+            raise ValueError(f"Base YAML config must be a mapping: {base_path}")
+        if base_cfg.get("extends"):
+            raise ValueError(
+                "Only one config inheritance level is supported. "
+                f"{config_path} extends {base_path}, but that base config also defines extends."
+            )
+        cfg = _deep_merge_config(base_cfg, cfg)
+        cfg["_base_config_path"] = str(base_path)
+
+    cfg.pop("extends", None)
     cfg["_config_path"] = str(config_path)
     cfg["_config_dir"] = str(config_path.parent)
     return cfg
@@ -137,6 +171,7 @@ def save_config(config: Dict[str, Any], destination: str | Path) -> None:
     payload = copy.deepcopy(config)
     payload.pop("_config_path", None)
     payload.pop("_config_dir", None)
+    payload.pop("_base_config_path", None)
     with destination.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 

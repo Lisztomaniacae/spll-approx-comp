@@ -1,0 +1,30 @@
+extends: mnist_spll_training_config.yaml
+
+paths:
+  output_root: ./outputs/spll_training_smoke
+
+seeds: [42]
+
+training:
+  max_steps: 500
+
+validation:
+  interval_steps: 50
+  milestones: [0.1, 0.2]
+  sum_probe:
+    enabled: true
+    num_cases: 20
+
+schedule:
+  preview_size: 20
+
+experiments:
+  - n_terms: 2
+    enabled: true
+    max_steps: 500
+
+inference_modes:
+  - name: exact
+    top_k_cutoff: null
+  - name: approx_0p01
+    top_k_cutoff: 0.01

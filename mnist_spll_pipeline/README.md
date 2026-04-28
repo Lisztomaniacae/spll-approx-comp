@@ -260,3 +260,165 @@ source .venv-spll-x86/bin/activate
 ./.venv-spll-x86/bin/python -m pip install torch torchvision
 ./.venv-spll-x86/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml compile
 ```
+
+---
+
+# Pipeline II: training through generated SPLL inference
+
+Pipeline II tests whether SPLL approximation changes the **training process** itself. Unlike the inference-evaluation pipeline above, this pipeline trains an MNIST base model from **sum labels only** by calling the generated SPLL Python artifact inside every optimizer step.
+
+## Pipeline II files
+
+- `run_spll_training_pipeline.py`: stage dispatcher for Pipeline II.
+- `mnist_spll_training_config.yaml`: default Pipeline II config.
+- `mnist_spll_training_smoke_config.yaml`: small layered smoke-test override using one-level `extends`.
+- `prepare_spll_training.py`: creates the balanced split manifest, compact schedule manifests/previews, and shared initial checkpoints.
+- `compile_spll_training.py`: writes SPLL sum programs and compiles exact/approximate generated Python artifacts.
+- `train_spll_generated.py`: trains through the generated SPLL artifacts with a differentiable `readMNist` callback.
+- `visualize_spll_training.py`: writes milestone tables and per-arity training plots.
+- `spll_training_core.py`: Pipeline II helpers for paths, schedules, generated-artifact calls, training guards, and split handling.
+
+## Pipeline II design summary
+
+Pipeline II uses only the official MNIST training partition. It materializes one global equal-count-per-digit 80/20 split:
+
+- 80% source pool for sum-supervised training cases;
+- 20% held-out uniform digit validation split;
+- the official MNIST test partition is reserved/unused.
+
+Training supervision is only the true sum. Digit labels are used for split construction and held-out digit-accuracy milestones, not for the loss. One optimizer step is one generated SPLL true-sum query:
+
+```text
+p_true = generated_spll.main.forward(true_sum, *global_indices)
+loss = -log(p_true + epsilon)
+```
+
+The generated SPLL artifact receives global MNIST indices. The patched `readMNist(index)` callback resolves the index to a transformed MNIST tensor, runs the current differentiable base model, and returns torch probabilities without detaching them.
+
+## Pipeline II stage order
+
+```text
+prepare -> compile -> train -> visualize
+```
+
+`all` exists, but on Apple Silicon it is usually safer to run stages explicitly because `compile` should run under Rosetta/x86 while `prepare`, `train`, and `visualize` should run in the native arm64 environment.
+
+## Pipeline II commands
+
+From `mnist_spll_pipeline/`.
+
+### Smoke test prepare
+
+Run in native arm64:
+
+```bash
+source .venv-train-arm64/bin/activate
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml prepare
+```
+
+### Smoke test compile
+
+Run in Rosetta/x86_64:
+
+```bash
+arch -x86_64 zsh -f
+cd /Users/lisztomaniacae/IdeaProjects/spll-approx-comp/mnist_spll_pipeline
+source .venv-spll-x86/bin/activate
+./.venv-spll-x86/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml compile
+```
+
+### Smoke test train and visualize
+
+Run in native arm64:
+
+```bash
+source .venv-train-arm64/bin/activate
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml train
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml visualize
+```
+
+### Default Pipeline II run
+
+Use the same stage split, replacing the config path:
+
+```bash
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml prepare
+```
+
+```bash
+arch -x86_64 zsh -f
+source .venv-spll-x86/bin/activate
+./.venv-spll-x86/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml compile
+```
+
+```bash
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml train
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml visualize
+```
+
+## Pipeline II outputs
+
+Default output root:
+
+```text
+outputs/spll_training/
+```
+
+Smoke-test output root:
+
+```text
+outputs/spll_training_smoke/
+```
+
+Important artifacts:
+
+```text
+outputs/spll_training/
+  config_used.yaml
+  data_split_manifest.json
+  schedules/
+    seed_42_terms_02_schedule_manifest.json
+    previews/seed_42_terms_02_preview.jsonl
+  initial_checkpoints/
+    seed_42_terms_02.pt
+  generated/
+    spll_programs/sum_terms_02.spll
+    compiled_python/terms_02/<mode>/program.py
+  runs/
+    seed_42_terms_02_exact/
+      train_trace.csv
+      validation_trace.csv
+      milestones.json
+      checkpoints/milestone_0p10.pt
+      checkpoints/final.pt
+  visualization/
+    tables/milestone_summary.csv
+    figures/main_text/*.png
+    figures/appendix/*.png
+```
+
+## Pipeline II safety checks
+
+The training stage is intentionally strict. It aborts if:
+
+- prepared split/schedule/checkpoint artifacts are missing;
+- compiled generated Python artifacts are missing;
+- the generated SPLL probability is detached or not a torch tensor;
+- the preflight call does not produce finite nonzero gradients;
+- true-sum probability or loss becomes `NaN`, `inf`, or negative;
+- gradients contain `NaN` or `inf`.
+
+If compiled artifacts are missing, `train` refuses to compile automatically and prints the Rosetta/x86 compile command instead.
+
+## Pipeline II config inheritance
+
+`mnist_spll_common.load_config(...)` supports one `extends` level. This is used by `mnist_spll_training_smoke_config.yaml`.
+
+Merge semantics:
+
+- dictionaries deep-merge;
+- lists replace completely;
+- nested `extends` is rejected;
+- `config_used.yaml` stores the fully resolved config.
+
+Whenever `mnist_spll_training_config.yaml` changes, the smoke override must be checked and updated in the same patch so it remains a fast representative of the default config.

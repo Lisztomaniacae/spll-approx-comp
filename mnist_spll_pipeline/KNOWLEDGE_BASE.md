@@ -628,3 +628,120 @@ Avoid creating GitHub issues or PRs unless the user explicitly asks. If asked fo
 | Collapse rate | Fraction of runs where the full posterior raw mass is zero or less. |
 | Branch count | Compiler-provided internal branch count when SPLL is compiled with `-c`. |
 | Selected test accuracy | Existing field name for selected validation/model-selection accuracy. |
+
+## 14. Pipeline II: training through generated SPLL inference
+
+Pipeline II is separate from the original inference-evaluation pipeline. It tests whether exact versus approximate SPLL inference changes the **training process** itself.
+
+### 14.1 Core idea
+
+Each optimizer step is one MNIST sum case. The base MNIST model is trained from the true sum only:
+
+```text
+p_true = generated_spll.main.forward(true_sum, *global_indices)
+loss = -log(p_true + epsilon)
+```
+
+The generated SPLL Python artifact is part of the gradient path. Do not replace it with a hand-written torch-native semantic equivalent for Pipeline II experiments. The patched `readMNist(index)` callback must return torch probabilities produced by the current model without detaching them.
+
+### 14.2 Pipeline II files
+
+| File | Role |
+|---|---|
+| `run_spll_training_pipeline.py` | Stage dispatcher for Pipeline II. |
+| `mnist_spll_training_config.yaml` | Default Pipeline II config. |
+| `mnist_spll_training_smoke_config.yaml` | Layered smoke override. |
+| `prepare_spll_training.py` | Creates the balanced split, schedule manifests/previews, and shared initial checkpoints. |
+| `compile_spll_training.py` | Writes SPLL source programs and compiles generated Python artifacts per arity/mode. |
+| `train_spll_generated.py` | Trains through generated SPLL artifacts with differentiable `readMNist`. |
+| `visualize_spll_training.py` | Writes milestone tables and per-arity figures. |
+| `spll_training_core.py` | Shared Pipeline II helpers. |
+
+### 14.3 Stage order and environments
+
+Pipeline II stage order:
+
+```text
+prepare -> compile -> train -> visualize
+```
+
+Preferred Apple Silicon environment split:
+
+| Stage | Environment |
+|---|---|
+| `prepare` | native arm64 torch venv |
+| `compile` | Rosetta/x86 SPLL venv |
+| `train` | native arm64 torch venv |
+| `visualize` | native arm64 torch venv |
+
+`all` exists for convenience but is less robust on Apple Silicon because the compile stage prefers a different architecture.
+
+### 14.4 Data and schedules
+
+Pipeline II uses the official MNIST train partition only. It materializes one global equal-count-per-digit 80/20 split:
+
+- train source pool: used to sample sum-supervised training cases;
+- validation pool: used only for held-out digit accuracy and same-mode true-sum-mass probes;
+- official MNIST test partition: reserved/unused.
+
+The training schedule is compact and random-access deterministic. `prepare` writes manifests plus a small preview, not a huge JSONL schedule up to `max_steps`. A case is reproduced from `(seed, n_terms, step, split)`.
+
+Within one sum case, repeated digits must use distinct MNIST image indices. Across steps, replacement is allowed.
+
+### 14.5 Exact and approximate modes
+
+Initial Pipeline II modes:
+
+```yaml
+inference_modes:
+  - name: exact
+    top_k_cutoff: null
+  - name: approx_0p01
+    top_k_cutoff: 0.01
+  - name: approx_0p05
+    top_k_cutoff: 0.05
+  - name: approx_0p1
+    top_k_cutoff: 0.1
+```
+
+`exact` means true exact compilation without `-k`. A `-k 0.0` overhead mode is intentionally not part of the first Pipeline II run, but can be added later as another inference mode.
+
+Branch counting is enabled by default as sanity metadata. The loss uses only the probability component of the generated return value.
+
+### 14.6 Milestones, traces, and stopping
+
+Pipeline II trains from sum labels only, but milestones are held-out digit accuracy thresholds. Digit labels are never used in the loss.
+
+Validation is interval-based. A milestone is recorded at the first observed validation point whose digit accuracy is at or above the threshold. Milestone checkpoints are mandatory.
+
+Important run artifacts:
+
+- `train_trace.csv`: step-level loss, true-sum mass, zero-mass flag, branch count, gradient norm;
+- `validation_trace.csv`: digit accuracy, same-mode true-sum-mass probe, recent train means;
+- `milestones.json`: first observed step/time for each milestone;
+- `checkpoints/milestone_*.pt`: first crossing snapshots;
+- `checkpoints/final.pt`: final snapshot.
+
+### 14.7 Safety rails
+
+Pipeline II should fail loudly rather than silently produce invalid training results. The train stage should abort if:
+
+- generated artifacts are missing;
+- the generated probability is not a differentiable torch tensor;
+- the preflight gradient check fails;
+- probability/loss becomes NaN, infinite, or negative;
+- gradients contain NaN or infinity.
+
+The train stage must not auto-compile missing artifacts. It should tell the user to run the compile stage in the Rosetta/x86 environment.
+
+### 14.8 Config inheritance
+
+`mnist_spll_common.load_config(...)` supports exactly one `extends` level. Dicts deep-merge and lists replace completely. Nested inheritance is rejected.
+
+This is used for the Pipeline II smoke config. Whenever the default Pipeline II config changes, the smoke override must be checked and updated in the same patch so it remains a valid fast representative of the default experiment.
+
+## 15. Patch discipline
+
+Every patch/change that affects pipeline behavior, file structure, workflow, output schemas, config semantics, or known caveats must update this knowledge base in the same patch.
+
+For Pipeline II specifically, README updates are mandatory whenever user-facing commands, stages, config names, environment assumptions, or expected outputs change.
