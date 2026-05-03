@@ -654,7 +654,7 @@ The generated SPLL Python artifact is part of the gradient path. Do not replace 
 | `prepare_spll_training.py` | Creates the balanced split, schedule manifests/previews, and shared initial checkpoints. |
 | `compile_spll_training.py` | Writes SPLL source programs and compiles generated Python artifacts per arity/mode. |
 | `train_spll_generated.py` | Trains through generated SPLL artifacts with differentiable `readMNist`. |
-| `visualize_spll_training.py` | Writes milestone tables and per-arity figures. |
+| `visualize_spll_training.py` | Writes milestone tables, per-arity grouped milestone bar charts, and trace figures. |
 | `spll_training_core.py` | Shared Pipeline II helpers. |
 
 ### 14.3 Stage order and environments
@@ -727,6 +727,8 @@ Important run artifacts:
 Visualization behavior:
 
 - `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final digit accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
+- Main-text Pipeline II milestone figures for steps and wall-clock time are grouped bar charts split by arity: milestones are on the x-axis, the metric is on the y-axis, and inference modes are bars within each milestone group. Values are averaged across seeds for the same `(n_terms, mode, milestone)` cell.
+- Pipeline II visualization uses a stable color map derived from inference-mode order. The same mode color is reused across steps-to-milestone, time-to-milestone, and trace figures.
 - Main-text Pipeline II trace figures use rolling means by default so noisy per-step losses and masses do not dominate the thesis-facing plot. Raw traces are still exported to appendix figures with `_raw_trace` in the file name.
 - Milestone figures keep unreached modes visible via summary tables and a plot footnote instead of silently pretending missing modes do not exist.
 - Wall-clock milestone plots may use a log y-axis when values span more than about 5x; tick labels should remain readable scalar seconds, not opaque scientific notation.

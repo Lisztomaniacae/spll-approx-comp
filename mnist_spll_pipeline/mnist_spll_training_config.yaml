@@ -1,5 +1,5 @@
 seed: 42
-seeds: [42]
+seeds: [42,43,44,45,46]
 show_progress: true
 
 paths:

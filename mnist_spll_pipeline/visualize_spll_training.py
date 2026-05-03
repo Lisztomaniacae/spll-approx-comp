@@ -81,6 +81,29 @@ def _mode_order(config: Dict[str, Any]) -> List[str]:
     return [str(mode["name"]) for mode in get_inference_modes(config)]
 
 
+def _mode_color_map(config: Dict[str, Any]) -> Dict[str, str]:
+    """Return a stable, colorblind-friendly color per inference mode.
+
+    The mapping is derived from config order so the same mode keeps the same
+    color in milestone bar charts and trace figures, independent of which
+    milestones were reached in a particular run.
+    """
+
+    palette = [
+        "#4E79A7",
+        "#F28E2B",
+        "#59A14F",
+        "#E15759",
+        "#B07AA1",
+        "#76B7B2",
+        "#EDC948",
+        "#FF9DA7",
+        "#9C755F",
+        "#BAB0AC",
+    ]
+    return {mode_name: palette[idx % len(palette)] for idx, mode_name in enumerate(_mode_order(config))}
+
+
 def _highest_milestone(summary: Dict[str, Any]) -> Optional[float]:
     milestones = summary.get("milestones", {})
     if not milestones:
@@ -214,6 +237,13 @@ def _format_log_tick(value: float, _pos: int) -> str:
     return f"{value:.2g}"
 
 
+def _format_milestone_label(value: float) -> str:
+    percent = value * 100.0
+    if abs(percent - round(percent)) < 1e-9:
+        return f"{percent:.0f}%"
+    return f"{percent:g}%"
+
+
 def _plot_metric_for_terms(
     *,
     config: Dict[str, Any],
@@ -225,39 +255,71 @@ def _plot_metric_for_terms(
     output_path: Path,
     maybe_log: bool = False,
 ) -> None:
-    term_rows = [row for row in rows if int(row["n_terms"]) == int(n_terms) and row["reached"] and row[metric] not in {None, ""}]
+    term_all_rows = [row for row in rows if int(row["n_terms"]) == int(n_terms)]
+    term_rows = [row for row in term_all_rows if row["reached"] and row[metric] not in {None, ""}]
     if not term_rows:
         return
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    milestones = sorted({float(row["milestone"]) for row in term_all_rows})
+    mode_names = _mode_order(config)
+    colors = _mode_color_map(config)
+    x_positions = list(range(len(milestones)))
+    mode_count = max(1, len(mode_names))
+    bar_width = min(0.82 / mode_count, 0.18)
+    group_width = bar_width * mode_count
+
+    fig, ax = plt.subplots(figsize=(max(8.5, 0.75 * len(milestones) + 2.5), 5.0))
     values_for_scale: List[float] = []
-    for mode_name in _mode_order(config):
+    plotted_modes: List[str] = []
+
+    for mode_idx, mode_name in enumerate(mode_names):
         mode_rows = [row for row in term_rows if row["mode_name"] == mode_name]
-        if not mode_rows:
-            continue
         by_milestone: Dict[float, List[float]] = {}
         for row in mode_rows:
             by_milestone.setdefault(float(row["milestone"]), []).append(float(row[metric]))
-        xs = sorted(by_milestone)
-        ys = [sum(by_milestone[x]) / len(by_milestone[x]) for x in xs]
+
+        xs: List[float] = []
+        ys: List[float] = []
+        offset = -group_width / 2.0 + bar_width / 2.0 + mode_idx * bar_width
+        for milestone_idx, milestone in enumerate(milestones):
+            values = by_milestone.get(milestone)
+            if not values:
+                continue
+            xs.append(float(x_positions[milestone_idx]) + offset)
+            ys.append(sum(values) / len(values))
+
+        if not ys:
+            continue
         values_for_scale.extend(ys)
-        ax.plot([x * 100.0 for x in xs], ys, marker="o", label=mode_name)
+        plotted_modes.append(mode_name)
+        ax.bar(
+            xs,
+            ys,
+            width=bar_width,
+            label=mode_name,
+            color=colors[mode_name],
+            edgecolor="white",
+            linewidth=0.8,
+        )
 
     if maybe_log:
         positive = [v for v in values_for_scale if v > 0]
         if positive and max(positive) / min(positive) > 5.0:
             ax.set_yscale("log")
+            ax.set_ylim(min(positive) * 0.75, max(positive) * 1.35)
             ax.yaxis.set_major_locator(mticker.LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
             ax.yaxis.set_major_formatter(mticker.FuncFormatter(_format_log_tick))
             ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.set_title(f"{n_terms}-term SPLL training: {ylabel}", loc="left")
-    ax.set_xlabel("Held-out digit accuracy milestone (%)")
+    ax.set_xlabel("Held-out digit accuracy milestone")
     ax.set_ylabel(ylabel)
-    ax.set_xlim(0, 100)
-    ax.grid(True, alpha=0.3)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels([_format_milestone_label(value) for value in milestones])
+    ax.grid(True, axis="y", alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
+    if plotted_modes:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
 
     note = _censor_note(config, run_summaries, n_terms)
     if note:
@@ -268,7 +330,6 @@ def _plot_metric_for_terms(
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
-
 
 def _rolling_mean(values: Sequence[float], window: int) -> List[float]:
     if window <= 1:
@@ -314,12 +375,13 @@ def _plot_trace(
 ) -> None:
     fig, ax = plt.subplots(figsize=(8.5, 5.0))
     plotted = False
+    colors = _mode_color_map(config)
     for mode_name in _mode_order(config):
         xs, ys = _merged_trace_series(config, n_terms, mode_name, trace_name, value_key)
         if not xs:
             continue
         display_ys = _rolling_mean(ys, smooth_window)
-        ax.plot(xs, display_ys, label=mode_name, linewidth=1.5)
+        ax.plot(xs, display_ys, label=mode_name, linewidth=1.5, color=colors[mode_name])
         plotted = True
     if not plotted:
         plt.close(fig)

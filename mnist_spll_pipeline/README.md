@@ -275,7 +275,7 @@ Pipeline II tests whether SPLL approximation changes the **training process** it
 - `prepare_spll_training.py`: creates the balanced split manifest, compact schedule manifests/previews, and shared initial checkpoints.
 - `compile_spll_training.py`: writes SPLL sum programs and compiles exact/approximate generated Python artifacts.
 - `train_spll_generated.py`: trains through the generated SPLL artifacts with a differentiable `readMNist` callback.
-- `visualize_spll_training.py`: writes milestone tables and per-arity training plots.
+- `visualize_spll_training.py`: writes milestone tables, per-arity grouped milestone bar charts, and training plots.
 - `spll_training_core.py`: Pipeline II helpers for paths, schedules, generated-artifact calls, training guards, and split handling.
 
 ## Pipeline II design summary
@@ -393,9 +393,13 @@ outputs/spll_training/
       checkpoints/final.pt
   visualization/
     tables/milestone_summary.csv
+    figures/main_text/terms_02_steps_to_digit_milestone.png
+    figures/main_text/terms_02_time_to_digit_milestone.png
     figures/main_text/*.png
     figures/appendix/*.png
 ```
+
+The `steps_to_digit_milestone` and `time_to_digit_milestone` figures are grouped bar charts: milestones are on the x-axis, the metric is on the y-axis, and each inference mode keeps the same color across milestone and trace figures. Missing or censored milestones remain explicit in the summary tables and plot footnote.
 
 ## Pipeline II safety checks
 
