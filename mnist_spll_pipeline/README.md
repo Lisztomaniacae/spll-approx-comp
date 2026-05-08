@@ -286,14 +286,19 @@ Pipeline II uses only the official MNIST training partition. It materializes one
 - 20% held-out uniform digit validation split;
 - the official MNIST test partition is reserved/unused.
 
-Training supervision is only the true sum. Digit labels are used for split construction and held-out digit-accuracy milestones, not for the loss. One optimizer step is one generated SPLL true-sum query:
+Training supervision is only the true sum. Digit labels are used for balanced split construction, but milestones are now task-level full-posterior sum accuracy, not held-out digit accuracy. The training stage supports SPLL sum mini-batches through `training.sum_batch_size`. The default config uses `sum_batch_size: 100`, so one optimizer update accumulates 100 generated SPLL true-sum queries before validation:
 
 ```text
-p_true = generated_spll.main.forward(true_sum, *global_indices)
-loss = -log(p_true + epsilon)
+for each case in the sum batch:
+    p_true_i = generated_spll.main.forward(true_sum_i, *global_indices_i)
+loss = mean_i(-log(p_true_i + epsilon))
 ```
 
-The generated SPLL artifact receives global MNIST indices. The patched `readMNist(index)` callback resolves the index to a transformed MNIST tensor, runs the current differentiable base model, and returns torch probabilities without detaching them.
+The generated SPLL artifact still receives scalar global MNIST indices and is still the source of truth for exact/approximate pruning. To avoid repeating the CNN forward for every scalar SPLL call, the training loop first runs the current differentiable base model once over all unique images in the batch, installs a temporary `readMNist(index)` lookup backed by those softmax rows, and then calls the generated artifact once per sum case. The stored probability tensors remain attached to the autograd graph, so gradients from the mean batch loss flow back to the CNN.
+
+`training.max_steps`, `validation.interval_steps`, milestone steps, and the `train_trace.csv` `step` column are measured in **sum cases seen**, not optimizer updates. The trace also records `optimizer_update`, `batch_size`, `branch_count_mean`, and `branch_count_total`. Set `training.sum_batch_size: 1` to recover the old one-case-per-update behavior.
+
+Validation can run asynchronously via `validation.async.enabled`. In that mode the trainer snapshots the current model and optimizer state at each validation interval, sends the snapshot to a separate validator process, and immediately continues training. The validator enumerates the full generated-SPLL posterior over candidate sums `0..9*n_terms` for each held-out sum case, predicts the argmax sum, and reports `sum_posterior_accuracy`. When a result crosses a milestone, the milestone checkpoint is written from the validated snapshot; when the highest milestone is reached, the trainer stops the next time it polls the validator result. This avoids blocking every training batch on validation, but the stop can be slightly delayed if validation is slower than training. The default async validator uses `device: cpu` and `max_pending_jobs: 1` to avoid fighting the MPS/GPU training process.
 
 ## Pipeline II stage order
 
@@ -393,13 +398,29 @@ outputs/spll_training/
       checkpoints/final.pt
   visualization/
     tables/milestone_summary.csv
-    figures/main_text/terms_02_steps_to_digit_milestone.png
-    figures/main_text/terms_02_time_to_digit_milestone.png
+    tables/milestone_aggregate_summary.csv
+    figures/main_text/terms_02_steps_to_sum_posterior_milestone.png
+    figures/main_text/terms_02_time_to_sum_posterior_milestone.png
     figures/main_text/*.png
     figures/appendix/*.png
 ```
 
-The `steps_to_digit_milestone` and `time_to_digit_milestone` figures are grouped bar charts: milestones are on the x-axis, the metric is on the y-axis, and each inference mode keeps the same color across milestone and trace figures. Missing or censored milestones remain explicit in the summary tables and plot footnote.
+The `steps_to_sum_posterior_milestone` and `time_to_sum_posterior_milestone` figures are grouped bar charts: milestones are on the x-axis, the metric is on the y-axis, and each inference mode keeps the same color across milestone and trace figures. Bars show the mean over reached seeds, and error bars use the configured across-seed uncertainty interval. Missing or censored milestones remain explicit in the summary tables and plot footnote.
+
+By default, Pipeline II visualisation uses one sample standard deviation across seeds for milestone error bars and smoothed trace uncertainty bands:
+
+```yaml
+visualization:
+  trace_smoothing_window_points: 100
+  uncertainty_interval: std   # std | sem | ci95 | none
+  min_uncertainty_samples: 2
+  show_milestone_error_bars: true
+  show_trace_uncertainty_bands: true
+  show_raw_trace_uncertainty_bands: false
+  trace_band_alpha: 0.16
+```
+
+Smoothed trace figures first smooth each seed independently, then plot the across-seed mean and uncertainty band. Raw appendix traces keep uncertainty bands disabled by default so the raw noise remains inspectable rather than hidden under wide fills.
 
 ## Pipeline II safety checks
 

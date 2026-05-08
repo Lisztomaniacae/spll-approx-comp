@@ -528,6 +528,50 @@ class DifferentiableReadMNIST:
         return torch.softmax(logits, dim=-1)[0]
 
 
+class PrecomputedReadMNIST:
+    """readMNist replacement backed by a differentiable per-batch probability lookup.
+
+    The generated SPLL training artifact calls readMNist once per image index while it
+    evaluates one sum case.  In batched training we first run the CNN on all unique
+    images needed by the whole batch, then let each scalar SPLL call reuse the
+    corresponding softmax row from this lookup.  The stored tensors are still part of
+    the current autograd graph, so gradients flow back to the CNN even though the SPLL
+    calls remain sequential Python calls.
+    """
+
+    def __init__(self, probabilities_by_index: Dict[int, torch.Tensor]) -> None:
+        self.probabilities_by_index = {int(key): value for key, value in probabilities_by_index.items()}
+
+    def __call__(self, global_index: int) -> torch.Tensor:
+        index = int(global_index)
+        try:
+            return self.probabilities_by_index[index]
+        except KeyError as exc:
+            raise KeyError(
+                f"SPLL requested MNIST index {index}, but it was not precomputed for this batch."
+            ) from exc
+
+
+def make_precomputed_read_mnist(
+    *,
+    model: nn.Module,
+    tensor_cache: TensorLRUCache,
+    device: torch.device,
+    global_indices: Sequence[int],
+) -> PrecomputedReadMNIST:
+    """Build a differentiable readMNist lookup for all unique indices in a sum batch."""
+
+    ordered_unique_indices = list(dict.fromkeys(int(v) for v in global_indices))
+    if not ordered_unique_indices:
+        raise ValueError("Cannot build a precomputed readMNist lookup for an empty batch.")
+    xs = torch.stack([tensor_cache.get(index).to(device) for index in ordered_unique_indices], dim=0)
+    logits = model(xs)
+    probabilities = torch.softmax(logits, dim=-1)
+    return PrecomputedReadMNIST(
+        {index: probabilities[row_idx] for row_idx, index in enumerate(ordered_unique_indices)}
+    )
+
+
 def digit_accuracy(model: nn.Module, dataset: Any, validation_indices: Sequence[int], device: torch.device, batch_size: int) -> float:
     subset = Subset(dataset, [int(v) for v in validation_indices])
     loader = DataLoader(subset, batch_size=int(batch_size), shuffle=False, num_workers=0)
@@ -596,6 +640,8 @@ def save_training_checkpoint(
     seed: int,
     n_terms: int,
     mode: Dict[str, Any],
+    validation_metric_name: str = "digit_accuracy",
+    sum_posterior_accuracy: Optional[float] = None,
 ) -> None:
     ensure_dir(path.parent)
     torch.save(
@@ -605,6 +651,10 @@ def save_training_checkpoint(
             "step": int(step),
             "elapsed_seconds": float(elapsed_seconds),
             "digit_accuracy": float(digit_accuracy_value),
+            "validation_metric_name": str(validation_metric_name),
+            "sum_posterior_accuracy": (
+                float(sum_posterior_accuracy) if sum_posterior_accuracy is not None else None
+            ),
             "model_config": dict(config.get("model", {})),
             "seed": int(seed),
             "n_terms": int(n_terms),

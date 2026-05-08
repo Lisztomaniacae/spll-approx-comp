@@ -37,20 +37,47 @@ optimizer:
 training:
   device: auto
   require_mps: true
-  max_steps: 1000000
+  # Number of SPLL sum cases accumulated into one optimizer update.
+  # With validation.interval_steps=100, sum_batch_size=100 validates after each batch.
+  sum_batch_size: 1
+  max_steps: 1000000   # measured in training sum cases, not optimizer updates
   loss_epsilon: 1.0e-12
 
 validation:
   interval_steps: 100
-  digit_eval_batch_size: 256
+  digit_eval_batch_size: 1024
   milestones: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
   stop_at_highest_milestone: true
   sum_probe:
-    enabled: true
+    enabled: false
     num_cases: 100
+    zero_total_mass_tolerance: 1.0e-12
+  async:
+    # Run validation in a separate process from training. The trainer snapshots
+    # model weights every validation interval and keeps training while the
+    # validator evaluates that snapshot. Milestone checkpoints are written from
+    # the validated snapshot, not from the later live model.
+    enabled: true
+    device: cpu
+    max_pending_jobs: 1
+    validate_step_zero_synchronously: true
+    torch_num_threads: 1
+    join_timeout_sec: 5.0
 
 schedule:
   preview_size: 20
+
+visualization:
+  trace_smoothing_window_points: 100
+  # Across-seed uncertainty shown in milestone error bars and smoothed traces.
+  # Options: std, sem, ci95, none. With five seeds, std is the most honest
+  # default because it shows run-to-run spread without overclaiming precision.
+  uncertainty_interval: std
+  min_uncertainty_samples: 2
+  show_milestone_error_bars: true
+  show_trace_uncertainty_bands: true
+  show_raw_trace_uncertainty_bands: false
+  trace_band_alpha: 0.16
 
 experiments:
   - n_terms: 2

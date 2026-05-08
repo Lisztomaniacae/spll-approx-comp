@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
@@ -32,6 +33,107 @@ def _safe_int(value: Any) -> Optional[int]:
     return int(number) if number is not None else None
 
 
+def _mean(values: Sequence[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _sample_std(values: Sequence[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    mean_value = sum(values) / len(values)
+    variance = sum((value - mean_value) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(max(0.0, variance))
+
+
+def _viz_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(config.get("visualization", {}) or {})
+
+
+def _uncertainty_mode(config: Dict[str, Any]) -> str:
+    """Return the configured across-seed uncertainty interval.
+
+    Supported values:
+    - ``std``: one sample standard deviation across seeds;
+    - ``sem``: standard error of the mean;
+    - ``ci95``: approximate normal 95% confidence interval around the mean;
+    - ``none``: disable error bars / bands.
+
+    ``std`` is the default because Pipeline II currently has only a handful of
+    seeds; it honestly shows run-to-run spread without implying an overprecise
+    population confidence interval.
+    """
+
+    mode = str(_viz_cfg(config).get("uncertainty_interval", "std")).strip().lower()
+    if mode not in {"std", "sem", "ci95", "none"}:
+        raise ValueError(
+            "visualization.uncertainty_interval must be one of: "
+            "std, sem, ci95, none"
+        )
+    return mode
+
+
+def _min_uncertainty_samples(config: Dict[str, Any]) -> int:
+    return max(2, int(_viz_cfg(config).get("min_uncertainty_samples", 2)))
+
+
+def _uncertainty_half_width(values: Sequence[float], config: Dict[str, Any]) -> Optional[float]:
+    mode = _uncertainty_mode(config)
+    if mode == "none" or len(values) < _min_uncertainty_samples(config):
+        return None
+    std = _sample_std(values)
+    if std is None:
+        return None
+    if mode == "std":
+        return std
+    sem = std / math.sqrt(len(values))
+    if mode == "sem":
+        return sem
+    return 1.96 * sem
+
+
+def _uncertainty_label(config: Dict[str, Any]) -> str:
+    mode = _uncertainty_mode(config)
+    labels = {
+        "std": "±1 sample std over seeds",
+        "sem": "±1 SEM over seeds",
+        "ci95": "approx. 95% CI over seeds",
+        "none": "uncertainty disabled",
+    }
+    return labels[mode]
+
+
+def _show_milestone_error_bars(config: Dict[str, Any]) -> bool:
+    return bool(_viz_cfg(config).get("show_milestone_error_bars", True))
+
+
+def _show_trace_uncertainty_bands(config: Dict[str, Any], smooth_window: int) -> bool:
+    viz_cfg = _viz_cfg(config)
+    if _uncertainty_mode(config) == "none":
+        return False
+    if smooth_window <= 1 and not bool(viz_cfg.get("show_raw_trace_uncertainty_bands", False)):
+        return False
+    return bool(viz_cfg.get("show_trace_uncertainty_bands", True))
+
+
+def _trace_band_alpha(config: Dict[str, Any]) -> float:
+    return max(0.0, min(1.0, float(_viz_cfg(config).get("trace_band_alpha", 0.16))))
+
+
+def _add_uncertainty_note(fig: Any, config: Dict[str, Any], *, enabled: bool, y: float = 0.015) -> None:
+    if not enabled or _uncertainty_mode(config) == "none":
+        return
+    fig.text(
+        0.01,
+        y,
+        f"Mean over configured seeds; uncertainty shows {_uncertainty_label(config)}.",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+    )
+
+
 def _collect_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     paths = training_paths(config)
     rows: List[Dict[str, Any]] = []
@@ -56,9 +158,77 @@ def _collect_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "step": info.get("step"),
                             "elapsed_seconds": info.get("elapsed_seconds"),
                             "digit_accuracy": info.get("digit_accuracy"),
+                            "sum_posterior_accuracy": info.get("sum_posterior_accuracy", info.get("digit_accuracy")),
+                            "validation_metric": info.get("validation_metric", "sum_posterior_accuracy"),
                         }
                     )
     return rows
+
+
+def _metric_summary(values: Sequence[float], config: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    mean_value = _mean(values)
+    std_value = _sample_std(values)
+    half_width = _uncertainty_half_width(values, config)
+    if not values:
+        return {
+            "mean": None,
+            "std": None,
+            "uncertainty_half_width": None,
+            "min": None,
+            "max": None,
+        }
+    return {
+        "mean": mean_value,
+        "std": std_value,
+        "uncertainty_half_width": half_width,
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def _collect_milestone_aggregates(config: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[int, str, float], List[Dict[str, Any]]] = {}
+    configured_seed_count = len(get_seeds(config))
+    for row in rows:
+        key = (int(row["n_terms"]), str(row["mode_name"]), float(row["milestone"]))
+        grouped.setdefault(key, []).append(row)
+
+    aggregate_rows: List[Dict[str, Any]] = []
+    for key in sorted(grouped, key=lambda item: (item[0], _mode_order(config).index(item[1]) if item[1] in _mode_order(config) else 999, item[2])):
+        n_terms, mode_name, milestone = key
+        group_rows = grouped[key]
+        reached_rows = [row for row in group_rows if row.get("reached")]
+        step_values = [float(row["step"]) for row in reached_rows if row.get("step") not in {None, ""}]
+        time_values = [float(row["elapsed_seconds"]) for row in reached_rows if row.get("elapsed_seconds") not in {None, ""}]
+        accuracy_values = [float(row["digit_accuracy"]) for row in reached_rows if row.get("digit_accuracy") not in {None, ""}]
+        step_summary = _metric_summary(step_values, config)
+        time_summary = _metric_summary(time_values, config)
+        accuracy_summary = _metric_summary(accuracy_values, config)
+        aggregate_rows.append(
+            {
+                "n_terms": n_terms,
+                "mode_name": mode_name,
+                "top_k_cutoff": group_rows[0].get("top_k_cutoff") if group_rows else None,
+                "milestone": milestone,
+                "configured_seed_count": configured_seed_count,
+                "observed_seed_count": len({int(row["seed"]) for row in group_rows}),
+                "reached_seed_count": len({int(row["seed"]) for row in reached_rows}),
+                "step_mean": step_summary["mean"],
+                "step_std": step_summary["std"],
+                "step_uncertainty_half_width": step_summary["uncertainty_half_width"],
+                "step_min": step_summary["min"],
+                "step_max": step_summary["max"],
+                "elapsed_seconds_mean": time_summary["mean"],
+                "elapsed_seconds_std": time_summary["std"],
+                "elapsed_seconds_uncertainty_half_width": time_summary["uncertainty_half_width"],
+                "elapsed_seconds_min": time_summary["min"],
+                "elapsed_seconds_max": time_summary["max"],
+                "digit_accuracy_mean": accuracy_summary["mean"],
+                "digit_accuracy_std": accuracy_summary["std"],
+                "digit_accuracy_uncertainty_half_width": accuracy_summary["uncertainty_half_width"],
+            }
+        )
+    return aggregate_rows
 
 
 def _read_trace_csv(path: Path) -> List[Dict[str, str]]:
@@ -139,6 +309,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "final_step": None,
                             "final_elapsed_seconds": None,
                             "final_digit_accuracy": None,
+                            "final_sum_posterior_accuracy": None,
+                            "validation_metric": None,
                             "highest_milestone": None,
                             "highest_reached_milestone": None,
                             "reached_highest_milestone": False,
@@ -185,6 +357,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "final_step": final_step,
                         "final_elapsed_seconds": final_elapsed,
                         "final_digit_accuracy": summary.get("final_digit_accuracy"),
+                        "final_sum_posterior_accuracy": summary.get("final_sum_posterior_accuracy", summary.get("final_digit_accuracy")),
+                        "validation_metric": summary.get("validation_metric", "sum_posterior_accuracy"),
                         "highest_milestone": highest,
                         "highest_reached_milestone": highest_reached,
                         "reached_highest_milestone": bool(highest is not None and highest_reached is not None and highest_reached >= highest),
@@ -271,6 +445,7 @@ def _plot_metric_for_terms(
     fig, ax = plt.subplots(figsize=(max(8.5, 0.75 * len(milestones) + 2.5), 5.0))
     values_for_scale: List[float] = []
     plotted_modes: List[str] = []
+    draw_error_bars = _show_milestone_error_bars(config)
 
     for mode_idx, mode_name in enumerate(mode_names):
         mode_rows = [row for row in term_rows if row["mode_name"] == mode_name]
@@ -280,18 +455,38 @@ def _plot_metric_for_terms(
 
         xs: List[float] = []
         ys: List[float] = []
+        err_lowers: List[float] = []
+        err_uppers: List[float] = []
         offset = -group_width / 2.0 + bar_width / 2.0 + mode_idx * bar_width
         for milestone_idx, milestone in enumerate(milestones):
             values = by_milestone.get(milestone)
             if not values:
                 continue
+            mean_value = _mean(values)
+            if mean_value is None:
+                continue
+            half_width = _uncertainty_half_width(values, config) if draw_error_bars else None
             xs.append(float(x_positions[milestone_idx]) + offset)
-            ys.append(sum(values) / len(values))
+            ys.append(mean_value)
+            if half_width is None:
+                err_lowers.append(0.0)
+                err_uppers.append(0.0)
+            else:
+                err_lowers.append(min(half_width, mean_value * 0.95) if maybe_log and mean_value > 0 else half_width)
+                err_uppers.append(half_width)
 
         if not ys:
             continue
-        values_for_scale.extend(ys)
+        for y_value, err_lower, err_upper in zip(ys, err_lowers, err_uppers):
+            values_for_scale.append(y_value)
+            if err_lower > 0:
+                values_for_scale.append(max(0.0, y_value - err_lower))
+            if err_upper > 0:
+                values_for_scale.append(y_value + err_upper)
         plotted_modes.append(mode_name)
+        yerr: Optional[List[List[float]]] = None
+        if draw_error_bars and any(error > 0 for error in err_lowers + err_uppers):
+            yerr = [err_lowers, err_uppers]
         ax.bar(
             xs,
             ys,
@@ -300,6 +495,8 @@ def _plot_metric_for_terms(
             color=colors[mode_name],
             edgecolor="white",
             linewidth=0.8,
+            yerr=yerr,
+            error_kw={"elinewidth": 1.0, "capsize": 2.5, "capthick": 1.0},
         )
 
     if maybe_log:
@@ -311,7 +508,7 @@ def _plot_metric_for_terms(
             ax.yaxis.set_major_formatter(mticker.FuncFormatter(_format_log_tick))
             ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.set_title(f"{n_terms}-term SPLL training: {ylabel}", loc="left")
-    ax.set_xlabel("Held-out digit accuracy milestone")
+    ax.set_xlabel("Held-out sum posterior accuracy milestone")
     ax.set_ylabel(ylabel)
     ax.set_xticks(x_positions)
     ax.set_xticklabels([_format_milestone_label(value) for value in milestones])
@@ -323,8 +520,10 @@ def _plot_metric_for_terms(
 
     note = _censor_note(config, run_summaries, n_terms)
     if note:
-        fig.text(0.01, 0.015, note, ha="left", va="bottom", fontsize=8)
-        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        fig.text(0.01, 0.033, note, ha="left", va="bottom", fontsize=8)
+    _add_uncertainty_note(fig, config, enabled=draw_error_bars, y=0.015)
+    if note or draw_error_bars:
+        fig.tight_layout(rect=(0, 0.075, 1, 1))
     else:
         fig.tight_layout()
     ensure_dir(output_path.parent)
@@ -347,20 +546,72 @@ def _rolling_mean(values: Sequence[float], window: int) -> List[float]:
     return result
 
 
-def _merged_trace_series(config: Dict[str, Any], n_terms: int, mode_name: str, trace_name: str, value_key: str) -> Tuple[List[int], List[float]]:
+def _seed_trace_series(
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_name: str,
+    trace_name: str,
+    value_key: str,
+    smooth_window: int,
+) -> Dict[int, Tuple[List[int], List[float]]]:
     paths = training_paths(config)
-    merged: Dict[int, List[float]] = {}
+    by_seed: Dict[int, Tuple[List[int], List[float]]] = {}
     for seed in get_seeds(config):
+        per_step: Dict[int, List[float]] = {}
         rows = _read_trace_csv(run_dir(paths, seed, n_terms, mode_name) / trace_name)
         for row in rows:
             value = _safe_float(row.get(value_key))
             step = _safe_int(row.get("step"))
             if value is None or step is None:
                 continue
-            merged.setdefault(step, []).append(value)
+            per_step.setdefault(step, []).append(value)
+        if not per_step:
+            continue
+        xs = sorted(per_step)
+        ys = [float(sum(per_step[x]) / len(per_step[x])) for x in xs]
+        by_seed[int(seed)] = (xs, _rolling_mean(ys, smooth_window))
+    return by_seed
+
+
+def _merged_trace_stats(
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_name: str,
+    trace_name: str,
+    value_key: str,
+    smooth_window: int,
+) -> Tuple[List[int], List[float], List[float], List[float], List[int]]:
+    merged: Dict[int, List[float]] = {}
+    for xs, ys in _seed_trace_series(config, n_terms, mode_name, trace_name, value_key, smooth_window).values():
+        for step, value in zip(xs, ys):
+            merged.setdefault(step, []).append(float(value))
+
     xs = sorted(merged)
-    ys = [sum(merged[x]) / len(merged[x]) for x in xs]
-    return xs, ys
+    means: List[float] = []
+    lowers: List[float] = []
+    uppers: List[float] = []
+    counts: List[int] = []
+    for step in xs:
+        values = merged[step]
+        mean_value = _mean(values)
+        if mean_value is None:
+            continue
+        half_width = _uncertainty_half_width(values, config)
+        means.append(mean_value)
+        counts.append(len(values))
+        if half_width is None:
+            lowers.append(mean_value)
+            uppers.append(mean_value)
+        else:
+            lower = mean_value - half_width
+            upper = mean_value + half_width
+            if value_key in {"loss", "true_mass", "branch_count", "zero_true_mass"}:
+                lower = max(0.0, lower)
+            if value_key in {"true_mass", "zero_true_mass"}:
+                upper = min(1.0, upper)
+            lowers.append(lower)
+            uppers.append(upper)
+    return xs, means, lowers, uppers, counts
 
 
 def _plot_trace(
@@ -376,12 +627,21 @@ def _plot_trace(
     fig, ax = plt.subplots(figsize=(8.5, 5.0))
     plotted = False
     colors = _mode_color_map(config)
+    draw_bands = _show_trace_uncertainty_bands(config, smooth_window)
     for mode_name in _mode_order(config):
-        xs, ys = _merged_trace_series(config, n_terms, mode_name, trace_name, value_key)
+        xs, ys, lowers, uppers, _counts = _merged_trace_stats(
+            config,
+            n_terms,
+            mode_name,
+            trace_name,
+            value_key,
+            smooth_window,
+        )
         if not xs:
             continue
-        display_ys = _rolling_mean(ys, smooth_window)
-        ax.plot(xs, display_ys, label=mode_name, linewidth=1.5, color=colors[mode_name])
+        ax.plot(xs, ys, label=mode_name, linewidth=1.5, color=colors[mode_name])
+        if draw_bands and any(abs(upper - lower) > 0.0 for lower, upper in zip(lowers, uppers)):
+            ax.fill_between(xs, lowers, uppers, color=colors[mode_name], alpha=_trace_band_alpha(config), linewidth=0)
         plotted = True
     if not plotted:
         plt.close(fig)
@@ -394,7 +654,11 @@ def _plot_trace(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
-    fig.tight_layout()
+    _add_uncertainty_note(fig, config, enabled=draw_bands)
+    if draw_bands:
+        fig.tight_layout(rect=(0, 0.045, 1, 1))
+    else:
+        fig.tight_layout()
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -407,6 +671,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
 
     stage_message(2, 3, "Collecting milestone and run summaries")
     rows = _collect_rows(config)
+    milestone_aggregates = _collect_milestone_aggregates(config, rows)
     run_summaries = _collect_run_summaries(config)
     milestone_fields = [
         "seed",
@@ -418,6 +683,8 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "step",
         "elapsed_seconds",
         "digit_accuracy",
+        "sum_posterior_accuracy",
+        "validation_metric",
     ]
     run_summary_fields = [
         "seed",
@@ -429,6 +696,8 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "final_step",
         "final_elapsed_seconds",
         "final_digit_accuracy",
+        "final_sum_posterior_accuracy",
+        "validation_metric",
         "highest_milestone",
         "highest_reached_milestone",
         "reached_highest_milestone",
@@ -438,11 +707,36 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "final_loss",
         "final_true_mass",
     ]
+    milestone_aggregate_fields = [
+        "n_terms",
+        "mode_name",
+        "top_k_cutoff",
+        "milestone",
+        "configured_seed_count",
+        "observed_seed_count",
+        "reached_seed_count",
+        "step_mean",
+        "step_std",
+        "step_uncertainty_half_width",
+        "step_min",
+        "step_max",
+        "elapsed_seconds_mean",
+        "elapsed_seconds_std",
+        "elapsed_seconds_uncertainty_half_width",
+        "elapsed_seconds_min",
+        "elapsed_seconds_max",
+        "digit_accuracy_mean",
+        "digit_accuracy_std",
+        "digit_accuracy_uncertainty_half_width",
+    ]
     _write_csv(paths.tables_root / "milestone_summary.csv", rows, milestone_fields)
     write_json(paths.tables_root / "milestone_summary.json", rows)
+    _write_csv(paths.tables_root / "milestone_aggregate_summary.csv", milestone_aggregates, milestone_aggregate_fields)
+    write_json(paths.tables_root / "milestone_aggregate_summary.json", milestone_aggregates)
     _write_csv(paths.tables_root / "run_summary.csv", run_summaries, run_summary_fields)
     write_json(paths.tables_root / "run_summary.json", run_summaries)
     print(f"Saved milestone summary to: {paths.tables_root / 'milestone_summary.csv'}")
+    print(f"Saved milestone aggregate summary to: {paths.tables_root / 'milestone_aggregate_summary.csv'}")
     print(f"Saved run summary to: {paths.tables_root / 'run_summary.csv'}")
 
     stage_message(3, 3, "Writing Pipeline II figures")
@@ -457,7 +751,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             metric="step",
             ylabel="Steps to milestone",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_steps_to_digit_milestone.png",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_steps_to_sum_posterior_milestone.png",
         )
         _plot_metric_for_terms(
             config=config,
@@ -466,7 +760,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             metric="elapsed_seconds",
             ylabel="Seconds to milestone",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_time_to_digit_milestone.png",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_time_to_sum_posterior_milestone.png",
             maybe_log=True,
         )
         _plot_trace(

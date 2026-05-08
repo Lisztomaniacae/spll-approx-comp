@@ -6,14 +6,15 @@ paths:
 seeds: [42]
 
 training:
+  sum_batch_size: 50
   max_steps: 500
 
 validation:
   interval_steps: 50
   milestones: [0.1, 0.2]
-  sum_probe:
-    enabled: true
+  sum_posterior:
     num_cases: 20
+    zero_total_mass_tolerance: 1.0e-12
 
 schedule:
   preview_size: 20

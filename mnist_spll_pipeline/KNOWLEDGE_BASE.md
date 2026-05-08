@@ -635,14 +635,19 @@ Pipeline II is separate from the original inference-evaluation pipeline. It test
 
 ### 14.1 Core idea
 
-Each optimizer step is one MNIST sum case. The base MNIST model is trained from the true sum only:
+Each training case is one MNIST sum case. The base MNIST model is trained from the true sum only. The training loop now supports SPLL sum mini-batches controlled by `training.sum_batch_size`:
 
 ```text
-p_true = generated_spll.main.forward(true_sum, *global_indices)
-loss = -log(p_true + epsilon)
+for each case i in the current sum batch:
+    p_true_i = generated_spll.main.forward(true_sum_i, *global_indices_i)
+loss = mean_i(-log(p_true_i + epsilon))
 ```
 
-The generated SPLL Python artifact is part of the gradient path. Do not replace it with a hand-written torch-native semantic equivalent for Pipeline II experiments. The patched `readMNist(index)` callback must return torch probabilities produced by the current model without detaching them.
+The default config uses `sum_batch_size: 100`, matching `validation.interval_steps: 100`, so validation is requested after each 100-case optimizer update. Set `sum_batch_size: 1` to recover the older one-case-per-update behavior.
+
+Pipeline II supports asynchronous validation through `validation.async.enabled`. The trainer snapshots the current model and optimizer state at validation intervals, sends the CPU snapshot to a separate validator process, and continues training. The validator computes task-level `sum_posterior_accuracy` by enumerating every generated-SPLL candidate sum `0..9*n_terms` for each held-out validation sum case and comparing the argmax posterior sum to the true sum. Milestone checkpoints must be written from the validated snapshot, not from the later live model. The trainer stops only after polling a validator result that reaches the highest milestone, so stopping can overshoot by one or more training batches when validation lags. The default async validator uses CPU and `max_pending_jobs: 1` to avoid MPS/GPU contention and unbounded snapshot memory.
+
+The generated SPLL Python artifact is part of the gradient path. Do not replace it with a hand-written torch-native semantic equivalent for Pipeline II experiments. Batched training keeps the generated artifact as the source of truth: it precomputes differentiable MNIST softmax rows for all unique image indices in the batch, installs a temporary `readMNist(index)` lookup backed by those tensors, and still calls the generated SPLL `main.forward(...)` once per scalar sum case. The lookup tensors must remain attached to the current autograd graph.
 
 ### 14.2 Pipeline II files
 
@@ -681,12 +686,12 @@ Preferred Apple Silicon environment split:
 Pipeline II uses the official MNIST train partition only. It materializes one global equal-count-per-digit 80/20 split:
 
 - train source pool: used to sample sum-supervised training cases;
-- validation pool: used only for held-out digit accuracy and same-mode true-sum-mass probes;
+- validation pool: used to sample held-out sum cases for full-posterior sum-accuracy validation;
 - official MNIST test partition: reserved/unused.
 
 The training schedule is compact and random-access deterministic. `prepare` writes manifests plus a small preview, not a huge JSONL schedule up to `max_steps`. A case is reproduced from `(seed, n_terms, step, split)`.
 
-Within one sum case, repeated digits must use distinct MNIST image indices. Across steps, replacement is allowed.
+Within one sum case, repeated digits must use distinct MNIST image indices. Across steps, replacement is allowed. In batched training, `step`, `max_steps`, `validation.interval_steps`, and milestone steps are measured in sum cases seen, not optimizer updates.
 
 ### 14.5 Exact and approximate modes
 
@@ -712,26 +717,42 @@ A fully pruned true-sum path may return a literal Python `0.0` from the generate
 
 ### 14.6 Milestones, traces, and stopping
 
-Pipeline II trains from sum labels only, but milestones are held-out digit accuracy thresholds. Digit labels are never used in the loss.
+Pipeline II trains from sum labels only, and milestones are task-level `sum_posterior_accuracy` thresholds. Digit labels are used only to materialize balanced train/validation pools and to construct the true sum for generated cases.
 
-Validation is interval-based. A milestone is recorded at the first observed validation point whose digit accuracy is at or above the threshold. Milestone checkpoints are mandatory.
+Validation is interval-based. For each validation sum case, the validator enumerates every possible candidate sum through the compiled generated SPLL artifact, computes the posterior mass for each candidate, predicts the argmax candidate, and compares it with the true sum. A case whose approximate artifact prunes every candidate to zero total posterior mass is counted as incorrect and logged through `sum_posterior_zero_total_rate`. A milestone is recorded at the first observed validation point whose sum-posterior accuracy is at or above the threshold. Milestone checkpoints are mandatory.
 
 Important run artifacts:
 
-- `train_trace.csv`: step-level loss, true-sum mass, zero-mass flag, branch count, gradient norm;
-- `validation_trace.csv`: digit accuracy, same-mode true-sum-mass probe, recent train means;
+- `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, and gradient norm;
+- `validation_trace.csv`: backward-compatible `digit_accuracy` alias plus `sum_posterior_accuracy`, validation-case count, candidate count, mean true/predicted/total posterior mass, zero-total posterior rate, tie rate, validation branch-count mean, and recent train means;
 - `milestones.json`: first observed step/time for each milestone;
 - `checkpoints/milestone_*.pt`: first crossing snapshots;
 - `checkpoints/final.pt`: final snapshot.
 
 Visualization behavior:
 
-- `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final digit accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
-- Main-text Pipeline II milestone figures for steps and wall-clock time are grouped bar charts split by arity: milestones are on the x-axis, the metric is on the y-axis, and inference modes are bars within each milestone group. Values are averaged across seeds for the same `(n_terms, mode, milestone)` cell.
+- `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final sum-posterior accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
+- `visualize_spll_training.py` also writes `milestone_aggregate_summary.*`, which stores per-`(n_terms, mode, milestone)` reached-seed counts, means, sample standard deviations, configured uncertainty half-widths, and min/max values for steps and wall-clock time.
+- Main-text Pipeline II milestone figures for steps and wall-clock time are grouped bar charts split by arity: milestones are on the x-axis, the metric is on the y-axis, and inference modes are bars within each milestone group. Values are averaged across reached seeds for the same `(n_terms, mode, milestone)` cell, with configurable across-seed error bars enabled by default.
 - Pipeline II visualization uses a stable color map derived from inference-mode order. The same mode color is reused across steps-to-milestone, time-to-milestone, and trace figures.
-- Main-text Pipeline II trace figures use rolling means by default so noisy per-step losses and masses do not dominate the thesis-facing plot. Raw traces are still exported to appendix figures with `_raw_trace` in the file name.
+- Main-text Pipeline II trace figures compute rolling traces per seed first, then plot the across-seed mean with configurable uncertainty bands. This avoids hiding seed variability by smoothing only after aggregation. Raw traces are still exported to appendix figures with `_raw_trace` in the file name; raw uncertainty bands are disabled by default to keep appendix plots readable.
 - Milestone figures keep unreached modes visible via summary tables and a plot footnote instead of silently pretending missing modes do not exist.
 - Wall-clock milestone plots may use a log y-axis when values span more than about 5x; tick labels should remain readable scalar seconds, not opaque scientific notation.
+
+Pipeline II visualization config:
+
+```yaml
+visualization:
+  trace_smoothing_window_points: 100
+  uncertainty_interval: std   # std | sem | ci95 | none
+  min_uncertainty_samples: 2
+  show_milestone_error_bars: true
+  show_trace_uncertainty_bands: true
+  show_raw_trace_uncertainty_bands: false
+  trace_band_alpha: 0.16
+```
+
+The default uncertainty interval is `std`, interpreted as one sample standard deviation across seeds. `sem` and `ci95` are available for narrower uncertainty-of-the-mean displays, but with the default five seeds `std` is the more conservative thesis-facing default.
 
 ### 14.7 Safety rails
 
@@ -740,7 +761,7 @@ Pipeline II should fail loudly rather than silently produce invalid training res
 - generated artifacts are missing;
 - the generated probability is not a differentiable torch tensor, except for literal zero from a fully pruned true-sum path;
 - the preflight gradient check cannot find at least one nonzero-gradient case across its probe cases;
-- probability/loss becomes NaN, infinite, or negative;
+- probability/loss becomes NaN, infinite, or negative for any case in a sum batch;
 - gradients contain NaN or infinity.
 
 The train stage must not auto-compile missing artifacts. It should tell the user to run the compile stage in the Rosetta/x86 environment.
