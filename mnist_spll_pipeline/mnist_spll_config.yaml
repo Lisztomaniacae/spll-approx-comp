@@ -181,3 +181,7 @@ inference:
   stack_arch: x86_64
   show_progress: true
   show_inner_progress: false
+  # readMNist cache policy during timed generated-SPLL inference:
+  # - run_scoped_no_cross_run_cache: fresh cache per measured posterior/true-candidate query
+  # - uncached: call the MNIST model for every generated-SPLL readMNist invocation
+  read_mnist_cache_policy: uncached

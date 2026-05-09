@@ -1,350 +1,201 @@
-# MNIST + SPLL pipeline
+# MNIST + SPLL Pipeline
 
-This pipeline is split into distinct stage files plus one orchestration entrypoint.
+This folder contains the Python-side experiment code for the thesis comparison between **exact SPLL inference** and **approximate SPLL inference** on MNIST digit addition.
 
-## Files
+There are two separate pipelines:
 
-- `train_mnist.py`: trains the MNIST classifier and exports the model plus the fixed dataset split manifest.
-- `compile_spll.py`: generates and compiles the SPLL programs for every configured `(term_count, cutoff)` target.
-- `stage_experiments.py`: samples MNIST digit-addition experiments from the fixed inference split and saves them.
-- `infer_experiments.py`: runs posterior inference for the staged experiments and saves broad raw run data as JSON.
-- `visualize_results.py`: computes summaries, tables, and plots from the saved raw inference JSON.
-- `run_spll_pipeline.py`: orchestration entrypoint that takes a stage name as input.
-- `run_spll_sum_experiments.py`: backward-compatible wrapper around the new stage-based pipeline.
-- `mnist_spll_pipeline_core.py`: shared pipeline helpers.
-- `mnist_spll_common.py`: shared model/config utilities.
-- `mnist_spll_config.yaml`: joint config for all stages.
+| Pipeline | Entrypoint | Purpose | Stage order |
+|---|---|---|---|
+| Pipeline I: inference evaluation | `run_spll_pipeline.py` | Train/evaluate MNIST models, then compare exact vs approximate SPLL inference at test time. | `train -> compile -> stage -> infer -> visualize` |
+| Pipeline II: generated-SPLL training | `run_spll_training_pipeline.py` | Train an MNIST model from sum labels by calling generated SPLL inference inside the optimizer loop. | `prepare -> compile -> train -> visualize` |
 
+For detailed architecture notes, schema details, caveats, and patch discipline, read [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md). Keep this README as an operator guide, but do not remove either pipeline from it.
 
-## Living knowledge base
+---
 
-Detailed architecture notes, workflow caveats, output schemas, and future patch discipline live in [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md). Any patch that changes the MNIST SPLL pipeline should update that file in the same patch.
+## 1. Setup on Apple Silicon
 
-## Approximation reminder
+Use explicit interpreter paths. Do not rely on a shell alias such as `python -> /opt/homebrew/bin/python@3.11`.
 
-In this repo, `-k/--topKCutoff` is **not** a literal top-k class count. It is a **probability cutoff in the range 0..1** that prunes low-probability branches during inference. Exact inference is represented by `null` in `approximation_thresholds`.
+Run all commands below from `mnist_spll_pipeline/` unless stated otherwise.
 
-## Pipeline order
+### Native arm64 environment
 
-The intended stage order is:
-
-```text
-train -> compile spll -> stage experiments -> inference -> visualisation
-```
-
-## Important Apple Silicon caveat
-
-Use explicit interpreter paths. Do **not** rely on a shell alias like `python -> /opt/homebrew/bin/python@3.11`.
-
-Recommended rule:
-
-- native arm64 stages: use the arm venv interpreter explicitly
-- Rosetta/x86_64 compile: use the x86 venv interpreter explicitly
-
-Examples in this README therefore use:
-
-- `./.venv-train-arm64/bin/python`
-- `./.venv-spll-x86/bin/python`
-
-## Why the compile stage needs Python packages too
-
-The current orchestrator imports all stage modules at startup. Because of that, the compile stage currently needs the shared Python dependencies too, even though the actual SPLL compilation work is done through Stack.
-
-That means the Rosetta/x86 compile env needs these Python packages installed as well:
-
-- `numpy`
-- `PyYAML`
-- `Pillow`
-- `matplotlib`
-- `torch`
-- `torchvision`
-
-`stack` is still required separately for the actual SPLL compile step.
-
-## Package installation
-
-Run these from `mnist_spll_pipeline/`.
-
-### Native arm64 env
+Use this environment for training, staging, inference, and visualization.
 
 ```bash
 python3 -m venv --copies .venv-train-arm64
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python -m pip install --upgrade pip setuptools wheel
-./.venv-train-arm64/bin/python -m pip install numpy PyYAML Pillow matplotlib
-./.venv-train-arm64/bin/python -m pip install torch torchvision
+./.venv-train-arm64/bin/python -m pip install numpy PyYAML Pillow matplotlib torch torchvision
 ```
 
-### Rosetta / x86_64 env
-
-Open a clean Rosetta shell first:
-
-```bash
-arch -x86_64 zsh -f
-cd /Users/lisztomaniacae/IdeaProjects/spll-approx-comp/mnist_spll_pipeline
-arch -x86_64 /usr/local/bin/python3.11 -m venv --copies .venv-spll-x86
-source .venv-spll-x86/bin/activate
-./.venv-spll-x86/bin/python -m pip install --upgrade pip setuptools wheel
-./.venv-spll-x86/bin/python -m pip install numpy PyYAML Pillow matplotlib
-./.venv-spll-x86/bin/python -m pip install torch torchvision
-```
-
-If `.venv-spll-x86` already exists and only packages are missing, just activate it and run the three `pip install` lines.
-
-## Verify both interpreters
-
-### Native arm64
+Verify:
 
 ```bash
 ./.venv-train-arm64/bin/python -c "import platform, torch; print(platform.machine(), torch.__version__)"
 ```
 
-Expected machine value: `arm64`
+Expected machine value: `arm64`.
 
-### Rosetta / x86_64
+### Rosetta/x86_64 compile environment
+
+Use this environment for SPLL compilation because the Haskell/SPLL stack is normally run under Rosetta.
+
+```bash
+arch -x86_64 zsh -f
+cd /path/to/spll-approx-comp/mnist_spll_pipeline
+arch -x86_64 /usr/local/bin/python3.11 -m venv --copies .venv-spll-x86
+./.venv-spll-x86/bin/python -m pip install --upgrade pip setuptools wheel
+./.venv-spll-x86/bin/python -m pip install numpy PyYAML Pillow matplotlib torch torchvision
+```
+
+Verify:
 
 ```bash
 ./.venv-spll-x86/bin/python -c "import platform, torch; print(platform.machine(), torch.__version__)"
 ```
 
-Expected machine value: `x86_64`
+Expected machine value: `x86_64`.
 
-## Commands
+`stack` must also be available in the Rosetta shell.
 
-From this folder:
+---
+
+## 2. Pipeline I: inference evaluation
+
+Pipeline I evaluates trained MNIST models under exact and approximate SPLL inference.
+
+### Files
+
+| File | Role |
+|---|---|
+| `mnist_spll_config.yaml` | Main config. |
+| `run_spll_pipeline.py` | Stage dispatcher. |
+| `train_mnist.py` | Trains MNIST model variants. |
+| `compile_spll.py` | Generates and compiles SPLL inference artifacts. |
+| `stage_experiments.py` | Samples fixed digit-addition experiments. |
+| `infer_experiments.py` | Runs posterior inference and writes raw JSON. |
+| `visualize_results.py` | Writes derived tables and plots. |
+| `mnist_spll_pipeline_core.py` | Shared Pipeline I helpers. |
+
+`run_spll_sum_experiments.py` is a legacy wrapper. Prefer `run_spll_pipeline.py`.
+
+### Commands
+
+Train in native arm64:
 
 ```bash
-cd /Users/lisztomaniacae/IdeaProjects/spll-approx-comp/mnist_spll_pipeline
-```
-
-### Train
-
-Run in native arm64:
-
-```bash
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml train
 ```
 
-### Compile SPLL
-
-Run in Rosetta/x86_64:
+Compile in Rosetta/x86_64:
 
 ```bash
 arch -x86_64 zsh -f
-cd /Users/lisztomaniacae/IdeaProjects/spll-approx-comp/mnist_spll_pipeline
-source .venv-spll-x86/bin/activate
+cd /path/to/spll-approx-comp/mnist_spll_pipeline
 ./.venv-spll-x86/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml compile
 ```
 
-This compiles every configured `(term_count, cutoff)` pair for the range defined by `terms_per_sum_min` and `terms_per_sum_max`.
-
-### Stage experiments
-
-Run in native arm64:
+Stage experiments in native arm64:
 
 ```bash
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml stage
 ```
 
-### Inference
-
-Run in native arm64:
+Run inference in native arm64:
 
 ```bash
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml infer
 ```
 
-This does **not** compute summary metrics yet. It writes broad raw run records to JSON, including:
-
-- experiment metadata
-- image paths
-- true labels and true sums
-- candidate sums
-- raw posterior values for every candidate
-- raw branch counts for every candidate sum
-- runtime per run
-- compiled program path used for the run
-
-### Visualisation
-
-Run in native arm64:
+Visualize in native arm64:
 
 ```bash
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml visualize
 ```
 
-This stage reads the raw inference JSON and writes a fuller bundle:
+`all` exists, but the stage-by-stage workflow is safer on Apple Silicon because `compile` normally runs in the x86_64 environment.
 
-- tables under `visualization/tables`
-- main-text figures under `visualization/figures/main_text`
-- appendix/supporting figures under `visualization/figures/appendix`
-- appendix heatmaps under `visualization/figures/appendix/heatmaps`
+### Main outputs
 
-### Run all stages
-
-```bash
-./.venv-train-arm64/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml all
-```
-
-On Apple Silicon, running all stages in one command is less robust than the stage-by-stage split because compile lives in the Rosetta env.
-
-## Raw and derived outputs
-
-The pipeline writes its stage artifacts under:
+Default output root:
 
 ```text
 outputs/spll_experiments/
 ```
 
-Important files:
+Important artifacts:
 
-- `compile_manifest.json`
-- `staged_experiments.json`
-- `inference_manifest.json`
-- `inference_runs.json`
-- `visualization/tables/detailed_results.csv`
-- `visualization/tables/summary_results.csv`
-- `visualization/tables/summary_results.json`
-- `visualization/tables/overhead_exact_vs_zero_summary.csv`
-- `visualization/tables/model_accuracy_targets.csv`
-- `visualization/figures/main_text/*.png`
-- `visualization/figures/appendix/*.png`
-- `visualization/figures/appendix/heatmaps/*.png`
+| Path | Produced by | Contents |
+|---|---|---|
+| `compile_manifest.json` | `compile` | Compiled SPLL target inventory. |
+| `staged_experiments.json` | `stage` | Fixed digit-addition inputs. |
+| `inference_manifest.json` | `infer` | Inference run metadata. |
+| `inference_runs.json` | `infer` | Raw posterior/runtime/branch-count records. |
+| `visualization/tables/*.csv` | `visualize` | Derived result tables. |
+| `visualization/figures/**/*.png` | `visualize` | Main and appendix figures. |
 
-## Progress output
-
-You still get progress bars for:
-
-- compilation targets
-- staged experiments
-- loading compiled Python targets
-- inference runs
-- per-run posterior candidate sums
-
-Disable all bars with:
-
-```yaml
-inference:
-  show_progress: false
-```
-
-Disable only the inner posterior bar with:
-
-```yaml
-inference:
-  show_inner_progress: false
-```
-
-## Notes
-
-- `repo_root` in the YAML should point to your local NeST checkout.
-- The compile stage expects `stack` to be available on the shell `PATH`.
-- The infer stage does not need Stack, but it will fail if the compiled outputs are missing.
-- The default `terms_per_sum_max` should stay conservative because exact inference gets expensive fast.
-- Branch counts are only available if the SPLL targets were compiled with branch counting enabled.
-- If you turn branch counting on after compiling, you must re-run the compile stage so the generated `program.py` files expose that data.
-
-## Fast fix for your current compile error
-
-If the x86 venv already exists and the current failure is only missing packages, run:
-
-```bash
-cd /Users/lisztomaniacae/IdeaProjects/spll-approx-comp/mnist_spll_pipeline
-source .venv-spll-x86/bin/activate
-./.venv-spll-x86/bin/python -m pip install --upgrade pip setuptools wheel
-./.venv-spll-x86/bin/python -m pip install numpy PyYAML Pillow matplotlib
-./.venv-spll-x86/bin/python -m pip install torch torchvision
-./.venv-spll-x86/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml compile
-```
+Treat `inference_runs.json` as the main empirical artifact. Visualization should derive results from it rather than rerunning inference.
 
 ---
 
-# Pipeline II: training through generated SPLL inference
+## 3. Pipeline II: training through generated SPLL inference
 
-Pipeline II tests whether SPLL approximation changes the **training process** itself. Unlike the inference-evaluation pipeline above, this pipeline trains an MNIST base model from **sum labels only** by calling the generated SPLL Python artifact inside every optimizer step.
+Pipeline II tests whether SPLL approximation changes the **training process itself**. It trains an MNIST base model from **sum labels only** by calling the generated SPLL Python artifact inside each optimizer step.
 
-## Pipeline II files
+### Files
 
-- `run_spll_training_pipeline.py`: stage dispatcher for Pipeline II.
-- `mnist_spll_training_config.yaml`: default Pipeline II config.
-- `mnist_spll_training_smoke_config.yaml`: small layered smoke-test override using one-level `extends`.
-- `prepare_spll_training.py`: creates the balanced split manifest, compact schedule manifests/previews, and shared initial checkpoints.
-- `compile_spll_training.py`: writes SPLL sum programs and compiles exact/approximate generated Python artifacts.
-- `train_spll_generated.py`: trains through the generated SPLL artifacts with a differentiable `readMNist` callback.
-- `visualize_spll_training.py`: writes milestone tables, per-arity grouped milestone bar charts, and training plots.
-- `spll_training_core.py`: Pipeline II helpers for paths, schedules, generated-artifact calls, training guards, and split handling.
+| File | Role |
+|---|---|
+| `mnist_spll_training_config.yaml` | Default Pipeline II config. |
+| `mnist_spll_training_smoke_config.yaml` | Small smoke-test override. |
+| `run_spll_training_pipeline.py` | Stage dispatcher. |
+| `prepare_spll_training.py` | Builds split/schedule manifests and initial checkpoints. |
+| `compile_spll_training.py` | Generates and compiles exact/approximate SPLL training artifacts. |
+| `train_spll_generated.py` | Trains through generated SPLL artifacts. |
+| `visualize_spll_training.py` | Writes milestone tables and training plots. |
+| `spll_training_core.py` | Shared Pipeline II helpers. |
 
-## Pipeline II design summary
+### Design summary
 
-Pipeline II uses only the official MNIST training partition. It materializes one global equal-count-per-digit 80/20 split:
-
-- 80% source pool for sum-supervised training cases;
-- 20% held-out uniform digit validation split;
-- the official MNIST test partition is reserved/unused.
-
-Training supervision is only the true sum. Digit labels are used for balanced split construction, but milestones are now task-level full-posterior sum accuracy, not held-out digit accuracy. The training stage supports SPLL sum mini-batches through `training.sum_batch_size`. The default config uses `sum_batch_size: 100`, so one optimizer update accumulates 100 generated SPLL true-sum queries before validation:
+Pipeline II uses the official MNIST training partition only. It builds a balanced split, creates sum-supervised schedules, compiles generated SPLL programs, then trains with loss based on the generated true-sum probability:
 
 ```text
-for each case in the sum batch:
-    p_true_i = generated_spll.main.forward(true_sum_i, *global_indices_i)
-loss = mean_i(-log(p_true_i + epsilon))
+loss = mean_i(-log(p_true_sum_i + epsilon))
 ```
 
-The generated SPLL artifact still receives scalar global MNIST indices and is still the source of truth for exact/approximate pruning. To avoid repeating the CNN forward for every scalar SPLL call, the training loop first runs the current differentiable base model once over all unique images in the batch, installs a temporary `readMNist(index)` lookup backed by those softmax rows, and then calls the generated artifact once per sum case. The stored probability tensors remain attached to the autograd graph, so gradients from the mean batch loss flow back to the CNN.
+The generated SPLL artifact remains the source of truth for exact/approximate pruning. The training loop batches CNN evaluation outside the scalar generated-SPLL calls so gradients still flow back to the CNN.
 
-`training.max_steps`, `validation.interval_steps`, milestone steps, and the `train_trace.csv` `step` column are measured in **sum cases seen**, not optimizer updates. The trace also records `optimizer_update`, `batch_size`, `branch_count_mean`, and `branch_count_total`. Set `training.sum_batch_size: 1` to recover the old one-case-per-update behavior.
+Milestones and trace `step` values are measured in **sum cases seen**, not optimizer updates. `training.sum_batch_size: 1` recovers the old one-case-per-update behavior.
 
-Validation can run asynchronously via `validation.async.enabled`. In that mode the trainer snapshots the current model and optimizer state at each validation interval, sends the snapshot to a separate validator process, and immediately continues training. The validator enumerates the full generated-SPLL posterior over candidate sums `0..9*n_terms` for each held-out sum case, predicts the argmax sum, and reports `sum_posterior_accuracy`. When a result crosses a milestone, the milestone checkpoint is written from the validated snapshot; when the highest milestone is reached, the trainer stops the next time it polls the validator result. This avoids blocking every training batch on validation, but the stop can be slightly delayed if validation is slower than training. The default async validator uses `device: cpu` and `max_pending_jobs: 1` to avoid fighting the MPS/GPU training process.
+Validation can run asynchronously if enabled in the config. Milestone checkpoints are written from validated snapshots.
 
-## Pipeline II stage order
+### Smoke-test commands
 
-```text
-prepare -> compile -> train -> visualize
-```
-
-`all` exists, but on Apple Silicon it is usually safer to run stages explicitly because `compile` should run under Rosetta/x86 while `prepare`, `train`, and `visualize` should run in the native arm64 environment.
-
-## Pipeline II commands
-
-From `mnist_spll_pipeline/`.
-
-### Smoke test prepare
-
-Run in native arm64:
+Prepare in native arm64:
 
 ```bash
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml prepare
 ```
 
-### Smoke test compile
-
-Run in Rosetta/x86_64:
+Compile in Rosetta/x86_64:
 
 ```bash
 arch -x86_64 zsh -f
-cd /Users/lisztomaniacae/IdeaProjects/spll-approx-comp/mnist_spll_pipeline
-source .venv-spll-x86/bin/activate
+cd /path/to/spll-approx-comp/mnist_spll_pipeline
 ./.venv-spll-x86/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml compile
 ```
 
-### Smoke test train and visualize
-
-Run in native arm64:
+Train and visualize in native arm64:
 
 ```bash
-source .venv-train-arm64/bin/activate
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml train
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml visualize
 ```
 
-### Default Pipeline II run
+### Default-run commands
 
-Use the same stage split, replacing the config path:
+Use the same stage split with the default config:
 
 ```bash
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml prepare
@@ -352,7 +203,7 @@ Use the same stage split, replacing the config path:
 
 ```bash
 arch -x86_64 zsh -f
-source .venv-spll-x86/bin/activate
+cd /path/to/spll-approx-comp/mnist_spll_pipeline
 ./.venv-spll-x86/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml compile
 ```
 
@@ -361,7 +212,7 @@ source .venv-spll-x86/bin/activate
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml visualize
 ```
 
-## Pipeline II outputs
+### Main outputs
 
 Default output root:
 
@@ -377,65 +228,58 @@ outputs/spll_training_smoke/
 
 Important artifacts:
 
-```text
-outputs/spll_training/
-  config_used.yaml
-  data_split_manifest.json
-  schedules/
-    seed_42_terms_02_schedule_manifest.json
-    previews/seed_42_terms_02_preview.jsonl
-  initial_checkpoints/
-    seed_42_terms_02.pt
-  generated/
-    spll_programs/sum_terms_02.spll
-    compiled_python/terms_02/<mode>/program.py
-  runs/
-    seed_42_terms_02_exact/
-      train_trace.csv
-      validation_trace.csv
-      milestones.json
-      checkpoints/milestone_0p10.pt
-      checkpoints/final.pt
-  visualization/
-    tables/milestone_summary.csv
-    tables/milestone_aggregate_summary.csv
-    figures/main_text/terms_02_steps_to_sum_posterior_milestone.png
-    figures/main_text/terms_02_time_to_sum_posterior_milestone.png
-    figures/main_text/*.png
-    figures/appendix/*.png
-```
+| Path | Contents |
+|---|---|
+| `config_used.yaml` | Fully resolved config for the run. |
+| `data_split_manifest.json` | Balanced source/validation split. |
+| `schedules/*.json` and `schedules/previews/*.jsonl` | Sum-supervised training schedules. |
+| `initial_checkpoints/*.pt` | Shared initial model checkpoints. |
+| `generated/spll_programs/*.spll` | Generated SPLL sum programs. |
+| `generated/compiled_python/**/program.py` | Generated Python inference artifacts. |
+| `runs/*/train_trace.csv` | Training trace. |
+| `runs/*/validation_trace.csv` | Validation trace. |
+| `runs/*/milestones.json` | Reached or censored milestones. |
+| `runs/*/checkpoints/*.pt` | Milestone/final checkpoints. |
+| `visualization/tables/*.csv` | Milestone and aggregate tables. |
+| `visualization/figures/**/*.png` | Training and milestone figures. |
 
-The `steps_to_sum_posterior_milestone` and `time_to_sum_posterior_milestone` figures are grouped bar charts: milestones are on the x-axis, the metric is on the y-axis, and each inference mode keeps the same color across milestone and trace figures. Bars show the mean over reached seeds, and error bars use the configured across-seed uncertainty interval. Missing or censored milestones remain explicit in the summary tables and plot footnote.
+The training stage is intentionally strict: it refuses to run if prepared or compiled artifacts are missing, if generated probabilities are detached/non-finite, or if gradients become invalid.
 
-By default, Pipeline II visualisation uses one sample standard deviation across seeds for milestone error bars and smoothed trace uncertainty bands:
+---
+
+## 4. Important config semantics
+
+### Approximation thresholds
+
+Approximation settings are represented by cutoff values in the config.
+
+| YAML value | Meaning |
+|---|---|
+| `null` | exact baseline; no SPLL pruning flag is passed |
+| `0.0` | approximate code path with zero cutoff; useful as overhead baseline, but not identical to exact |
+| positive number, e.g. `0.01` | approximate inference with pruning threshold passed via `-k` |
+
+### Inference-time `readMNist` caching
+
+Pipeline I has a config switch for the cache around generated-SPLL neural calls:
 
 ```yaml
-visualization:
-  trace_smoothing_window_points: 100
-  uncertainty_interval: std   # std | sem | ci95 | none
-  min_uncertainty_samples: 2
-  show_milestone_error_bars: true
-  show_trace_uncertainty_bands: true
-  show_raw_trace_uncertainty_bands: false
-  trace_band_alpha: 0.16
+inference:
+  read_mnist_cache_policy: run_scoped_no_cross_run_cache
 ```
 
-Smoothed trace figures first smooth each seed independently, then plot the across-seed mean and uncertainty band. Raw appendix traces keep uncertainty bands disabled by default so the raw noise remains inspectable rather than hidden under wide fills.
+Allowed values:
 
-## Pipeline II safety checks
+| Value | Meaning |
+|---|---|
+| `run_scoped_no_cross_run_cache` | Default. Use a fresh cache for each timed full-posterior or true-candidate query. This avoids repeated CNN calls inside one generated-SPLL query without sharing cache state between exact and cutoff runs. |
+| `uncached` | Disable inference-time caching. Every generated-SPLL `readMNist` call runs the MNIST model. This is useful for sensitivity checks, but it is much slower and changes runtime scale. |
 
-The training stage is intentionally strict. It aborts if:
+Aliases such as `run_scoped`, `cached`, `none`, or `off` are accepted, but prefer the canonical values above in committed configs.
 
-- prepared split/schedule/checkpoint artifacts are missing;
-- compiled generated Python artifacts are missing;
-- the generated SPLL probability is detached or not a torch tensor;
-- the preflight call does not produce finite nonzero gradients;
-- true-sum probability or loss becomes `NaN`, `inf`, or negative;
-- gradients contain `NaN` or `inf`.
+`-k/--topKCutoff` is a probability cutoff in `[0, 1]`. It is **not** a literal top-k class count.
 
-If compiled artifacts are missing, `train` refuses to compile automatically and prints the Rosetta/x86 compile command instead.
-
-## Pipeline II config inheritance
+### Config inheritance
 
 `mnist_spll_common.load_config(...)` supports one `extends` level. This is used by `mnist_spll_training_smoke_config.yaml`.
 
@@ -446,4 +290,22 @@ Merge semantics:
 - nested `extends` is rejected;
 - `config_used.yaml` stores the fully resolved config.
 
-Whenever `mnist_spll_training_config.yaml` changes, the smoke override must be checked and updated in the same patch so it remains a fast representative of the default config.
+Whenever `mnist_spll_training_config.yaml` changes, check the smoke override in the same patch.
+
+### Progress bars
+
+Progress bars can be disabled in the config:
+
+```yaml
+inference:
+  show_progress: false
+  show_inner_progress: false
+```
+
+---
+
+## 5. Notes for future changes
+
+- Update [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md) in the same patch whenever behavior, workflow, schemas, commands, caveats, or architecture change.
+- Keep exact and approximate inference comparable. Avoid process-global caching or other run-order effects that can make one cutoff look faster for external reasons.
+- Keep both Pipeline I and Pipeline II visible in this README. Detailed internals belong in the knowledge base, not here.

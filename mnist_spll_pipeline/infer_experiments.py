@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import torch
 
-from inference_engine import InferenceRunEngine, ModelInferenceContext
+from inference_engine import InferenceRunEngine, ModelInferenceContext, normalize_read_mnist_cache_policy
 from mnist_spll_common import (
     TerminalProgressBar,
     get_model_variants,
@@ -34,6 +34,9 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
     set_seed(int(config.get("seed", 42)))
     ctx = build_pipeline_context(config)
     show_inner_progress = bool(ctx.inference_cfg.get("show_inner_progress", True))
+    read_mnist_cache_policy = normalize_read_mnist_cache_policy(
+        ctx.inference_cfg.get("read_mnist_cache_policy", "run_scoped_no_cross_run_cache")
+    )
     model_variants = get_model_variants(config)
 
     stage_message(1, 3, "Loading trained model variants and staged experiment bundle")
@@ -83,6 +86,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
             show_progress=ctx.show_progress,
             show_inner_progress=show_inner_progress,
             progress_bar=inference_bar,
+            read_mnist_cache_policy=read_mnist_cache_policy,
         )
         raw_runs.extend(
             engine.run_many(
@@ -110,6 +114,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "show_inner_progress": show_inner_progress,
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "true_candidate_trace": True,
+                    "read_mnist_cache_policy": read_mnist_cache_policy,
+                    "threshold_order_policy": "rotated_by_experiment_index",
                     "paths": ctx.paths.to_json_dict(),
                 },
             ),
@@ -131,6 +137,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "num_runs": len(raw_runs),
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "true_candidate_trace": True,
+                    "read_mnist_cache_policy": read_mnist_cache_policy,
+                    "threshold_order_policy": "rotated_by_experiment_index",
                     "paths": ctx.paths.to_json_dict(),
                 },
             ),

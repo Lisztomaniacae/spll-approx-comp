@@ -357,14 +357,25 @@ Main responsibilities split:
 | `inference_engine.py` | Execute one or many inference runs and produce stable raw run records. |
 | `mnist_spll_pipeline_core.py` | Load compiled modules, patch `readMNist`, evaluate candidate sums, extract probabilities/branch counts. |
 
-`build_read_mnist(...)` loads the selected MNIST checkpoint and returns a callback that maps image paths to class probabilities. The compiled SPLL module is imported dynamically, then its `readMNist` symbol is replaced with this callback.
+`build_read_mnist(...)` loads the selected MNIST checkpoint and returns a deliberately **uncached** callback that maps image paths to class probabilities. The compiled SPLL module is imported dynamically, then its `readMNist` symbol is replaced with this callback and the base callback is preserved as `_spll_base_readMNist`.
+
+Inference timing is controlled by `inference.read_mnist_cache_policy` in `mnist_spll_config.yaml`. The canonical values are:
+
+| Value | Meaning |
+|---|---|
+| `run_scoped_no_cross_run_cache` | Default. Install a fresh query-scoped `readMNist` cache around each measured generated-SPLL call. This avoids repeated neural forward passes for the same image inside one posterior query, but prevents one cutoff measurement from warming the cache for another cutoff measurement. |
+| `uncached` | Do not cache generated-SPLL neural calls. Each `readMNist` invocation calls the base MNIST model, while still recording call/miss/unique-image stats. Use this only for sensitivity checks because runtime scale changes substantially. |
+
+Do not reintroduce a process-global `@lru_cache` around `read_mnist`; it can make later thresholds, especially `0.0`, look artificially faster than exact. The default run-scoped policy is the preferred thesis policy because it removes cross-run leakage while avoiding repeated identical CNN work inside one generated-SPLL query.
 
 For each model variant, staged experiment, cutoff mode, and threshold, inference does two conceptually separate measurements:
 
-1. **Full posterior query:** evaluate every candidate sum from `0` through `9 * n_terms`.
-2. **True-candidate query:** additionally evaluate only the expected true sum, e.g. for labels `5` and `7`, evaluate candidate `12` alone.
+1. **Full posterior query:** evaluate every candidate sum from `0` through `9 * n_terms` inside one fresh readMNist cache scope.
+2. **True-candidate query:** additionally evaluate only the expected true sum, e.g. for labels `5` and `7`, evaluate candidate `12` alone inside a separate fresh readMNist cache scope.
 
 The full posterior runtime is stored as `runtime_sec`. The true-candidate-only runtime is stored separately as `true_candidate_runtime_sec`. Do not add them together unless you explicitly want total measurement overhead of the instrumentation.
+
+Thresholds are measured in a rotated order by experiment index so `exact` is not always first. Raw run records include both the measurement order and the threshold order position used for that run.
 
 Raw run schema highlights:
 
@@ -389,6 +400,12 @@ Raw run schema highlights:
 | `true_candidate_runtime_sec` | Runtime for the true-sum-only query. |
 | `labels`, `global_indices`, `image_paths` | Provenance for the staged input. |
 | `compiled_program_path` | Exact compiled program used. |
+| `compiled_program_sha256` | SHA-256 digest of the compiled generated Python file used by the run. |
+| `measurement_order_index` | Actual chronological position of this timed threshold measurement in the inference stage. |
+| `threshold_order_position` | Position of the threshold within the rotated per-experiment threshold order. |
+| `read_mnist_cache_policy` | Cache policy used for generated SPLL neural calls: `run_scoped_no_cross_run_cache` or `uncached`. |
+| `posterior_read_mnist_stats` | Calls, hits, misses, and unique image count for the full-posterior cache scope. |
+| `true_candidate_read_mnist_stats` | Calls, hits, misses, and unique image count for the true-candidate-only cache scope. |
 
 Branch-count extraction caveat:
 
@@ -462,9 +479,10 @@ Keep these visible. They are useful future patch targets.
 4. **Raw config dict remains the main cross-stage interface.** A future `ExperimentPlan` object would reduce string-key coupling and make tests cleaner.
 5. **`selected_test_accuracy` naming is misleading.** It means selected validation/model-selection accuracy.
 6. **True-candidate tracing is extra work.** It is intentionally separate data, not part of the original posterior run. Keep `runtime_sec` and `true_candidate_runtime_sec` separate.
-7. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`.
-8. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
-9. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
+7. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`. After the timing-cache patch, `0.0` should no longer benefit from an exact-warmed process-global readMNist cache.
+8. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope, or deliberately disabled through `inference.read_mnist_cache_policy: uncached`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
+9. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
+10. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
 
 ## 8. Patch Discipline For Future Work
 
@@ -598,6 +616,8 @@ Minimum update examples:
 ## 12. Response Guidelines For Future Assistants
 
 The user usually wants practical patches, not GitHub issue management.
+
+`mnist_spll_pipeline/README.md` is intentionally a short operator guide. Keep detailed architecture notes, raw schema descriptions, caveats, and future-work discipline in this knowledge base instead of duplicating them in the README. The README must still list both Pipeline I and Pipeline II with their entrypoints, stage orders, config files, commands, and main output roots; do not delete Pipeline II while shortening the README.
 
 Prefer this response shape for code changes:
 

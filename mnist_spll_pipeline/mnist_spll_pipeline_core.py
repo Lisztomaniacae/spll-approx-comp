@@ -9,10 +9,10 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import inspect
+import math
 
 import torch
 from torch.utils.data import ConcatDataset
@@ -312,14 +312,22 @@ def build_read_mnist(model_path: Path, device: torch.device, config_path: Path):
     transform = build_eval_transform(config)
     from PIL import Image
 
-    @lru_cache(maxsize=None)
     def read_mnist(image_path: str) -> List[float]:
+        # Keep this function deliberately uncached.  The inference runner installs
+        # a fresh per-measurement cache around generated SPLL calls when it wants
+        # to avoid repeated neural-network evaluation inside one posterior query.
+        # A global lru_cache here would leak warm MNIST probabilities from the
+        # exact baseline into later cutoff runs and can manufacture speedups.
         image = Image.open(image_path).convert("L")
         x = transform(image).unsqueeze(0).to(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = model(x)
             probs = torch.softmax(logits, dim=-1)[0].detach().cpu().tolist()
-        return [float(v) for v in probs]
+
+        values = [float(v) for v in probs]
+        if len(values) != 10 or any(not math.isfinite(v) for v in values):
+            raise ValueError(f"readMNist returned invalid probabilities for {image_path!r}: {values!r}")
+        return values
 
     return read_mnist
 
@@ -521,6 +529,7 @@ def build_compiled_module_loader(
         compiled_py_path = compiled_program_path(paths.compiled_root, int(n_terms), normalized_mode, cutoff)
         module_name = f"spll_{normalized_mode}_{int(n_terms)}_{label}_{hashlib.sha1(str(compiled_py_path).encode()).hexdigest()[:10]}"
         module = import_compiled_module(compiled_py_path, module_name)
+        setattr(module, "_spll_base_readMNist", read_mnist)
         setattr(module, "readMNist", read_mnist)
         compiled_modules[key] = module
         loaded_targets += 1
