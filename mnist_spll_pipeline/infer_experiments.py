@@ -6,7 +6,12 @@ from typing import Any, Dict, List
 
 import torch
 
-from inference_engine import InferenceRunEngine, ModelInferenceContext, normalize_read_mnist_cache_policy
+from inference_engine import (
+    InferenceRunEngine,
+    ModelInferenceContext,
+    normalize_read_mnist_cache_policy,
+    warm_up_read_mnist,
+)
 from mnist_spll_common import (
     TerminalProgressBar,
     get_model_variants,
@@ -35,8 +40,11 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
     ctx = build_pipeline_context(config)
     show_inner_progress = bool(ctx.inference_cfg.get("show_inner_progress", True))
     read_mnist_cache_policy = normalize_read_mnist_cache_policy(
-        ctx.inference_cfg.get("read_mnist_cache_policy", "run_scoped_no_cross_run_cache")
+        ctx.inference_cfg.get("read_mnist_cache_policy", "uncached")
     )
+    read_mnist_warmup_calls = int(ctx.inference_cfg.get("read_mnist_warmup_calls", 0))
+    if read_mnist_warmup_calls < 0:
+        raise ValueError("inference.read_mnist_warmup_calls must be >= 0")
     model_variants = get_model_variants(config)
 
     stage_message(1, 3, "Loading trained model variants and staged experiment bundle")
@@ -57,6 +65,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
         enabled=ctx.show_progress and inference_total > 0,
     )
 
+    model_warmup_stats: Dict[str, Dict[str, Any]] = {}
+
     for variant in model_variants:
         model_id = variant["id"]
         target_accuracy = float(variant["target_accuracy"])
@@ -71,6 +81,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
             checkpoint_meta=checkpoint_meta,
         )
         read_mnist = build_read_mnist(model_path, device, Path(config["_config_path"]))
+        warmup_stats = warm_up_read_mnist(read_mnist, experiments, read_mnist_warmup_calls)
+        model_warmup_stats[model_id] = warmup_stats
         get_compiled_module, finish_loading = build_compiled_module_loader(
             ctx.paths,
             cutoff_modes,
@@ -87,6 +99,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
             show_inner_progress=show_inner_progress,
             progress_bar=inference_bar,
             read_mnist_cache_policy=read_mnist_cache_policy,
+            read_mnist_warmup_stats=warmup_stats,
         )
         raw_runs.extend(
             engine.run_many(
@@ -115,6 +128,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "true_candidate_trace": True,
                     "read_mnist_cache_policy": read_mnist_cache_policy,
+                    "read_mnist_warmup_calls": read_mnist_warmup_calls,
+                    "read_mnist_warmup_by_model": model_warmup_stats,
                     "threshold_order_policy": "rotated_by_experiment_index",
                     "paths": ctx.paths.to_json_dict(),
                 },
@@ -138,6 +153,8 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "true_candidate_trace": True,
                     "read_mnist_cache_policy": read_mnist_cache_policy,
+                    "read_mnist_warmup_calls": read_mnist_warmup_calls,
+                    "read_mnist_warmup_by_model": model_warmup_stats,
                     "threshold_order_policy": "rotated_by_experiment_index",
                     "paths": ctx.paths.to_json_dict(),
                 },

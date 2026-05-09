@@ -62,6 +62,7 @@ After the architecture-deepening refactor, this entrypoint lazy-loads only the s
 | `infer_experiments.py` | Inference stage orchestration | Iterates model variants and creates `InferenceRunEngine` instances. |
 | `inference_engine.py` | Deepened inference-run module | Owns full-posterior query, true-candidate query, timing, and raw run schema. |
 | `visualize_results.py` | Metrics, tables, and figures | Large file; contains both metric derivation and plotting. |
+| `diagnose_cutoff_zero_mwe.py` | Timing diagnostic / minimal-working-example harness | Repeatedly runs exact and `cutoff=0.0` generated Python artifacts with fake or real `readMNist` backends; writes timing CSV, summaries, optional profiles, and optional disassembly. |
 | `mnist_spll_pipeline_core.py` | Shared pipeline helpers | Paths, SPLL program generation, compilation wrapper, module loading, inference helpers, JSON helpers. |
 | `mnist_spll_common.py` | Shared config/model/data utilities | Config loading, path resolution, CNN model, MNIST loading, model variant config. |
 | `run_spll_sum_experiments.py` | Legacy wrapper | Kept for compatibility, but should not be the preferred entrypoint. See known caveat below. |
@@ -363,15 +364,17 @@ Inference timing is controlled by `inference.read_mnist_cache_policy` in `mnist_
 
 | Value | Meaning |
 |---|---|
-| `run_scoped_no_cross_run_cache` | Default. Install a fresh query-scoped `readMNist` cache around each measured generated-SPLL call. This avoids repeated neural forward passes for the same image inside one posterior query, but prevents one cutoff measurement from warming the cache for another cutoff measurement. |
-| `uncached` | Do not cache generated-SPLL neural calls. Each `readMNist` invocation calls the base MNIST model, while still recording call/miss/unique-image stats. Use this only for sensitivity checks because runtime scale changes substantially. |
+| `uncached` | Default thesis timing policy. Do not cache generated-SPLL neural calls; each `readMNist` invocation calls the base MNIST model, while still recording call/miss/unique-image stats. This measures the literal generated-SPLL execution without a memoized neural oracle. |
+| `run_scoped_no_cross_run_cache` | Sensitivity/debug policy. Install a fresh query-scoped `readMNist` cache around each measured generated-SPLL call. This avoids repeated neural forward passes for the same image inside one posterior query, but prevents one cutoff measurement from warming the cache for another cutoff measurement. |
 
-Do not reintroduce a process-global `@lru_cache` around `read_mnist`; it can make later thresholds, especially `0.0`, look artificially faster than exact. The default run-scoped policy is the preferred thesis policy because it removes cross-run leakage while avoiding repeated identical CNN work inside one generated-SPLL query.
+Do not reintroduce a process-global `@lru_cache` around `read_mnist`; it can make later thresholds, especially `0.0`, look artificially faster than exact. Use `run_scoped_no_cross_run_cache` only when the research question explicitly wants to factor out repeated identical CNN calls inside one generated-SPLL query.
+
+`inference.read_mnist_warmup_calls` controls optional untimed base `readMNist` calls before each model variant starts measured inference. The benchmark default is `0`. Keep it at `0` for thesis-facing runtime results so the measured run includes the same cold-start behavior a normal uncached inference call would see. Use a positive value only for diagnostics that intentionally factor out one-off PIL/PyTorch/device-dispatch startup effects.
 
 For each model variant, staged experiment, cutoff mode, and threshold, inference does two conceptually separate measurements:
 
-1. **Full posterior query:** evaluate every candidate sum from `0` through `9 * n_terms` inside one fresh readMNist cache scope.
-2. **True-candidate query:** additionally evaluate only the expected true sum, e.g. for labels `5` and `7`, evaluate candidate `12` alone inside a separate fresh readMNist cache scope.
+1. **Full posterior query:** evaluate every candidate sum from `0` through `9 * n_terms` inside one fresh readMNist scope using the selected cache policy.
+2. **True-candidate query:** additionally evaluate only the expected true sum, e.g. for labels `5` and `7`, evaluate candidate `12` alone inside a separate fresh readMNist scope using the selected cache policy.
 
 The full posterior runtime is stored as `runtime_sec`. The true-candidate-only runtime is stored separately as `true_candidate_runtime_sec`. Do not add them together unless you explicitly want total measurement overhead of the instrumentation.
 
@@ -403,9 +406,10 @@ Raw run schema highlights:
 | `compiled_program_sha256` | SHA-256 digest of the compiled generated Python file used by the run. |
 | `measurement_order_index` | Actual chronological position of this timed threshold measurement in the inference stage. |
 | `threshold_order_position` | Position of the threshold within the rotated per-experiment threshold order. |
-| `read_mnist_cache_policy` | Cache policy used for generated SPLL neural calls: `run_scoped_no_cross_run_cache` or `uncached`. |
-| `posterior_read_mnist_stats` | Calls, hits, misses, and unique image count for the full-posterior cache scope. |
-| `true_candidate_read_mnist_stats` | Calls, hits, misses, and unique image count for the true-candidate-only cache scope. |
+| `read_mnist_cache_policy` | Cache policy used for generated SPLL neural calls: `uncached` or `run_scoped_no_cross_run_cache`. |
+| `read_mnist_warmup_calls`, `read_mnist_warmup_runtime_sec` | Optional untimed warmup metadata for the base `readMNist` callback. Thesis-facing benchmark runs should normally record `0` calls and `0.0` seconds. |
+| `posterior_read_mnist_stats` | Calls, hits, misses, and unique image count for the full-posterior readMNist scope. |
+| `true_candidate_read_mnist_stats` | Calls, hits, misses, and unique image count for the true-candidate-only readMNist scope. |
 
 Branch-count extraction caveat:
 
@@ -417,7 +421,67 @@ T(probability, T(0.0, branch_count))
 
 `extract_branch_count(...)` reads the nested second component. If the structure is missing, it returns `None`. If the structure exists but cannot be converted to a scalar, it raises.
 
-### 6.5 Visualization stage
+### 6.5 Cutoff-zero timing diagnostic / MWE harness
+
+`diagnose_cutoff_zero_mwe.py` exists specifically to investigate suspicious speedups of the approximate `-k 0.0` generated Python path. It is not part of the main pipeline stages and does not write `inference_runs.json`; it writes an isolated diagnostic bundle under:
+
+```text
+outputs/spll_experiments/diagnostics/cutoff_zero_mwe/<timestamp>/
+```
+
+The harness loads the already compiled exact artifact and the already compiled `cutoff_0p0` artifact for a chosen arity. It then installs one selected `readMNist` backend into both modules:
+
+| Backend | Purpose |
+|---|---|
+| `uniform-list` | Replaces MNIST with `[0.1] * 10`; isolates generated Python and CPython interpreter behavior. |
+| `skewed-list` | Uses a deterministic nonuniform Python-list distribution; still avoids PyTorch. |
+| `uniform-tensor` | Returns a uniform torch tensor; adds PyTorch tensor dispatch while still avoiding CNN execution and image IO. |
+| `real` | Uses `build_read_mnist(...)` with a configured checkpoint and staged image paths. |
+
+Useful commands:
+
+```bash
+./.venv-train-arm64/bin/python diagnose_cutoff_zero_mwe.py \
+  --config mnist_spll_config.yaml \
+  --n-terms 2 \
+  --read-mnist-source uniform-list \
+  --query full-posterior \
+  --repeats 100 \
+  --sequence exact,exact,cutoff,cutoff \
+  --disassemble \
+  --profile-repeats 1000
+```
+
+```bash
+./.venv-train-arm64/bin/python diagnose_cutoff_zero_mwe.py \
+  --config mnist_spll_config.yaml \
+  --n-terms 2 \
+  --experiment-id 1 \
+  --model-id acc90 \
+  --read-mnist-source real \
+  --query full-posterior \
+  --repeats 100 \
+  --sequence exact,cutoff,exact,cutoff
+```
+
+Diagnostic artifacts:
+
+| File | Meaning |
+|---|---|
+| `timings.csv` | One measured row per generated-SPLL call. |
+| `block_summary.csv` | Mean/median/stdev/min/max plus first-10 versus last-10 timing ratios per sequence block. |
+| `summary.json` | Settings, environment metadata, program SHA-256 values, precheck probability/branch differences, block summaries, and speedup ratios. |
+| `profile_exact.txt`, `profile_cutoff.txt` | Optional `cProfile` summaries when `--profile-repeats` is positive. |
+| `dis_exact_forward.txt`, `dis_cutoff_forward.txt` | Optional bytecode disassembly when `--disassemble` is set. |
+
+Interpretation discipline:
+
+- If a speedup persists with `uniform-list`, the effect is in generated Python / CPython behavior, not the CNN or PyTorch model execution.
+- If it appears only with `uniform-tensor`, suspect torch tensor dispatch/autograd-related overhead rather than image IO or the trained model.
+- If it appears only with `real`, inspect `readMNist`, image loading, device warmup, or cache policy.
+- The default sequence `exact,exact,cutoff,cutoff` tests first-block versus second-block warmup inside each artifact. Use `exact,cutoff,exact,cutoff` to test cross-artifact run-order effects.
+
+### 6.6 Visualization stage
 
 Entrypoint:
 
@@ -480,9 +544,12 @@ Keep these visible. They are useful future patch targets.
 5. **`selected_test_accuracy` naming is misleading.** It means selected validation/model-selection accuracy.
 6. **True-candidate tracing is extra work.** It is intentionally separate data, not part of the original posterior run. Keep `runtime_sec` and `true_candidate_runtime_sec` separate.
 7. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`. After the timing-cache patch, `0.0` should no longer benefit from an exact-warmed process-global readMNist cache.
-8. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope, or deliberately disabled through `inference.read_mnist_cache_policy: uncached`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
-9. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
-10. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
+8. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope through `run_scoped_no_cross_run_cache`, or deliberately disabled through the default `inference.read_mnist_cache_policy: uncached`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
+9. **Default runtime plots should use uncached inference.** The run-scoped cache is useful as a sensitivity/debug mode, but thesis-facing runtime results should say explicitly which policy was used.
+10. **Do not hide cold-start effects in thesis-facing benchmarks.** Keep `read_mnist_warmup_calls: 0` for normal uncached runtime results. Use positive warmup only for explicit diagnostics that ask whether a one-off startup effect is present.
+11. **Use the cutoff-zero MWE harness before explaining suspicious `0.0` speedups.** Prefer `uniform-list` first, then `uniform-tensor`, then `real`, so generated Python/interpreter effects are separated from PyTorch and image/model effects.
+12. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
+13. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
 
 ## 8. Patch Discipline For Future Work
 

@@ -20,6 +20,7 @@ from mnist_spll_pipeline_core import (
 
 READ_MNIST_CACHE_POLICY_RUN_SCOPED = "run_scoped_no_cross_run_cache"
 READ_MNIST_CACHE_POLICY_UNCACHED = "uncached"
+READ_MNIST_CACHE_POLICY_DEFAULT = READ_MNIST_CACHE_POLICY_UNCACHED
 
 
 def normalize_read_mnist_cache_policy(value: Any) -> str:
@@ -32,10 +33,10 @@ def normalize_read_mnist_cache_policy(value: Any) -> str:
     - ``run_scoped_no_cross_run_cache``: cache repeated image probabilities
       only inside one measured generated-SPLL query.
     - ``uncached``: call the base MNIST model for every generated-SPLL
-      ``readMNist`` invocation.
+      ``readMNist`` invocation. This is the default thesis timing policy.
     """
 
-    text = str(value or READ_MNIST_CACHE_POLICY_RUN_SCOPED).strip().lower().replace("-", "_")
+    text = str(value or READ_MNIST_CACHE_POLICY_DEFAULT).strip().lower().replace("-", "_")
     if text in {
         "cached",
         "run_scoped",
@@ -115,6 +116,49 @@ class UncachedReadMNistCounter:
             "cache_misses": int(self.calls),
             "unique_images": int(len(self.unique_images_seen)),
         }
+
+
+def warm_up_read_mnist(
+    read_mnist: Callable[[str], Sequence[float]],
+    experiments: Sequence[Dict[str, Any]],
+    calls: int,
+) -> Dict[str, Any]:
+    """Run untimed readMNist calls before measured inference.
+
+    This removes one-off PIL/PyTorch/device-dispatch startup effects from the
+    first exact/cutoff measurement without installing any prediction cache.
+    The callback is intentionally the same uncached base callback that compiled
+    SPLL modules will call later through the selected cache policy.
+    """
+
+    requested = max(0, int(calls))
+    if requested <= 0 or not experiments:
+        return {"calls": 0, "runtime_sec": 0.0, "image_paths": []}
+
+    candidate_paths: List[str] = []
+    for experiment in experiments:
+        for image_path in experiment.get("image_paths", []):
+            candidate_paths.append(str(image_path))
+            if len(candidate_paths) >= requested:
+                break
+        if len(candidate_paths) >= requested:
+            break
+
+    if not candidate_paths:
+        return {"calls": 0, "runtime_sec": 0.0, "image_paths": []}
+
+    started = time.perf_counter()
+    completed = 0
+    for index in range(requested):
+        image_path = candidate_paths[index % len(candidate_paths)]
+        read_mnist(image_path)
+        completed += 1
+    runtime_sec = time.perf_counter() - started
+    return {
+        "calls": int(completed),
+        "runtime_sec": float(runtime_sec),
+        "image_paths": candidate_paths,
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -206,7 +250,8 @@ class InferenceRunEngine:
         show_progress: bool,
         show_inner_progress: bool,
         progress_bar: Optional[TerminalProgressBar] = None,
-        read_mnist_cache_policy: str = READ_MNIST_CACHE_POLICY_RUN_SCOPED,
+        read_mnist_cache_policy: str = READ_MNIST_CACHE_POLICY_DEFAULT,
+        read_mnist_warmup_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.paths = paths
         self.model = model
@@ -215,6 +260,7 @@ class InferenceRunEngine:
         self.show_inner_progress = bool(show_inner_progress)
         self.progress_bar = progress_bar
         self.read_mnist_cache_policy = normalize_read_mnist_cache_policy(read_mnist_cache_policy)
+        self.read_mnist_warmup_stats = dict(read_mnist_warmup_stats or {})
 
     @contextmanager
     def _read_mnist_scope(self, module: Any) -> Iterator[RunScopedReadMNistCache | UncachedReadMNistCounter]:
@@ -382,4 +428,6 @@ class InferenceRunEngine:
             "read_mnist_cache_policy": self.read_mnist_cache_policy,
             "posterior_read_mnist_stats": posterior_read_mnist_stats,
             "true_candidate_read_mnist_stats": true_candidate_read_mnist_stats,
+            "read_mnist_warmup_calls": int(self.read_mnist_warmup_stats.get("calls", 0)),
+            "read_mnist_warmup_runtime_sec": float(self.read_mnist_warmup_stats.get("runtime_sec", 0.0)),
         }

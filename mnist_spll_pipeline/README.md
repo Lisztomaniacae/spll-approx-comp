@@ -163,7 +163,7 @@ Pipeline II uses the official MNIST training partition only. It builds a balance
 ```text
 loss = mean_i(-log(p_true_sum_i + epsilon))
 ```
-
+my 
 The generated SPLL artifact remains the source of truth for exact/approximate pruning. The training loop batches CNN evaluation outside the scalar generated-SPLL calls so gradients still flow back to the CNN.
 
 Milestones and trace `step` values are measured in **sum cases seen**, not optimizer updates. `training.sum_batch_size: 1` recovers the old one-case-per-update behavior.
@@ -265,19 +265,74 @@ Pipeline I has a config switch for the cache around generated-SPLL neural calls:
 
 ```yaml
 inference:
-  read_mnist_cache_policy: run_scoped_no_cross_run_cache
+  read_mnist_cache_policy: uncached
+  read_mnist_warmup_calls: 0
 ```
 
-Allowed values:
+Allowed cache values:
 
 | Value | Meaning |
 |---|---|
-| `run_scoped_no_cross_run_cache` | Default. Use a fresh cache for each timed full-posterior or true-candidate query. This avoids repeated CNN calls inside one generated-SPLL query without sharing cache state between exact and cutoff runs. |
-| `uncached` | Disable inference-time caching. Every generated-SPLL `readMNist` call runs the MNIST model. This is useful for sensitivity checks, but it is much slower and changes runtime scale. |
+| `uncached` | Default thesis timing policy. Every generated-SPLL `readMNist` call runs the MNIST model; no prediction cache is installed around inference. |
+| `run_scoped_no_cross_run_cache` | Sensitivity/debug policy. Use a fresh cache for each timed full-posterior or true-candidate query. This avoids repeated CNN calls inside one generated-SPLL query without sharing cache state between exact and cutoff runs. |
+
+`read_mnist_warmup_calls` defaults to `0` and should stay `0` for thesis-facing runtime benchmarks. A positive value is only a diagnostic option for intentionally excluding one-off cold-start effects; it runs untimed base `readMNist` calls before a model variant starts measured inference, without installing any inference cache.
 
 Aliases such as `run_scoped`, `cached`, `none`, or `off` are accepted, but prefer the canonical values above in committed configs.
 
 `-k/--topKCutoff` is a probability cutoff in `[0, 1]`. It is **not** a literal top-k class count.
+
+### Diagnosing cutoff `0.0` timing artifacts
+
+Use `diagnose_cutoff_zero_mwe.py` when the approximate `0.0` path appears faster than exact even though branch counts and probabilities should be almost identical. The script runs the exact and `cutoff_0p0` generated Python artifacts repeatedly, writes per-call timings, and can also write `cProfile` and `dis.dis` reports.
+
+First isolate generated-Python/interpreter overhead with a fake list-valued `readMNist`:
+
+```bash
+./.venv-train-arm64/bin/python diagnose_cutoff_zero_mwe.py \
+  --config mnist_spll_config.yaml \
+  --n-terms 2 \
+  --read-mnist-source uniform-list \
+  --query full-posterior \
+  --repeats 100 \
+  --sequence exact,exact,cutoff,cutoff \
+  --disassemble \
+  --profile-repeats 1000
+```
+
+Then add PyTorch tensor dispatch without the real CNN:
+
+```bash
+./.venv-train-arm64/bin/python diagnose_cutoff_zero_mwe.py \
+  --config mnist_spll_config.yaml \
+  --n-terms 2 \
+  --read-mnist-source uniform-tensor \
+  --query full-posterior \
+  --repeats 100 \
+  --sequence exact,cutoff,exact,cutoff
+```
+
+Finally test the real model and staged images:
+
+```bash
+./.venv-train-arm64/bin/python diagnose_cutoff_zero_mwe.py \
+  --config mnist_spll_config.yaml \
+  --n-terms 2 \
+  --experiment-id 1 \
+  --model-id acc90 \
+  --read-mnist-source real \
+  --query full-posterior \
+  --repeats 100 \
+  --sequence exact,cutoff,exact,cutoff
+```
+
+Outputs are written under:
+
+```text
+outputs/spll_experiments/diagnostics/cutoff_zero_mwe/<timestamp>/
+```
+
+The most useful files are `timings.csv`, `block_summary.csv`, `summary.json`, optional `profile_*.txt`, and optional `dis_*_forward.txt`.
 
 ### Config inheritance
 
