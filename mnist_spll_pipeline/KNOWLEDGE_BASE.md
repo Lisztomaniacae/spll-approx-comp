@@ -366,8 +366,9 @@ Inference timing is controlled by `inference.read_mnist_cache_policy` in `mnist_
 |---|---|
 | `uncached` | Default thesis timing policy. Do not cache generated-SPLL neural calls; each `readMNist` invocation calls the base MNIST model, while still recording call/miss/unique-image stats. This measures the literal generated-SPLL execution without a memoized neural oracle. |
 | `run_scoped_no_cross_run_cache` | Sensitivity/debug policy. Install a fresh query-scoped `readMNist` cache around each measured generated-SPLL call. This avoids repeated neural forward passes for the same image inside one posterior query, but prevents one cutoff measurement from warming the cache for another cutoff measurement. |
+| `precomputed_per_measurement` | Inference-isolation policy. For each measured full-posterior or true-candidate query, compute neural probabilities for that run's image paths into a fresh lookup immediately before timing, install a lookup-only `readMNist`, time only the generated-SPLL query, then discard the lookup. Precompute time is logged separately and is never shared between exact and cutoff runs. |
 
-Do not reintroduce a process-global `@lru_cache` around `read_mnist`; it can make later thresholds, especially `0.0`, look artificially faster than exact. Use `run_scoped_no_cross_run_cache` only when the research question explicitly wants to factor out repeated identical CNN calls inside one generated-SPLL query.
+Do not reintroduce a process-global `@lru_cache` around `read_mnist`; it can make later thresholds, especially `0.0`, look artificially faster than exact. Use `run_scoped_no_cross_run_cache` only when the research question explicitly wants to factor out repeated identical CNN calls inside one generated-SPLL query. Use `precomputed_per_measurement` when the research question wants to isolate generated probabilistic-inference/runtime behavior after neural predictions are already available.
 
 `inference.read_mnist_warmup_calls` controls optional untimed base `readMNist` calls before each model variant starts measured inference. The benchmark default is `0`. Keep it at `0` for thesis-facing runtime results so the measured run includes the same cold-start behavior a normal uncached inference call would see. Use a positive value only for diagnostics that intentionally factor out one-off PIL/PyTorch/device-dispatch startup effects.
 
@@ -406,10 +407,12 @@ Raw run schema highlights:
 | `compiled_program_sha256` | SHA-256 digest of the compiled generated Python file used by the run. |
 | `measurement_order_index` | Actual chronological position of this timed threshold measurement in the inference stage. |
 | `threshold_order_position` | Position of the threshold within the rotated per-experiment threshold order. |
-| `read_mnist_cache_policy` | Cache policy used for generated SPLL neural calls: `uncached` or `run_scoped_no_cross_run_cache`. |
+| `read_mnist_cache_policy` | Cache policy used for generated SPLL neural calls: `uncached`, `run_scoped_no_cross_run_cache`, or `precomputed_per_measurement`. |
 | `read_mnist_warmup_calls`, `read_mnist_warmup_runtime_sec` | Optional untimed warmup metadata for the base `readMNist` callback. Thesis-facing benchmark runs should normally record `0` calls and `0.0` seconds. |
 | `posterior_read_mnist_stats` | Calls, hits, misses, and unique image count for the full-posterior readMNist scope. |
 | `true_candidate_read_mnist_stats` | Calls, hits, misses, and unique image count for the true-candidate-only readMNist scope. |
+| `read_mnist_precompute_runtime_sec` | Full-posterior neural precompute time when `precomputed_per_measurement` is used; otherwise `0.0`. This is deliberately excluded from `runtime_sec`. |
+| `true_candidate_read_mnist_precompute_runtime_sec` | True-candidate neural precompute time when `precomputed_per_measurement` is used; otherwise `0.0`. This is deliberately excluded from `true_candidate_runtime_sec`. |
 
 Branch-count extraction caveat:
 
@@ -544,12 +547,16 @@ Keep these visible. They are useful future patch targets.
 5. **`selected_test_accuracy` naming is misleading.** It means selected validation/model-selection accuracy.
 6. **True-candidate tracing is extra work.** It is intentionally separate data, not part of the original posterior run. Keep `runtime_sec` and `true_candidate_runtime_sec` separate.
 7. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`. After the timing-cache patch, `0.0` should no longer benefit from an exact-warmed process-global readMNist cache.
-8. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope through `run_scoped_no_cross_run_cache`, or deliberately disabled through the default `inference.read_mnist_cache_policy: uncached`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
-9. **Default runtime plots should use uncached inference.** The run-scoped cache is useful as a sensitivity/debug mode, but thesis-facing runtime results should say explicitly which policy was used.
+8. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope through `run_scoped_no_cross_run_cache`, deliberately disabled through the default `inference.read_mnist_cache_policy: uncached`, or precomputed into a fresh per-measurement lookup through `precomputed_per_measurement`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
+9. **Runtime plots must state the readMNist policy.** Use `uncached` for literal end-to-end generated-SPLL execution. Use `precomputed_per_measurement` for inference-isolated timing. Do not mix the two regimes in one speedup claim without labeling them.
 10. **Do not hide cold-start effects in thesis-facing benchmarks.** Keep `read_mnist_warmup_calls: 0` for normal uncached runtime results. Use positive warmup only for explicit diagnostics that ask whether a one-off startup effect is present.
 11. **Use the cutoff-zero MWE harness before explaining suspicious `0.0` speedups.** Prefer `uniform-list` first, then `uniform-tensor`, then `real`, so generated Python/interpreter effects are separated from PyTorch and image/model effects.
 12. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
 13. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
+14. **Branch-count timing caveat.** Branch counting is currently treated as symmetric enough for the exact-vs-approximate comparison, but thesis-facing runtime text should state when `count_branches: true` was enabled. If clean runtime becomes central, run a non-counting timing sensitivity check rather than assuming instrumentation overhead is exactly equal across modes.
+15. **Pipeline I uses a custom MNIST-pool split.** This is intentional: official MNIST train and test partitions are loaded into one pool and then split into train, validation/model-selection, and inference subsets by the configured ratios and seed. Do not describe Pipeline I as an official MNIST-test benchmark unless the split logic is changed.
+16. **Large-N random sampling is the current mitigation for staged-case luck.** The final run is expected to use many more staged experiments rather than stratified balancing. If residual fairness concerns remain, add slice reporting by arity, true sum, model variant, collapse rate, and exact confidence.
+17. **Operand-order sensitivity is known but not currently patched.** Generated addition expressions are left-associated; approximation may be branch/order sensitive. Large-N random sampling is the current practical mitigation. A future permutation-sensitivity experiment would be the cleanest direct check.
 
 ## 8. Patch Discipline For Future Work
 
@@ -732,7 +739,9 @@ loss = mean_i(-log(p_true_i + epsilon))
 
 The default config uses `sum_batch_size: 100`, matching `validation.interval_steps: 100`, so validation is requested after each 100-case optimizer update. Set `sum_batch_size: 1` to recover the older one-case-per-update behavior.
 
-Pipeline II supports asynchronous validation through `validation.async.enabled`. The trainer snapshots the current model and optimizer state at validation intervals, sends the CPU snapshot to a separate validator process, and continues training. The validator computes task-level `sum_posterior_accuracy` by enumerating every generated-SPLL candidate sum `0..9*n_terms` for each held-out validation sum case and comparing the argmax posterior sum to the true sum. Milestone checkpoints must be written from the validated snapshot, not from the later live model. The trainer stops only after polling a validator result that reaches the highest milestone, so stopping can overshoot by one or more training batches when validation lags. The default async validator uses CPU and `max_pending_jobs: 1` to avoid MPS/GPU contention and unbounded snapshot memory.
+Pipeline II supports asynchronous validation through `validation.async.enabled`. The trainer snapshots the current model and optimizer state at validation intervals, sends the CPU snapshot to a separate validator process, and continues training. The validator computes task-level `sum_posterior_accuracy` by enumerating every generated-SPLL candidate sum `0..9*n_terms` for each held-out validation sum case and comparing the argmax posterior sum to the true sum. Milestone checkpoints must be written from the validated snapshot, not from the later live model. The trainer stops only after polling a validator result that reaches the highest milestone, so stopping can overshoot by one or more training batches when validation lags. On shutdown, the trainer drains the async result queue again after joining the worker so late completed validations are still recorded. The default async validator uses CPU and `max_pending_jobs: 1` to avoid MPS/GPU contention and unbounded snapshot memory.
+
+Pipeline II rotates inference-mode run order by seed/experiment index instead of always running exact first. Run summaries record `mode_order_position`, `mode_order_offset`, and `run_order_index` so thermal/cache/load-order effects can be audited later.
 
 The generated SPLL Python artifact is part of the gradient path. Do not replace it with a hand-written torch-native semantic equivalent for Pipeline II experiments. Batched training keeps the generated artifact as the source of truth: it precomputes differentiable MNIST softmax rows for all unique image indices in the batch, installs a temporary `readMNist(index)` lookup backed by those tensors, and still calls the generated SPLL `main.forward(...)` once per scalar sum case. The lookup tensors must remain attached to the current autograd graph.
 
@@ -811,7 +820,7 @@ Validation is interval-based. For each validation sum case, the validator enumer
 Important run artifacts:
 
 - `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, and gradient norm;
-- `validation_trace.csv`: backward-compatible `digit_accuracy` alias plus `sum_posterior_accuracy`, validation-case count, candidate count, mean true/predicted/total posterior mass, zero-total posterior rate, tie rate, validation branch-count mean, and recent train means;
+- `validation_trace.csv`: backward-compatible `digit_accuracy` alias plus `sum_posterior_accuracy`, validation-case count, candidate count, mean true/predicted/total posterior mass, zero-total posterior rate, tie rate, validation branch-count mean, recent train means, validation snapshot step, trainer step when submitted/recorded, and validation lag in steps;
 - `milestones.json`: first observed step/time for each milestone;
 - `checkpoints/milestone_*.pt`: first crossing snapshots;
 - `checkpoints/final.pt`: final snapshot.

@@ -207,6 +207,8 @@ def _validation_worker_main(
                 {
                     "type": "result",
                     "job_id": job_id,
+                    "validation_snapshot_step": int(request.get("validation_snapshot_step", request.get("step", -1))),
+                    "trainer_step_when_submitted": request.get("trainer_step_when_submitted"),
                     "loss_recent_mean": request.get("loss_recent_mean"),
                     "true_mass_recent_mean": request.get("true_mass_recent_mean"),
                     "zero_true_mass_recent_rate": request.get("zero_true_mass_recent_rate"),
@@ -535,6 +537,13 @@ def _write_milestones_json(path: Path, milestones_state: Dict[str, Dict[str, Any
     write_json(path, {"milestones": milestones_state})
 
 
+def _rotated_modes(modes: List[Dict[str, Any]], offset: int) -> List[Dict[str, Any]]:
+    if not modes:
+        return []
+    shift = int(offset) % len(modes)
+    return modes[shift:] + modes[:shift]
+
+
 def _train_one_run(
     *,
     config: Dict[str, Any],
@@ -543,6 +552,9 @@ def _train_one_run(
     seed: int,
     experiment: Dict[str, Any],
     mode: Dict[str, Any],
+    mode_order_position: int = 0,
+    mode_order_offset: int = 0,
+    run_order_index: Optional[int] = None,
 ) -> None:
     paths = training_paths(config)
     n_terms = int(experiment["n_terms"])
@@ -552,7 +564,15 @@ def _train_one_run(
     ensure_dir(this_run_dir)
     ensure_dir(this_run_dir / "checkpoints")
 
-    context = {"seed": seed, "n_terms": n_terms, "mode": mode_name, "top_k_cutoff": mode.get("top_k_cutoff")}
+    context = {
+        "seed": seed,
+        "n_terms": n_terms,
+        "mode": mode_name,
+        "top_k_cutoff": mode.get("top_k_cutoff"),
+        "mode_order_position": int(mode_order_position),
+        "mode_order_offset": int(mode_order_offset),
+        "run_order_index": None if run_order_index is None else int(run_order_index),
+    }
     validation_process = None
     validation_request_queue = None
     try:
@@ -642,6 +662,9 @@ def _train_one_run(
                 "zero_true_mass_recent_rate",
                 "validation_source",
                 "trainer_step_when_recorded",
+                "validation_snapshot_step",
+                "trainer_step_when_submitted",
+                "validation_lag_steps",
             ],
         )
 
@@ -700,6 +723,15 @@ def _train_one_run(
             step = int(result["step"])
             elapsed = float(result["elapsed_seconds"])
             acc = float(result["sum_posterior_accuracy"] if result.get("sum_posterior_accuracy") is not None else result["digit_accuracy"])
+            snapshot_step = int(result.get("validation_snapshot_step", step))
+            trainer_step_submitted = result.get("trainer_step_when_submitted")
+            if trainer_step_submitted is not None:
+                trainer_step_submitted = int(trainer_step_submitted)
+            validation_lag_steps = (
+                int(trainer_step_when_recorded) - snapshot_step
+                if trainer_step_when_recorded is not None
+                else None
+            )
             val_writer.writerow(
                 {
                     "step": step,
@@ -721,6 +753,9 @@ def _train_one_run(
                     "zero_true_mass_recent_rate": result.get("zero_true_mass_recent_rate"),
                     "validation_source": source,
                     "trainer_step_when_recorded": trainer_step_when_recorded,
+                    "validation_snapshot_step": snapshot_step,
+                    "trainer_step_when_submitted": trainer_step_submitted,
+                    "validation_lag_steps": validation_lag_steps,
                 }
             )
             val_handle.flush()
@@ -815,11 +850,14 @@ def _train_one_run(
                 "model_state_dict": _snapshot_model_state(model),
                 "optimizer_state_dict": _snapshot_optimizer_state(optimizer),
                 "step": int(step),
+                "trainer_step_when_submitted": int(trainer_step_when_submitted),
             }
             request = {
                 "type": "validate",
                 "job_id": job_id,
                 "step": int(step),
+                "validation_snapshot_step": int(step),
+                "trainer_step_when_submitted": int(trainer_step_when_submitted),
                 "elapsed_seconds": float(time.perf_counter() - started_at),
                 "model_state_dict": snapshot["model_state_dict"],
                 "loss_recent_mean": recent_mean(list(recent_losses)),
@@ -860,7 +898,10 @@ def _train_one_run(
             if validation_process is None or validation_request_queue is None:
                 return
             try:
-                validation_request_queue.put_nowait({"type": "shutdown"})
+                validation_request_queue.put(
+                    {"type": "shutdown"},
+                    timeout=max(0.1, async_join_timeout_sec),
+                )
             except Exception:
                 pass
             validation_process.join(timeout=async_join_timeout_sec)
@@ -951,8 +992,11 @@ def _train_one_run(
                 progress.finish(postfix="max_steps reached")
 
         if async_enabled:
-            poll_async_validation_results(trainer_step_when_recorded=cases_seen)
+            if poll_async_validation_results(trainer_step_when_recorded=cases_seen) and async_stop_step is None:
+                async_stop_step = cases_seen
             shutdown_validation_worker()
+            if poll_async_validation_results(trainer_step_when_recorded=cases_seen) and async_stop_step is None:
+                async_stop_step = cases_seen
 
         final_elapsed = time.perf_counter() - started_at
         final_metrics = _evaluate_sum_posterior_validation(
@@ -990,6 +1034,9 @@ def _train_one_run(
                 "n_terms": n_terms,
                 "mode_name": mode_name,
                 "top_k_cutoff": mode.get("top_k_cutoff"),
+                "mode_order_position": int(mode_order_position),
+                "mode_order_offset": int(mode_order_offset),
+                "run_order_index": None if run_order_index is None else int(run_order_index),
                 "max_steps": max_steps,
                 "sum_batch_size": sum_batch_size,
                 "completed_training_cases": cases_seen,
@@ -1053,11 +1100,16 @@ def run_train_stage(config: Dict[str, Any]) -> None:
     dataset = load_mnist_train_dataset(config)
 
     stage_message(4, 4, "Training through generated SPLL artifacts")
-    total = len(get_seeds(config)) * len(get_experiments(config)) * len(get_inference_modes(config))
+    seeds = get_seeds(config)
+    experiments = get_experiments(config)
+    inference_modes = get_inference_modes(config)
+    total = len(seeds) * len(experiments) * len(inference_modes)
     outer = TerminalProgressBar(total, desc="Pipeline II runs", unit="runs", enabled=bool(config.get("show_progress", True)))
-    for seed in get_seeds(config):
-        for experiment in get_experiments(config):
-            for mode in get_inference_modes(config):
+    run_order_index = 0
+    for seed_index, seed in enumerate(seeds):
+        for experiment_index, experiment in enumerate(experiments):
+            mode_order_offset = seed_index + experiment_index
+            for mode_order_position, mode in enumerate(_rotated_modes(inference_modes, mode_order_offset)):
                 _train_one_run(
                     config=config,
                     split_manifest=split_manifest,
@@ -1065,8 +1117,12 @@ def run_train_stage(config: Dict[str, Any]) -> None:
                     seed=seed,
                     experiment=experiment,
                     mode=mode,
+                    mode_order_position=mode_order_position,
+                    mode_order_offset=mode_order_offset,
+                    run_order_index=run_order_index,
                 )
                 outer.update(postfix=f"seed={seed}, terms={experiment['n_terms']}, mode={mode['name']}")
+                run_order_index += 1
     outer.finish(postfix="done")
 
 

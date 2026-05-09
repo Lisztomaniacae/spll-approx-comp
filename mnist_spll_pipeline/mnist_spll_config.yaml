@@ -184,6 +184,7 @@ inference:
   # readMNist cache policy during timed generated-SPLL inference:
   # - uncached: default thesis timing policy; every generated-SPLL readMNist call runs the MNIST model
   # - run_scoped_no_cross_run_cache: fresh cache per measured posterior/true-candidate query
+  # - precomputed_per_measurement: fresh per-measurement lookup-only neural outputs; precompute time is logged separately
   read_mnist_cache_policy: uncached
   # Optional diagnostic-only untimed base readMNist calls before measured inference.
   # Keep this at 0 for thesis-facing benchmarks so cold-start effects are measured.

@@ -63,7 +63,7 @@ Expected machine value: `x86_64`.
 
 ## 2. Pipeline I: inference evaluation
 
-Pipeline I evaluates trained MNIST models under exact and approximate SPLL inference.
+Pipeline I evaluates trained MNIST models under exact and approximate SPLL inference. It intentionally uses a custom split over the combined official MNIST train+test pool: the configured ratios create train, validation/model-selection, and inference subsets from that pool. Do not describe Pipeline I outputs as official MNIST-test results unless the split logic is changed.
 
 ### Files
 
@@ -275,10 +275,11 @@ Allowed cache values:
 |---|---|
 | `uncached` | Default thesis timing policy. Every generated-SPLL `readMNist` call runs the MNIST model; no prediction cache is installed around inference. |
 | `run_scoped_no_cross_run_cache` | Sensitivity/debug policy. Use a fresh cache for each timed full-posterior or true-candidate query. This avoids repeated CNN calls inside one generated-SPLL query without sharing cache state between exact and cutoff runs. |
+| `precomputed_per_measurement` | Inference-isolation policy. Before each timed full-posterior or true-candidate query, compute neural probabilities for that query's image paths into a fresh lookup table, then time only the generated-SPLL query. Precompute time is logged separately and never shared between exact and cutoff runs. |
 
 `read_mnist_warmup_calls` defaults to `0` and should stay `0` for thesis-facing runtime benchmarks. A positive value is only a diagnostic option for intentionally excluding one-off cold-start effects; it runs untimed base `readMNist` calls before a model variant starts measured inference, without installing any inference cache.
 
-Aliases such as `run_scoped`, `cached`, `none`, or `off` are accepted, but prefer the canonical values above in committed configs.
+Aliases such as `run_scoped`, `cached`, `precomputed`, `none`, or `off` are accepted, but prefer the canonical values above in committed configs.
 
 `-k/--topKCutoff` is a probability cutoff in `[0, 1]`. It is **not** a literal top-k class count.
 

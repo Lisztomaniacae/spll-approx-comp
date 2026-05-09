@@ -20,6 +20,7 @@ from mnist_spll_pipeline_core import (
 
 READ_MNIST_CACHE_POLICY_RUN_SCOPED = "run_scoped_no_cross_run_cache"
 READ_MNIST_CACHE_POLICY_UNCACHED = "uncached"
+READ_MNIST_CACHE_POLICY_PRECOMPUTED = "precomputed_per_measurement"
 READ_MNIST_CACHE_POLICY_DEFAULT = READ_MNIST_CACHE_POLICY_UNCACHED
 
 
@@ -32,6 +33,11 @@ def normalize_read_mnist_cache_policy(value: Any) -> str:
 
     - ``run_scoped_no_cross_run_cache``: cache repeated image probabilities
       only inside one measured generated-SPLL query.
+    - ``precomputed_per_measurement``: compute the probabilities for the
+      current measurement's image paths immediately before timing, install a
+      lookup-only ``readMNist`` for the timed generated-SPLL query, and discard
+      it immediately afterwards.  This isolates symbolic/probabilistic
+      inference time without allowing exact runs to warm approximate runs.
     - ``uncached``: call the base MNIST model for every generated-SPLL
       ``readMNist`` invocation. This is the default thesis timing policy.
     """
@@ -44,11 +50,20 @@ def normalize_read_mnist_cache_policy(value: Any) -> str:
         "run_scoped_no_cross_run_cache",
     }:
         return READ_MNIST_CACHE_POLICY_RUN_SCOPED
+    if text in {
+        "precomputed",
+        "precompute",
+        "precomputed_lookup",
+        "precomputed_per_measurement",
+        "lookup_only",
+    }:
+        return READ_MNIST_CACHE_POLICY_PRECOMPUTED
     if text in {"uncached", "no_cache", "none", "off", "disabled", "false"}:
         return READ_MNIST_CACHE_POLICY_UNCACHED
     raise ValueError(
         "inference.read_mnist_cache_policy must be one of "
-        f"'{READ_MNIST_CACHE_POLICY_RUN_SCOPED}' or '{READ_MNIST_CACHE_POLICY_UNCACHED}' "
+        f"'{READ_MNIST_CACHE_POLICY_UNCACHED}', '{READ_MNIST_CACHE_POLICY_RUN_SCOPED}', "
+        f"or '{READ_MNIST_CACHE_POLICY_PRECOMPUTED}' "
         f"(got {value!r})."
     )
 
@@ -115,6 +130,61 @@ class UncachedReadMNistCounter:
             "cache_hits": 0,
             "cache_misses": int(self.calls),
             "unique_images": int(len(self.unique_images_seen)),
+        }
+
+
+class PrecomputedReadMNistLookup:
+    """Lookup-only readMNist proxy with fresh per-measurement precompute.
+
+    The precompute step intentionally happens inside the measurement scope setup
+    but outside the timed posterior/true-candidate query.  A new instance is
+    created for every exact/cutoff measurement, so no run can benefit from a
+    cache warmed by a previous run.
+    """
+
+    def __init__(self, base_read_mnist: Callable[[str], Sequence[float]], image_paths: Sequence[str]) -> None:
+        self.base_read_mnist = base_read_mnist
+        self.calls = 0
+        self.lookup_hits = 0
+        self.lookup_misses = 0
+        self.cache: Dict[str, List[float]] = {}
+
+        unique_paths: List[str] = []
+        seen: Set[str] = set()
+        for image_path in image_paths:
+            key = str(image_path)
+            if key not in seen:
+                seen.add(key)
+                unique_paths.append(key)
+
+        started = time.perf_counter()
+        for key in unique_paths:
+            self.cache[key] = [float(value) for value in self.base_read_mnist(key)]
+        self.precompute_runtime_sec = float(time.perf_counter() - started)
+        self.precompute_calls = int(len(unique_paths))
+
+    def __call__(self, image_path: str) -> List[float]:
+        self.calls += 1
+        key = str(image_path)
+        cached = self.cache.get(key)
+        if cached is None:
+            self.lookup_misses += 1
+            raise KeyError(
+                "precomputed_per_measurement readMNist received an image path "
+                f"that was not precomputed for this measurement: {key!r}"
+            )
+        self.lookup_hits += 1
+        return list(cached)
+
+    def stats(self) -> Dict[str, int | float | str]:
+        return {
+            "policy": READ_MNIST_CACHE_POLICY_PRECOMPUTED,
+            "calls": int(self.calls),
+            "cache_hits": int(self.lookup_hits),
+            "cache_misses": int(self.lookup_misses),
+            "unique_images": int(len(self.cache)),
+            "precompute_calls": int(self.precompute_calls),
+            "precompute_runtime_sec": float(self.precompute_runtime_sec),
         }
 
 
@@ -263,13 +333,20 @@ class InferenceRunEngine:
         self.read_mnist_warmup_stats = dict(read_mnist_warmup_stats or {})
 
     @contextmanager
-    def _read_mnist_scope(self, module: Any) -> Iterator[RunScopedReadMNistCache | UncachedReadMNistCounter]:
+    def _read_mnist_scope(
+        self,
+        module: Any,
+        *,
+        image_paths: Sequence[str] = (),
+    ) -> Iterator[RunScopedReadMNistCache | UncachedReadMNistCounter | PrecomputedReadMNistLookup]:
         base_read_mnist = getattr(module, "_spll_base_readMNist", getattr(module, "readMNist"))
         previous_read_mnist = getattr(module, "readMNist")
         if self.read_mnist_cache_policy == READ_MNIST_CACHE_POLICY_RUN_SCOPED:
-            scoped_read_mnist: RunScopedReadMNistCache | UncachedReadMNistCounter = RunScopedReadMNistCache(base_read_mnist)
+            scoped_read_mnist: RunScopedReadMNistCache | UncachedReadMNistCounter | PrecomputedReadMNistLookup = RunScopedReadMNistCache(base_read_mnist)
         elif self.read_mnist_cache_policy == READ_MNIST_CACHE_POLICY_UNCACHED:
             scoped_read_mnist = UncachedReadMNistCounter(base_read_mnist)
+        elif self.read_mnist_cache_policy == READ_MNIST_CACHE_POLICY_PRECOMPUTED:
+            scoped_read_mnist = PrecomputedReadMNistLookup(base_read_mnist, image_paths)
         else:
             raise ValueError(f"Unsupported readMNist cache policy: {self.read_mnist_cache_policy!r}")
         setattr(module, "readMNist", scoped_read_mnist)
@@ -320,7 +397,7 @@ class InferenceRunEngine:
             enabled=self.show_progress and self.show_inner_progress and (max_sum + 1) > 0,
         )
         started_at = utc_now_iso()
-        with self._read_mnist_scope(module) as posterior_read_mnist:
+        with self._read_mnist_scope(module, image_paths=image_paths) as posterior_read_mnist:
             started = time.perf_counter()
             posterior_trace = posterior_for_experiment(
                 module,
@@ -336,7 +413,7 @@ class InferenceRunEngine:
             posterior_read_mnist_stats = posterior_read_mnist.stats()
         finished_at = utc_now_iso()
 
-        with self._read_mnist_scope(module) as true_candidate_read_mnist:
+        with self._read_mnist_scope(module, image_paths=image_paths) as true_candidate_read_mnist:
             true_candidate_trace = CandidateTrace.evaluate(module, image_paths, int(experiment["true_sum"]))
             true_candidate_read_mnist_stats = true_candidate_read_mnist.stats()
 
@@ -428,6 +505,14 @@ class InferenceRunEngine:
             "read_mnist_cache_policy": self.read_mnist_cache_policy,
             "posterior_read_mnist_stats": posterior_read_mnist_stats,
             "true_candidate_read_mnist_stats": true_candidate_read_mnist_stats,
+            "read_mnist_precompute_runtime_sec": float(
+                posterior_read_mnist_stats.get("precompute_runtime_sec", 0.0)
+            ),
+            "true_candidate_read_mnist_precompute_runtime_sec": float(
+                true_candidate_read_mnist_stats.get("precompute_runtime_sec", 0.0)
+            ),
+            "read_mnist_precompute_stats": posterior_read_mnist_stats,
+            "true_candidate_read_mnist_precompute_stats": true_candidate_read_mnist_stats,
             "read_mnist_warmup_calls": int(self.read_mnist_warmup_stats.get("calls", 0)),
             "read_mnist_warmup_runtime_sec": float(self.read_mnist_warmup_stats.get("runtime_sec", 0.0)),
         }

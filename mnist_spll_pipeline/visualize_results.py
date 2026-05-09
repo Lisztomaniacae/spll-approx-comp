@@ -238,6 +238,11 @@ def summarize_groups(
         runtimes = [float(item["runtime_sec"]) for item in items]
         true_candidate_runtimes = finite_float_values(items, "true_candidate_runtime_sec")
         true_candidate_branch_counts = finite_float_values(items, "true_candidate_branch_count")
+        precompute_runtimes = finite_float_values(items, "read_mnist_precompute_runtime_sec")
+        true_candidate_precompute_runtimes = finite_float_values(
+            items,
+            "true_candidate_read_mnist_precompute_runtime_sec",
+        )
         result: Dict[str, Any] = {key: first[key] for key in group_keys}
         result.update(
             {
@@ -250,6 +255,8 @@ def summarize_groups(
                 "median_runtime_sec": median(runtimes),
                 "runtime_q25_sec": quantile(runtimes, 0.25),
                 "runtime_q75_sec": quantile(runtimes, 0.75),
+                "mean_read_mnist_precompute_runtime_sec": mean_or_nan(precompute_runtimes),
+                "median_read_mnist_precompute_runtime_sec": median_or_nan(precompute_runtimes),
                 "mean_confidence": mean(float(item["confidence"]) for item in items),
                 "mean_output_pool": mean(float(item["output_pool"]) for item in items),
                 "mean_output_pool_fraction": mean(float(item["output_pool_fraction"]) for item in items),
@@ -263,6 +270,12 @@ def summarize_groups(
                 "median_true_candidate_runtime_sec": median_or_nan(true_candidate_runtimes),
                 "true_candidate_runtime_q25_sec": quantile(true_candidate_runtimes, 0.25),
                 "true_candidate_runtime_q75_sec": quantile(true_candidate_runtimes, 0.75),
+                "mean_true_candidate_read_mnist_precompute_runtime_sec": mean_or_nan(
+                    true_candidate_precompute_runtimes
+                ),
+                "median_true_candidate_read_mnist_precompute_runtime_sec": median_or_nan(
+                    true_candidate_precompute_runtimes
+                ),
                 "mean_true_candidate_probability_raw": mean(
                     float(item["true_candidate_probability_raw"]) for item in items
                 ),
@@ -363,13 +376,18 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
     for run in raw_runs:
         posterior_raw = [float(value) for value in run["posterior_raw"]]
         posterior = normalize_distribution(posterior_raw)
-        predicted_sum = int(max(range(len(posterior)), key=lambda idx: posterior[idx])) if posterior else 0
-        confidence = float(posterior[predicted_sum]) if posterior else 0.0
         branch_counts = [int(value) for value in run.get("branch_counts_raw", []) if value is not None]
         output_pool = int(sum(1 for value in posterior_raw if float(value) > EPS))
         candidate_sums = [int(value) for value in run.get("candidate_sums", [])]
         candidate_count = int(len(candidate_sums))
         posterior_mass = float(sum(posterior_raw))
+        zero_mass = posterior_mass <= EPS
+        if posterior and not zero_mass:
+            predicted_sum: int | None = int(max(range(len(posterior)), key=lambda idx: posterior[idx]))
+            confidence = float(posterior[predicted_sum])
+        else:
+            predicted_sum = None
+            confidence = 0.0
         true_sum = int(run["true_sum"])
 
         true_candidate_sum = int(run.get("true_candidate_sum", true_sum))
@@ -423,8 +441,13 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "n_terms": int(run["n_terms"]),
                 "true_sum": true_sum,
                 "predicted_sum": predicted_sum,
-                "correct": int(predicted_sum == true_sum),
+                "correct": int((predicted_sum is not None) and predicted_sum == true_sum),
+                "prediction_valid": int(predicted_sum is not None),
+                "posterior_invalid": int(zero_mass),
                 "runtime_sec": float(run["runtime_sec"]),
+                "read_mnist_precompute_runtime_sec": float(
+                    run.get("read_mnist_precompute_runtime_sec", 0.0)
+                ),
                 "confidence": confidence,
                 "posterior_mass": posterior_mass,
                 "posterior_entropy": entropy_from_distribution(posterior),
@@ -434,12 +457,15 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "total_branch_count": total_branch_count,
                 "mean_branch_count": float(mean(branch_counts)) if branch_counts else 0.0,
                 "max_branch_count": int(max(branch_counts)) if branch_counts else 0,
-                "zero_mass": int(posterior_mass <= 0.0),
+                "zero_mass": int(zero_mass),
                 "true_candidate_sum": true_candidate_sum,
                 "true_candidate_probability_raw": true_candidate_probability_raw,
                 "true_candidate_normalized_probability": true_candidate_normalized_probability,
                 "true_candidate_branch_count": true_candidate_branch_count,
                 "true_candidate_runtime_sec": true_candidate_runtime_sec,
+                "true_candidate_read_mnist_precompute_runtime_sec": float(
+                    run.get("true_candidate_read_mnist_precompute_runtime_sec", 0.0)
+                ),
                 "true_candidate_survived": int(true_candidate_probability_raw > EPS),
                 "true_candidate_branch_fraction_of_total": (
                     float(true_candidate_branch_count / total_branch_count)
@@ -454,7 +480,7 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "labels": str(run["labels"]),
                 "global_indices": str(run["global_indices"]),
                 "image_paths": str(run["image_paths"]),
-                "top_predictions": str(top_predictions(posterior, top_n)),
+                "top_predictions": str([] if zero_mass else top_predictions(posterior, top_n)),
             }
         )
     return detailed_rows
