@@ -1,0 +1,246 @@
+module SPLL.Lang.Types where
+
+
+import SPLL.Typing.PType
+import SPLL.Typing.RType
+import qualified Data.Map as Map
+import Control.Applicative (liftA2)
+import Control.Monad.Random.Lazy (Random)
+import Data.Number.Erf (Erf)
+import Data.Bifunctor (second)
+
+import Data.Maybe
+
+
+type ChainName = String
+
+type CompilerError = String
+
+data Expr =
+              -- Flow Control
+                IfThenElse TypeInfo Expr Expr Expr
+              | InjF TypeInfo String [Expr]
+              -- Variables
+              | LetIn TypeInfo String Expr Expr
+              | Var TypeInfo String
+              | Constant TypeInfo Value
+              | Lambda TypeInfo String Expr    -- (Currently) must use local context
+              | Apply TypeInfo Expr Expr
+              -- Distributions
+              | Uniform TypeInfo
+              | Normal TypeInfo
+              -- Parameters
+              | ThetaI TypeInfo Expr Int
+              | Subtree TypeInfo Expr Int
+              -- Lists/Tuples
+              | Cons TypeInfo Expr Expr
+              | TCons TypeInfo Expr Expr
+              | Null TypeInfo
+              -- Boolean Operations
+              | GreaterThan TypeInfo Expr Expr
+              | LessThan TypeInfo Expr Expr
+              | Equals TypeInfo Expr Expr   -- deprecated in favor of injF "eq"
+              | And TypeInfo Expr Expr
+              | Or TypeInfo Expr Expr
+              | Not TypeInfo Expr
+              -- Other
+              | ReadNN TypeInfo String Expr
+              | Error TypeInfo String
+              -- TODO: Needs Concat to achieve proper SPN-parity.
+              deriving (Show, Eq)
+
+
+data ExprStub = StubIfThenElse
+              | StubGreaterThan
+              | StubLessThan
+              | StubEquals
+              | StubThetaI
+              | StubSubtree
+              | StubUniform
+              | StubNormal
+              | StubConstant
+              | StubNot
+              | StubAnd
+              | StubOr
+              | StubNull
+              | StubCons
+              | StubTCons
+              | StubVar
+              | StubLetIn
+              | StubInjF
+              | StubLambda
+              | StubApply
+              | StubReadNN
+              | StubError
+              deriving (Show, Eq)
+--Do not use this constructor, use makeTypeInfo instead
+data TypeInfo = TypeInfo
+  { rType :: RType
+  , pType :: PType
+  , chainName :: ChainName
+  , tags :: [Tag]} deriving (Show, Eq)
+-- only use ord instance for algorithmic convenience, not for up/downgrades / lattice work.
+
+makeTypeInfo :: TypeInfo
+makeTypeInfo = TypeInfo
+    { rType = SPLL.Typing.RType.NotSetYet
+    , pType = SPLL.Typing.PType.NotSetYet
+    , chainName = ""
+    , tags = []}
+
+
+type Name = String
+
+data Program = Program {
+                    functions :: [FnDecl],
+                    neurals :: [NeuralDecl],
+                    adts :: [ADTDecl]
+                    } deriving (Show, Eq)
+
+type FnDecl = (String, Expr)
+
+type NeuralDecl = (String, RType, Maybe MultiValue)
+
+data ADTDecl = ADTDecl {
+  dataName :: String, 
+  constructors :: [ADTConstructorDecl], 
+  maxDepth :: Maybe Int
+  } deriving (Show, Eq)
+type ADTConstructorDecl = (String, [(String, RType)])
+
+data ThetaTree = ThetaTree [Double] [ThetaTree] deriving (Show, Eq)
+
+data GenericList a = EmptyList | ListCont a (GenericList a) | AnyList deriving (Show, Eq)
+type ValueList a = GenericList (GenericValue a)
+
+instance Functor GenericList where
+  fmap _ EmptyList = EmptyList
+  fmap f (ListCont x xs) = ListCont (f x) (fmap f xs) 
+  fmap _ AnyList = AnyList
+
+instance Foldable GenericList where
+  foldMap f EmptyList = mempty
+  foldMap f (ListCont x xs) = f x `mappend` foldMap f xs
+  foldMap f AnyList = error "Cannot fold AnyLists"
+
+instance Traversable GenericList where
+  traverse f EmptyList = pure EmptyList
+  traverse f (ListCont x xs) = ListCont <$> f x <*> traverse f xs
+  traverse _ AnyList = error "AnyLists are not traversable"
+
+type Value = GenericValue Expr
+
+data GenericValue a = VBool Bool
+           | VInt Int
+           | VSymbol String
+           | VFloat Double
+           | VUnit
+           | VList (GenericList (GenericValue a))
+           | VTuple (GenericValue a) (GenericValue a)
+           | VEither (Either (GenericValue a) (GenericValue a))
+           | VBranch (GenericValue a) (GenericValue a) String
+           | VThetaTree ThetaTree
+           | VClosure [(String, a)] String a
+           | VADT String [GenericValue a]
+           | VAny -- Only used for marginal queries
+           | VAnyExcept [a] -- Only used for marginal queries
+           deriving (Show, Eq)
+
+instance Functor GenericValue where
+  fmap _ (VInt x) = VInt x
+  fmap _ (VBool x) = VBool x
+  fmap _ (VSymbol x) = VSymbol x
+  fmap _ (VFloat x) = VFloat x
+  fmap _ VUnit = VUnit
+  fmap f (VList x) = VList (fmap (fmap f) x)
+  fmap f (VTuple x y) = VTuple (fmap f x) (fmap f y)
+  fmap f (VEither (Left x)) = VEither (Left (fmap f x))
+  fmap f (VEither (Right x)) = VEither (Right (fmap f x))
+  fmap f (VBranch x y s) = VBranch (fmap f x) (fmap f y) s
+  fmap _ (VThetaTree x) = VThetaTree x
+  fmap f (VClosure e n ex) = VClosure (map (Data.Bifunctor.second f) e) n (f ex)
+  fmap f (VADT n adt) = VADT n (map (fmap f) adt)
+  fmap f (VAnyExcept x) = VAnyExcept (map f x)
+  fmap _ VAny = VAny
+
+
+isVInt, isVBool, isVSymbol, isVFloat, isVUnit, isVList, isVTuple, isVEither, isVBranch, isVThetaTree, isVClosure, isVADT, isVAnyExcept :: GenericValue a -> Bool
+isVInt (VInt _) = True
+isVInt _ = False
+isVBool (VBool _) = True
+isVBool _ = False
+isVSymbol (VSymbol _) = True
+isVSymbol _ = False
+isVFloat (VFloat _) = True
+isVFloat _ = False
+isVUnit VUnit = True
+isVUnit _ = False
+isVList (VList _) = True
+isVList _ = False
+isVTuple (VTuple _ _) = True
+isVTuple _ = False
+isVEither (VEither _) = True
+isVEither _ = False
+isVBranch (VBranch _ _ _) = True
+isVBranch _ = False
+isVThetaTree (VThetaTree _) = True
+isVThetaTree _ = False
+isVClosure (VClosure _ _ _) = True
+isVClosure _ = False
+isVADT (VADT _ _) = True
+isVADT _ = False
+isVAnyExcept (VAnyExcept _) = True
+isVAnyExcept _ = False
+
+data MultiValue = MultiDiscretes [Value]
+                | MultiTuple MultiValue MultiValue
+                | MultiEither MultiValue MultiValue
+                | MultiADT [(String, [MultiValue])] 
+                | MultiTypeRef String
+                deriving (Show, Eq)
+
+isMultiDiscretes, isMultiTuple, isMultiEither, isMultiADT, isMultiTypeRef :: MultiValue -> Bool
+isMultiDiscretes (MultiDiscretes _) = True
+isMultiDiscretes _ = False
+isMultiTuple (MultiTuple _ _) = True
+isMultiTuple _ = False
+isMultiEither (MultiEither _ _) = True
+isMultiEither _ = False
+isMultiADT (MultiADT _) = True
+isMultiADT _ = False
+isMultiTypeRef (MultiTypeRef _) = True
+isMultiTypeRef _ = False
+
+
+data Tag = DiscreteValues MultiValue
+           | Alg InferenceRule
+           | IsConditional
+           deriving (Show, Eq)
+           
+
+
+data RuleConstraint = SubExprNIsType Int PType
+                    | SubExprNIsNotType Int PType
+                    | SubExprNIsAtLeast Int PType
+                    | SubExprNIsEnumerable Int
+                    | ResultingTypeMatch
+                    | ResolvesToDistribution
+                    deriving (Show, Eq)
+
+-- can we encode symmetries?
+data InferenceRule = InferenceRule { forExpression :: ExprStub
+                                   , constraints :: [RuleConstraint]
+                                   , algName :: String
+                                   --apply all subexpr PTypes to find PType
+                                   , resultingPType :: [PType] -> PType
+                                   , assumedRType :: Scheme
+                                   }
+
+instance Show InferenceRule where
+  show (InferenceRule _ _ name _ _) = name
+
+instance Eq InferenceRule where
+  a1 == a2 = algName a1 == algName a2
+
+instance Ord InferenceRule where
+  a1 `compare` a2 = algName a1 `compare` algName a2

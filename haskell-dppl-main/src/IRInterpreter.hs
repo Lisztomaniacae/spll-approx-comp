@@ -1,0 +1,440 @@
+module IRInterpreter (
+generateDet,
+generateRand
+) where
+
+import Statistics.Distribution (ContGen, genContVar, quantile, density)
+import SPLL.IntermediateRepresentation
+import SPLL.Lang.Lang (Value(..), ThetaTree(..), Program, elementAt, constructVList, lookupNeural, floatApproxEqThresh, multiValueToValueList, valueInMultiValue)
+import StandardLibrary
+import MockNN
+import SPLL.AutoNeural
+
+import Control.Monad.Random
+import Statistics.Distribution.Normal (normalDistr)
+import Data.Foldable
+import Data.Number.Erf
+import Debug.Trace
+import Data.Data
+import Data.Either (fromRight)
+import Data.Bifunctor (second)
+import Data.Maybe (fromMaybe, fromJust, isJust, catMaybes)
+import Data.List (isSuffixOf, isPrefixOf)
+import Data.Foldable (toList)
+import SPLL.Lang.Types
+import SPLL.Typing.RType
+import Data.Functor ((<&>))
+import SPLL.Typing.AlgebraicDataTypes
+import Data.Vector.Internal.Check (HasCallStack)
+
+data RandomFunctions m a = RandomFunctions {uniformGen:: m IRValue, normalGen:: m IRValue}
+
+-- Name, Body
+type ReducedIREnv = [(String, IRExpr)]
+
+generateRand :: (RandomGen g) => [NeuralDecl] -> IREnv -> [IRExpr]-> IRExpr -> Rand g IRValue
+generateRand neurals env = generate f neurals adts startingEnv startingEnv
+  where
+    f = RandomFunctions {
+      uniformGen = irSample IRUniform,
+      normalGen= irSample IRNormal}
+    startingEnv = reduceIREnv env ++ standardEnv ++ map neuralRTypeToEnv neurals ++ concatMap implicitFunctionsToEnv adts
+    (IREnv _ adts _) = env
+
+generateDet :: (HasCallStack) => [NeuralDecl] -> IREnv -> [IRExpr]-> IRExpr -> Either String IRValue
+--generateDet neurals env params e | traceShow e False = undefined
+generateDet neurals env = generate f neurals adts startingEnv startingEnv
+  where
+    f = RandomFunctions {
+      uniformGen = Left "Uniform Gen is not det",
+      normalGen = Left "Normal Gen is not det"}
+    startingEnv = reduceIREnv env ++ standardEnv ++ map neuralRTypeToEnv neurals ++ concatMap implicitFunctionsToEnv adts
+    (IREnv _ adts _) = env
+
+generate :: (Monad m, HasCallStack) => RandomFunctions m a -> [NeuralDecl] -> [ADTDecl ] -> ReducedIREnv -> ReducedIREnv -> [IRExpr]-> IRExpr -> m IRValue
+--generate f neurals adts globalEnv env args expr | trace ((show expr) {-++ " " ++ show env-}) False = undefined
+generate f neurals adts globalEnv env args expr | args /= [] = do
+  let reverseArgs = reverse args
+  let newExpr = foldr (flip IRApply) expr reverseArgs
+  generate f neurals adts globalEnv env [] newExpr
+generate f neurals adts globalEnv env [] (IRLambda name expr) = do
+  return $ VClosure env name expr
+generate f neurals adts globalEnv env [] (IRApply (IRVar name) sym)
+  | Just (rt, tags) <- lookupNeural name neurals = do
+    let realRT (TSymbol `TArrow` r) = r
+    let partPlan = makePartitionPlan adts (realRT rt) tags
+    symVal <- generate f neurals adts globalEnv env [] sym
+    return $ evaluateMockNN partPlan symVal
+generate f neurals adts globalEnv env [] (IRApply expr val) = do
+  exprVal <- generate f neurals adts globalEnv env [] expr
+  valVal <- generate f neurals adts globalEnv env [] val
+  case exprVal of
+    (VClosure closEnv name lambda) -> do
+      let constClosEnv = (name, IRConst valVal):closEnv
+      generate f neurals adts globalEnv constClosEnv [] lambda
+    _ -> error ("Type error: Expression is not a closure: " ++ show exprVal)
+generate f neurals adts globalEnv env args (IRIf cond thenCase elseCase) = do
+  condVal <- generate f neurals adts globalEnv env args cond
+  case condVal of
+    VBool True -> generate f neurals adts globalEnv env args thenCase
+    VBool False -> generate f neurals adts globalEnv env args elseCase
+    _ -> error $ "Type error: Condition is not a boolean: " ++ show condVal
+generate f neurals adts globalEnv env [] (IROp OpPlus a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VFloat af, VFloat bf) -> return $ VFloat (af + bf)
+    (VInt af, VInt bf) -> return $ VInt (af + bf)
+    --(VAny, _) -> return VAny
+    --(_, VAny) -> return VAny
+    _ -> error ("Type error: Plus can only add up numbers (of the same type): " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IROp OpMult a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VFloat af, VFloat bf) -> return $ VFloat (af * bf)
+    (VInt af, VInt bf) -> return $ VInt (af * bf)
+    --(VAny, _) -> return VAny
+    --(_, VAny) -> return VAny
+    _ -> error ("Type error: Mult can only multiply numbers (of the same type): " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IROp OpGreaterThan a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  return $ VBool $ gt aVal bVal
+  where gt a b = case (a, b) of
+          (VFloat af, VFloat bf) -> af > bf
+          (VInt af, VInt bf) -> af > bf
+          (VTuple af1 af2, VTuple bf1 bf2) -> gt af1 bf1 && gt af2 bf2
+          (VList (ListCont _ _), VList EmptyList) -> error "When comparing lists, they must be of the same length"
+          (VList EmptyList, VList (ListCont _ _)) -> error "When comparing lists, they must be of the same length"
+          (VList EmptyList, VList EmptyList) -> False
+          (VList (ListCont a as), VList (ListCont b bs)) -> gt a b && gt (VList as) (VList bs)
+          _ -> error ("Type error: greater than can only compare two numbers (of the same type): " ++ show (a, b))
+generate f neurals adts globalEnv env [] (IROp OpLessThan a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  return $ VBool $ lt aVal bVal
+  where lt a b = case (a, b) of
+          (VFloat af, VFloat bf) -> af < bf
+          (VInt af, VInt bf) -> af < bf
+          (VTuple af1 af2, VTuple bf1 bf2) -> lt af1 bf1 && lt af2 bf2
+          (VList (ListCont _ _), VList EmptyList) -> error "When comparing lists, they must be of the same length"
+          (VList EmptyList, VList (ListCont _ _)) -> error "When comparing lists, they must be of the same length"
+          (VList EmptyList, VList EmptyList) -> False
+          (VList (ListCont a as), VList (ListCont b bs)) -> lt a b && lt (VList as) (VList bs)
+          _ -> error ("Type error: less than can only compare two numbers (of the same type): " ++ show (a, b))
+generate f neurals adts globalEnv env [] (IROp OpDiv a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VFloat af, VFloat bf) -> return $ VFloat (af / bf)
+    --(VAny, _) -> return VAny
+    --(_, VAny) -> return VAny
+    _ -> error ("Type error: Divide can only divide two numbers (of the same type): " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IROp OpSub a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VFloat af, VFloat bf) -> return $ VFloat (af - bf)
+    (VInt af, VInt bf) -> return $ VInt (af - bf)
+    --(VAny, _) -> return VAny
+    --(_, VAny) -> return VAny
+    _ -> error ("Type error: Minus can only subtract two numbers (of the same type): " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IROp OpOr a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VBool af, VBool bf) -> return $ VBool (af || bf)
+    --(VAny, _) -> return VAny
+    --(_, VAny) -> return VAny
+    _ -> error ("Type error: Or can only evaluate on two booleans: " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IROp OpAnd a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VBool af, VBool bf) -> return $ VBool (af && bf)
+    --(VAny, _) -> return VAny
+    --(_, VAny) -> return VAny
+    _ -> error ("Type error: Or can only evaluate on two booleans: " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IROp OpEq a b) = do
+  aVal' <- generate f neurals adts globalEnv env [] a
+  bVal' <- generate f neurals adts globalEnv env [] b
+  let cmp aVal bVal = case (aVal, bVal) of
+        (VBool af, VBool bf) -> af == bf
+        (VFloat af, VFloat bf) -> af == bf
+        (VInt af, VInt bf) -> af == bf
+        (VList AnyList, VList _) -> True
+        (VList _, VList AnyList) -> True
+        (VList EmptyList, VList EmptyList) -> True
+        (VList (ListCont VAny as), VList (ListCont _ bs)) -> cmp (VList as) (VList bs)
+        (VList (ListCont _ as), VList (ListCont VAny bs)) -> cmp (VList as) (VList bs)
+        (VList (ListCont a as), VList (ListCont b bs)) -> cmp a b && cmp (VList as) (VList bs)
+        (VList _, VList _) -> False
+        (VTuple af1 af2, VTuple bf1 bf2) ->
+          let eqAny VAny _ = True
+              eqAny _ VAny = True
+              eqAny a b = a == b in
+                (eqAny af1 bf1 && eqAny af2 bf2)
+        (VEither (Left _), VEither (Right _)) -> False
+        (VEither (Right _), VEither (Left _)) -> False
+        (VEither (Left VAny), VEither (Left _)) -> True
+        (VEither (Left _), VEither (Left VAny)) -> True
+        (VEither (Right VAny), VEither (Right _)) -> True
+        (VEither (Right _), VEither (Right VAny)) -> True
+        (VEither (Left a), VEither (Left b)) -> cmp a b
+        (VEither (Right a), VEither (Right b)) -> cmp a b
+        (VADT n1 vs1, VADT n2 vs2) -> n1 == n2 && all (\(v1, v2) -> v1 == VAny || v2 == VAny || cmp v1 v2) (zip vs1 vs2)
+        (VUnit, VUnit) -> True
+        -- Any is not equal to anything
+        (VAny, b) -> False
+        (a, VAny) -> False
+        _ -> error ("Type error: Equals can only evaluate on two values: " ++ show (aVal, bVal))
+  return $ VBool (cmp aVal' bVal')
+generate f neurals adts globalEnv env [] (IROp OpApprox a b) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  bVal <- generate f neurals adts globalEnv env [] b
+  case (aVal, bVal) of
+    (VFloat af, VFloat bf) -> return $ VBool $ abs (af - bf) <= floatApproxEqThresh
+    _ -> error ("Type error: Approx can only evaluate on two floats: " ++ show (aVal, bVal))
+generate f neurals adts globalEnv env [] (IRUnaryOp OpNot a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VBool af -> return $ VBool (not af)
+    --VAny -> return VAny
+    _ -> error "Type error: Not can only evaluate on a Bool"
+generate f neurals adts globalEnv env [] (IRUnaryOp OpExp a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VFloat af -> return $ VFloat $ exp af
+    --VAny -> return VAny
+    _ -> error "Type error: Exp can only evaluate on a floating point numbers"
+generate f neurals adts globalEnv env [] (IRUnaryOp OpLog a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VFloat af -> return $ VFloat $ log af
+    --VAny -> return VAny
+    _ -> error "Type error: Exp can only evaluate on a floating point numbers"
+generate f neurals adts globalEnv env [] (IRUnaryOp OpNeg a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VFloat af -> return $ VFloat (-af)
+    VInt af -> return $ VInt (-af)
+    --VAny -> return VAny
+    _ -> error "Type error: Neg can only evaluate on a number"
+generate f neurals adts globalEnv env [] (IRUnaryOp OpSign a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VFloat af | af < 0 -> return $ VFloat (-1)
+    VFloat af | af == 0 -> return $ VFloat (0)
+    VFloat af | af > 0 -> return $ VFloat (1)
+    VInt af | af < 0 -> return $ VInt (-1)
+    VInt af | af == 0 -> return $ VInt (0)
+    VInt af | af > 0 -> return $ VInt (1)
+    --VAny -> return VAny
+    _ -> error "Type error: Neg can only evaluate on a number"
+generate f neurals adts globalEnv env [] (IRUnaryOp OpAbs a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VFloat af -> return $ VFloat (abs af)
+    VInt af -> return $ VInt (abs af)
+    --VAny -> return VAny
+    _ -> error "Type error: Abs can only evaluate on a number"
+generate f neurals adts globalEnv env [] (IRUnaryOp OpIsAny a) = do
+  aVal <- generate f neurals adts globalEnv env [] a
+  case aVal of
+    VAny -> return $ VBool True
+    _ -> return $ VBool False
+generate f neurals adts globalEnv env [] (IRTheta a i) = do
+  tt <- generate f neurals adts globalEnv env [] a
+  let VThetaTree (ThetaTree thetas _) = tt
+  return $ VFloat (thetas!!i)
+generate f neurals adts globalEnv env [] (IRSubtree a i) = do
+  tt <- generate f neurals adts globalEnv env [] a
+  let VThetaTree (ThetaTree _ subtrees) = tt
+  return $ VThetaTree (subtrees!!i)
+generate f neurals adts globalEnv env [] (IRConst val) = return val
+generate f neurals adts globalEnv env [] (IRCons hd tl) = do
+  ls <- generate f neurals adts globalEnv env [] tl
+  case ls of
+    VList xs -> do
+      x <- generate f neurals adts globalEnv env [] hd
+      return $ VList $ ListCont x xs
+    VAny -> do
+      x <- generate f neurals adts globalEnv env [] hd
+      return $ VList $ ListCont x AnyList
+    _ -> error "Type error: Tail of cons is not a list"
+generate f neurals adts globalEnv env [] (IRTCons fst snd) = do
+  fstVal <- generate f neurals adts globalEnv env [] fst
+  sndVal <- generate f neurals adts globalEnv env [] snd
+  return $ VTuple fstVal sndVal
+generate f neurals adts globalEnv env args (IRTFst expr) = do
+  val <- generate f neurals adts globalEnv env args expr
+  case val of
+    VTuple first _ -> return first
+    VClosure cEnv n cExpr -> return $ VClosure cEnv n (IRTFst cExpr)
+    _ -> error ("Type error: Expression of Fst is not a tuple: " ++ show val)
+generate f neurals adts globalEnv env args (IRTSnd expr) = do
+  val <- generate f neurals adts globalEnv env args expr
+  case val of
+    VTuple _ second -> return second
+    VClosure cEnv n cExpr -> return $ VClosure cEnv n (IRTSnd cExpr)
+    _ -> error ("Type error: Expression of Snd is not a tuple: " ++ show val)
+generate f neurals adts globalEnv env args (IRHead listExpr) = do
+  listVal <- generate f neurals adts globalEnv env args listExpr
+  case listVal of
+    VList (ListCont a _) -> return a
+    _ -> error "Type error: head must be called on a non-empty list"
+generate f neurals adts globalEnv env args (IRTail listExpr) = do
+  listVal <- generate f neurals adts globalEnv env args listExpr
+  case listVal of
+    VList (ListCont _ AnyList) -> return VAny
+    VList (ListCont _ a) -> return $ VList a
+    _ -> error "Type error: tail must be called on a non-empty list"
+generate f neurals adts globalEnv env args (IRMap fExpr listExpr) = do
+  listVal <- generate f neurals adts globalEnv env args listExpr
+  case listVal of
+    VList lst -> do
+      newLst <- mapM (\x -> generate f neurals adts globalEnv env args (IRApply fExpr (IRConst x))) lst
+      return $ VList newLst
+    _ ->  error "Type error: map must be called on a list"
+generate f neurals adts globalEnv env [] (IRElementOf elemExpr listExpr) = do
+  elemVal <- generate f neurals adts globalEnv env [] elemExpr
+  listVal <- generate f neurals adts globalEnv env [] listExpr
+  case listVal of
+    VList a -> return $ VBool (elemVal `elem` a)
+    _ -> error "Type error: ElementOf must be called on a list"
+generate f neurals adts globalEnv env [] (IRLeft expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  return $ VEither (Left x)
+generate f neurals adts globalEnv env [] (IRRight expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  return $ VEither (Right x)
+generate f neurals adts globalEnv env [] (IRFromLeft expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  case x of
+    VEither (Left l) -> return l
+    _ -> error $ "Type error: fromLeftrequires an either left: " ++ show x
+generate f neurals adts globalEnv env [] (IRFromRight expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  case x of
+    VEither (Right r) -> return r
+    _ -> error $ "Type error: fromRight requires an either right: " ++ show x
+generate f neurals adts globalEnv env [] (IRIsLeft expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  case x of
+    VEither (Left r) -> return (VBool True)
+    VEither (Right r) -> return (VBool False)
+    _ -> error $ "Type error: isLeft requires an either: " ++ show x
+generate f neurals adts globalEnv env [] (IRIsRight expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  case x of
+    VEither (Left r) -> return (VBool False)
+    VEither (Right r) -> return (VBool True)
+    _ -> error $ "Type error: isLeft requires an either: " ++ show x
+generate f neurals adts globalEnv env [] (IRDensity IRUniform expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  return $ irPDF IRUniform x
+generate f neurals adts globalEnv env [] (IRDensity IRNormal expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  return $ irPDF IRNormal x
+generate f neurals adts globalEnv env [] (IRCumulative IRUniform expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  return $ irCDF IRUniform x
+generate f neurals adts globalEnv env [] (IRCumulative IRNormal expr) = do
+  x <- generate f neurals adts globalEnv env [] expr
+  return $ irCDF IRNormal x
+generate f neurals adts globalEnv env [] (IRSample IRUniform) =
+  uniformGen f
+generate f neurals adts globalEnv env [] (IRSample IRNormal) =
+  normalGen f
+-- Let in evaluates the declaration expression to avoid sampling the same term multiple times
+generate f neurals adts globalEnv env args (IRLetIn name decl body) = do
+  declVal <- generate f neurals adts globalEnv env args decl
+  let extendedEnv = (name, IRConst declVal):env
+  generate f neurals adts globalEnv extendedEnv args body
+-- In case somebody decides to invoke neurals with IRVar
+generate f neurals adts globalEnv env args (IRVar name) | "_mock" `isSuffixOf` name && isJust (lookupNeural (iterate init name !! 5) neurals) = do
+  let (rt, tags) = fromJust (lookupNeural (iterate init name !! 5) neurals)
+  let realRT (TSymbol `TArrow` r) = r
+  let partPlan = makePartitionPlan adts (realRT rt) tags
+  case lookup symbolEnvName env of
+    Nothing -> error "No symbol found in the environment"
+    Just sym -> do
+      symVal <- generate f neurals adts globalEnv env args sym
+      return $ evaluateMockNN partPlan symVal
+-- To jump out of the interpreter into the implicit functions implemented in haskell we need to acuire the values of the parameter.
+-- This is not possible in normal program flow, because the parameters are applied to the functions before the IRVar call.
+-- To solve this we have created an artificial entry in the env table with the original name (E.g. Test) that points to a fresh name (E.g. Test_adt)
+-- which is a lambda with a known bound variable. We can now find this variable in the env and have the value of our parameter
+generate f neurals adts globalEnv env args (IRVar name) | "_adt" `isSuffixOf` name && (iterate init name !! 4) `elem` implicitFunctionNames adts = do
+  let realName = iterate init name !! 4
+  let rt = lookupRType realName adts
+  let lookupParams = sequence [lookup ("x" ++ show x) env | x <- [0..(arity rt - 1)]]
+  case lookupParams of
+    Nothing -> error ("No parameter found for " ++ name ++ " in environment")
+    Just val -> do
+      paramVal <- mapM (generate f neurals adts globalEnv env args) val
+      return $ implicitFunctionImpl adts realName paramVal
+  where
+    arity (_ `TArrow` rt) = arity rt + 1
+    arity _ = 0
+generate f neurals adts globalEnv env args (IRVar name) =
+  case lookup name env of
+    Just expr -> generate f neurals adts globalEnv env args expr
+    Nothing -> error ("Variable " ++ name ++ " not declared")
+generate f neurals adts globalEnv env [] (IREnumSum varname values expr) = do    --TODO Untested
+  foldrM (\v acc -> do
+    x <- generate f neurals adts globalEnv env [IRConst v] (IRLambda varname expr)
+    return $ sumValues x acc
+    ) (VFloat 0) (fmap valueToIR (multiValueToValueList values))
+  where sumValues = \(VFloat a) (VFloat b) -> VFloat $ a+b
+generate f neurals adts globalEnv env [] (IRIsPossible multiVal expr) = do
+  val <- generate f neurals adts globalEnv env [] expr
+  return $ VBool (valueInMultiValue multiVal (fmap (error "Failed conversion") val))
+generate f neurals adts globalEnv env args (IRIndex lstExpr idxExpr) = do
+  lst <- generate f neurals adts globalEnv env args lstExpr
+  idx <- generate f neurals adts globalEnv env args idxExpr
+  case lst of
+    VList l -> case idx of
+      VInt i -> return $ l `elementAt` i
+      _ -> error "Index must be an integer"
+    _ -> error "Expression must be a list"
+generate _ _ _ _ _ _ (IRError s) = error $ "Error during interpretation: " ++ s
+generate f neurals adts _ _ _ expr = error ("Expression is not yet implemented " ++ show expr)
+
+-- Reduces the complex data structure of an IREnv to a simpler reduced form
+-- Does this by creating a list of Maybe IRExpressions for each triple of gen, prob, and integ functions and then removes the Nothings
+reduceIREnv :: IREnv -> ReducedIREnv
+reduceIREnv (IREnv funcs _ consts) =
+  map (\(name, val) -> (name, IRConst val)) consts ++
+  concatMap (\(IRFunGroup name gen prob integ encode normal doc) ->
+    -- Special handling for per-component normal functions (created with "_component_" prefix)
+    if "_component_" `isPrefixOf` name then
+      -- Extract the actual component name and register without suffix
+      let componentName = drop 11 name  -- Remove "_component_" prefix
+      in catMaybes [normal <&> \(expr, _) -> (componentName, expr)]
+    else
+      catMaybes [gen <&> red name "_gen", prob <&> red name "_prob", integ <&> red name "_integ", encode <&> red name "_encode", normal <&> red name "_normal"]) funcs
+  where red name suffix (expr, _) = (name ++ suffix, expr)
+
+irSample :: (RandomGen g) => Distribution -> Rand g IRValue
+irSample IRUniform = do
+  r <- getRandomR (0.0, 1.0) --uniformR (0.0, 1.0)
+  return $ VFloat r
+irSample IRNormal = do
+  let gauss = normalDistr 0 1
+  r <- getRandomR (0.0, 1.0)
+  let result = quantile gauss r
+  return $ VFloat $ realToFrac result
+
+irPDF :: Distribution -> IRValue -> IRValue
+--irPDF _ VAny = VFloat 1
+irPDF IRUniform (VFloat x) = if x >= 0 && x <= 1 then VFloat 1 else VFloat 0
+irPDF IRNormal (VFloat x) = VFloat ((1 / sqrt (2 * pi)) * exp (-0.5 * x * x))
+irPDF expr x = error ("Expression must be the density of a valid distribution" ++ show x)
+
+irCDF :: Distribution -> IRValue -> IRValue
+irCDF IRUniform (VFloat x) = VFloat $ if x < 0 then 0 else if x > 1 then 1 else x
+irCDF IRNormal (VFloat x) = VFloat $ (1/2)*(1 + erf(x/sqrt(2)))
+
+

@@ -1,0 +1,875 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ConstraintKinds #-}
+
+module SPLL.Parser (
+  testParse'
+, pProg
+, pExpr
+, pIdentifier
+, pValue
+, pCSV
+, tryParseProgram
+, tryParseExpr
+, reserved
+) where
+
+import Control.Monad
+import Data.Void
+import Text.Megaparsec hiding (State)
+import Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer as L
+import PrettyPrint
+import Text.Pretty.Simple (pPrint)
+
+import Data.Either (Either(..))
+import qualified Data.Map as Map
+import qualified Data.Set as Set
+
+import Control.Monad.Combinators.Expr
+import Data.Void
+import Control.Monad (void)
+import Data.List.NonEmpty (NonEmpty (..))
+
+import SPLL.Lang.Types
+import SPLL.Lang.Lang
+import SPLL.Typing.Typing
+import SPLL.Typing.RType
+import PredefinedFunctions (globalFEnv, parameterCount)
+import SPLL.Prelude
+import Debug.Trace
+import Data.Functor ((<&>))
+import Control.Monad.State
+import Data.Functor.Identity
+import Data.Foldable (foldl')
+
+--import Text.Megaparsec.Debug (dbg)
+
+dbg x y = y
+--dbg x y = traceShow x y
+
+--TODO: This parser can by necessity not disambiguate Apply f arg from certain special-treatment builtin functions,
+-- like InjF
+
+--TODO: This can't parse type annotations.
+-- At some point this deserves fixing.
+
+type Parser = Parsec Void String
+type MonadParser m = (MonadParsec Void String m, MonadPlus m, MonadFail m, MonadState Int m)
+
+demandUniqueNumber :: MonadState Int m => m Int
+demandUniqueNumber = do
+  old <- get
+  put (old + 1)
+  return old
+
+scTop :: MonadParser m => m ()
+scTop = L.space space1 (L.skipLineComment "--") (L.skipBlockComment "{-" "-}")
+
+scExpr :: MonadParser m => m ()
+scExpr = do
+  L.space hspace1 (L.skipLineComment "--") (L.skipBlockComment "{-" "-}")
+  _ <- optional $ try $ do
+    void eol
+    void $ many (satisfy (\c -> c == ' ' || c == '\t' || c == '\n' || c == '\r'))
+    col <- L.indentLevel
+    guard (col > mkPos 1)
+    scExpr
+  return ()
+
+sc :: MonadParser m => m ()
+sc = scExpr
+
+lexeme :: MonadParser m => m a -> m a
+lexeme = L.lexeme sc
+
+symbol :: MonadParser m => String -> m String
+symbol = L.symbol sc
+
+reserved :: [String]
+reserved = ["data", "if", "then", "else", "let", "in", "theta", "subtree", "error", "ThetaTree", "Left", "Right"]
+
+keyword :: MonadParser m => String -> m String
+keyword kw = lexeme $ try (string kw <* notFollowedBy (alphaNumChar <|> char '\'' <|> char '_'))
+
+--Note: Won't parse capitalized constructors, if ever we add those.
+pIdentifier :: MonadParser m => m String
+pIdentifier = lexeme $ do
+  x <- letterChar <|> char '_'
+  xs <- many (alphaNumChar <|> char '\'' <|> char '_')
+  let ident = (x:xs)
+  if ident `elem` reserved
+    then fail $ "reserved word: " ++ ident
+    else return ident
+
+pUniform :: MonadParser m => m Expr
+pUniform = do
+  _ <- symbol "Uniform"
+  return uniform
+
+pNormal :: MonadParser m => m Expr
+pNormal = do
+  _ <- symbol "Normal"
+  return normal
+
+pIfThenElse :: MonadParser m => [ADTDecl] -> m Expr
+pIfThenElse adts = do
+  _ <- keyword "if"
+  a <- pExpr adts
+  _ <- keyword "then"
+  b <- pExpr adts
+  _ <- keyword "else"
+  c <- pExpr adts
+  return (ifThenElse a b c)
+
+pLetIn :: MonadParser m => [ADTDecl] -> m Expr
+pLetIn adts = do
+  keyword "let"
+  lhs <- pExpr adts
+  symbol "="
+  definition <- pExpr adts
+  keyword "in"
+  scope <- pExpr adts
+  destr <- letInDestructor lhs
+  return $ destr definition scope
+
+-- Parses the identifier part of the letIn and constructs a accessors for letIns
+-- Return type is a \v, b -> Let n = v in b
+letInDestructor :: MonadParser m => Expr -> m (Expr -> Expr -> Expr)
+letInDestructor (Var _ name) = return $ letIn name
+letInDestructor (TCons _ a b) = do
+  a' <- letInDestructor a
+  b' <- letInDestructor b
+  return $ \v body -> a' (tfst v) (b' (tsnd v) body)
+letInDestructor (InjF _ "left" [x]) = do
+  x' <- letInDestructor x
+  return $ \v -> x' (sfromLeft v)
+letInDestructor (InjF _ "right" [x]) = do
+  x' <- letInDestructor x
+  return $ \v -> x' (sfromRight v)
+letInDestructor (Null _) = return $ \v b -> ifThenElse (isNull v) b (Error makeTypeInfo "RHS of letin is longer than LHS")
+letInDestructor (Cons _ x xs) = do
+  x' <- letInDestructor x
+  xs' <- letInDestructor xs
+  id <- demandUniqueNumber
+  let varName = "p_d" ++ show id
+  return $ \v body -> letIn varName v (x' (lhead (var varName)) (xs' (ltail (var varName)) body))
+letInDestructor _ = fail "LHS of a letIn sould be an identifier or a complex type of identifiers"
+
+pError :: MonadParser m => m Expr
+pError = do
+  keyword "error"
+  char '"'
+  message <- many (noneOf "\"")
+  char '"'
+  return (Error makeTypeInfo message)
+
+pMaybeApply :: MonadParser m => [ADTDecl] -> m Expr
+pMaybeApply adts = choice [parens (pExpr adts), pVar]
+
+pExpr :: MonadParser m => [ADTDecl] -> m Expr
+pExpr = expr
+{-
+pExpr = dbg "expr" $ choice [
+  try pBinaryOp,
+  try pParensExpr,
+  try pTheta,
+  pIfThenElse,
+  pUniform,
+  pNormal,
+  pLetIn,
+  try pBinaryF,
+  try pApply,
+  try pConst,
+
+  pVar
+  ]
+-}
+
+-- TODO: I think this parser should accept any pExpr instead of identifiers. Might get ambiguous parses though.
+
+pTheta :: MonadParser m => [ADTDecl] -> m Expr
+pTheta adts = dbg "theta" $ do
+  keyword "theta"
+  thetaExpr <- pExpr adts
+  symbol "@"
+  ix <- pInt
+  return $ theta thetaExpr ix
+
+pSubtree :: MonadParser m => [ADTDecl] -> m Expr
+pSubtree adts = dbg "subtree" $ do
+  keyword "subtree"
+  thetaExpr <- pExpr adts
+  symbol "@"
+  ix <- pInt
+  return $ subtree thetaExpr ix
+
+-- just to make this parser quite unambiguous, we're going to demand parens around both ops.
+pBinaryOp :: MonadParser m => [ADTDecl] -> m Expr
+pBinaryOp adts = dbg "binOp" $ do
+  arg1 <- parens (pExpr adts)
+  op <- pOp
+  arg2 <- parens (pExpr adts)
+  case op of
+    ">=" -> return $ arg1 #># arg2
+    _ -> fail $ "unknown operator: " ++ op
+
+pOp :: MonadParser m => m String
+pOp = lexeme $ do
+    op <- some opChar
+    if op `elem` reservedOps
+        then fail $ "Reserved operator: " ++ op
+        else return op
+  where
+    opChar = oneOf ("!#$%&*+.:/<=>?@\\^|-~" :: String)
+    reservedOps = ["..","::","=","\\","|","<-","->","@","~","=>"]
+
+applyN :: Expr -> [Expr] -> Expr
+applyN function [] = function
+applyN function (arg:args) = applyN (apply function arg) args -- $ foldl (\a f -> Apply makeTypeInfo f a) (Var makeTypeInfo function) (map (Var makeTypeInfo) args)
+
+construct1 :: (Expr -> Expr) -> [Expr] -> Expr
+construct1 constructor [arg] = constructor arg
+construct1 _ _ = error "tried to apply the wrong number of arguments."
+
+construct2 :: (Expr -> Expr -> Expr) -> [Expr] -> Expr
+construct2 constructor [arg1, arg2] = constructor arg2 arg2
+construct2 _ _ = error "tried to apply the wrong number of arguments."
+
+constructN :: Int -> ([Expr] -> Expr) -> [Expr] -> Expr
+constructN n constructor args | n == length args = constructor args
+constructN _ _ _ = error "tried to apply the wrong number of arguments."
+
+-- Constructs a partially applied function, by wrapping the constructor in lambdas and using the bound variables as missing parameters
+constructNPartial :: MonadParser m => Int -> ([Expr] -> Expr) -> [Expr] -> m Expr
+constructNPartial expected constructor params = do
+  let missingParamCnt = expected - length params
+  substituteParamIDs <- replicateM missingParamCnt demandUniqueNumber
+  let substituteParamNames = map (("p_m" ++) . show) substituteParamIDs
+  let extendedArgs = params ++ map var substituteParamNames
+  return $ foldl (flip (#->#)) (constructor extendedArgs) substituteParamNames
+
+pVar :: MonadParser m => m Expr
+pVar = do
+  varname <- lexeme pIdentifier
+  return $ var varname
+
+binaryFs :: [(String, Expr -> Expr -> Expr)]
+binaryFs = [
+  ("multF", (#*#)),
+  ("multI", (#<*>#)),
+  ("plusF", (#+#)),
+  ("plusI", (#<+>#))
+  ]
+
+unaryFs :: [(String, Expr -> Expr)]
+unaryFs = [
+  ("negate", negF)
+  ]
+
+pValue :: MonadParser m => m Value
+pValue = choice [pBool, try pFloat, pIntVal, try pUnitVal, pTupleVal, pEither, pAny, pList <&> constructVList, pThetaTree <&> VThetaTree]
+
+pUnitVal :: MonadParser m => m Value
+pUnitVal = do
+  symbol "("
+  symbol ")"
+  return VUnit
+
+pTupleVal :: MonadParser m => m Value
+pTupleVal = do
+  (symbol "(")
+  val1 <- pValue
+  _ <- symbol ","
+  val2 <- pValue
+  (symbol ")")
+  return (VTuple val1 val2)
+
+pConst :: MonadParser m => m Expr
+pConst = do
+  val <- pValue
+  return (Constant makeTypeInfo val)
+
+pBool :: MonadParser m => m Value
+pBool = do
+  b <- choice [keyword "True" >> return True, keyword "False" >> return False]
+  return (VBool b)
+
+pFloat :: MonadParser m => m Value
+pFloat = dbg "float" $ do
+  sign <- optional (symbol "-")
+  f <- lexeme L.float
+  case sign of
+    Nothing -> return (VFloat f)
+    Just "-" -> return (VFloat (-f))
+
+pIntVal :: MonadParser m => m Value
+pIntVal = dbg "int" $ do
+  sign <- optional (symbol "-")
+  i <- lexeme L.decimal
+  case sign of
+    Nothing -> return (VInt i)
+    Just "-" -> return (VInt (-i))
+
+
+pInt :: MonadParser m => m Int
+pInt = do
+  sign <- optional (symbol "-")
+  i <- lexeme L.decimal
+  case sign of
+    Nothing -> return i
+    Just "-" -> return (-i)
+
+pEither :: MonadParser m => m Value
+pEither = do
+  side <- choice[keyword "Left", keyword "Right"]
+  v <- pValue
+  case side of
+    "Left" -> return $ VEither (Left v)
+    "Right" -> return $ VEither (Right v)
+    s -> fail $ "Unrecognized Either constructor: " ++ s
+
+pAny :: MonadParser m => m Value
+pAny = do
+  keyword "ANY"
+  return VAny
+
+pThetaTree :: MonadParser m => m ThetaTree
+pThetaTree = do
+  keyword "ThetaTree"
+  symbol "["
+  thetas <- (L.signed sc (lexeme L.float)) `sepBy` symbol ","
+  symbol "]"
+  symbol "["
+  subtrees <- pThetaTree `sepBy` symbol ","
+  symbol "]"
+  return $ ThetaTree thetas subtrees
+
+pBinaryF :: MonadParser m => [ADTDecl] -> m Expr
+pBinaryF adts = do
+  op <- choice (map (symbol . fst) binaryFs)
+  left <- pExpr adts
+  right <- pExpr adts
+  case (lookup op binaryFs) of
+    Nothing -> error "unexpected parse error"
+    Just opconstructor -> return (opconstructor left right)
+
+parseFromList :: MonadParser m => [(String, b)] -> m b
+parseFromList kvlist = do
+  key <- choice (map (symbol . fst) kvlist)
+  case (lookup key kvlist) of
+    Nothing -> error "unexpected parse error"
+    Just value -> return value
+
+rTypes :: [(String, RType)]
+rTypes = [("Int", TInt), ("Float", TFloat), ("Bool", TBool), ("Symbol", TSymbol), ("Unit", TUnit)]
+
+-- this function needs to handle compound types such as "Int -> Float" as well 
+-- first, we want to try parsing a compound type, and if that fails assume that a simple type is there instead.
+pType :: MonadParser m => m RType
+pType = dbg "type" $ choice [pEitherType, try pCompoundType, pSimpleType]
+
+pEitherType :: MonadParser m => m RType
+pEitherType = dbg "EitherType" $ do
+  keyword "Either"
+  lType <- SPLL.Parser.pType
+  rType <- SPLL.Parser.pType
+  return $ TEither lType rType
+
+pCompoundType :: MonadParser m => m RType
+pCompoundType = dbg "CompoundType" $ parens $ do
+  left <- SPLL.Parser.pType
+  combinator <- pTypeCombinator
+  right <- SPLL.Parser.pType
+  return $ combinator left right
+    where
+      pTypeCombinator = parseFromList combinators
+      combinators = [("->", TArrow), ("," , Tuple)]
+
+pSimpleType :: MonadParser m => m RType
+pSimpleType = dbg "SimpleType" $
+  choice [try pUnitType, try $ parseFromList rTypes, pIdentifier <&> TADT]
+
+pUnitType :: MonadParser m => m RType
+pUnitType = do
+  symbol "("
+  symbol ")"
+  return TUnit
+
+pList :: MonadParser m => m [Value]
+pList = do
+  (symbol "[")
+  values <- pCSV
+  (symbol "]")
+  return values
+
+pRange :: MonadParser m => m (Value, Value)
+pRange = do
+  (symbol "[")
+  from <- valueParser
+  (symbol "..")
+  to <- valueParser
+  (symbol "]")
+  return (from, to)
+
+pListExpr :: MonadParser m => [ADTDecl] -> m Expr
+pListExpr adts = do
+  (symbol "[")
+  exprs <- expr adts `sepBy` (symbol ",")
+  (symbol "]")
+  return (foldr cons nul exprs)
+
+valueParser :: MonadParser m => m Value
+valueParser = pValue
+
+pCSV :: MonadParser m => m [Value]
+pCSV = valueParser `sepBy` (symbol ",")
+
+pDefinition :: MonadParser m => [ADTDecl] -> m (Either FnDecl NeuralDecl)
+pDefinition adts = do
+  x <- choice [fmap Right pNeural, fmap Left (pFunction adts)]
+  return x
+
+--TODO: Add validation via AutoNeural.
+pNeural :: MonadParser m => m NeuralDecl
+pNeural = dbg "neural" $ do
+  _ <- keyword "neural"
+  name <- pIdentifier
+  _ <- symbol "::"
+  ty <- SPLL.Parser.pType
+  multiVal <- optional (symbol "of" *> pNeuralMultiValue)
+  return (name, ty, multiVal)
+
+pNeuralMultiValue :: MonadParser m => m MultiValue
+pNeuralMultiValue = dbg "multiVal" $ do
+  choice [try pMultiTypeDef, try pMultiTypeRef, try pMultiTuple, pMultiDiscretes, pMultiADT, try pMultiEither]
+
+pMultiTypeDef :: MonadParser m => m MultiValue
+pMultiTypeDef = do
+  depth <- pInt
+  name <- pIdentifier
+  symbol "."
+  inner <- pNeuralMultiValue
+  return (resolveMultiValueTypeDecl depth inner (name, inner))
+
+pMultiTypeRef :: MonadParser m => m MultiValue
+pMultiTypeRef = pIdentifier <&> MultiTypeRef
+
+resolveMultiValueTypeDecl :: Int -> MultiValue -> (String, MultiValue) -> MultiValue
+resolveMultiValueTypeDecl 0 (MultiTypeRef _) _ = error "Cannot recurse, no depth left"
+resolveMultiValueTypeDecl 1 (MultiTypeRef refName) (declName, MultiADT constrs) = MultiADT (filter (\(_, args) -> not $ any (containsMultiValueTypeRef declName) args) constrs)
+resolveMultiValueTypeDecl depthLeft (MultiTypeRef refName) decl@(declName, declVal) | declName == refName = resolveMultiValueTypeDecl (depthLeft - 1) declVal decl
+resolveMultiValueTypeDecl depthLeft (MultiDiscretes d) decl = MultiDiscretes d
+resolveMultiValueTypeDecl depthLeft (MultiTuple l r) decl =
+  MultiTuple (resolveMultiValueTypeDecl depthLeft l decl)
+             (resolveMultiValueTypeDecl depthLeft r decl)
+resolveMultiValueTypeDecl depthLeft (MultiEither l r) decl =
+  MultiEither (resolveMultiValueTypeDecl depthLeft l decl)
+              (resolveMultiValueTypeDecl depthLeft r decl)
+resolveMultiValueTypeDecl depthLeft (MultiADT cons) decl =
+  MultiADT [(cname, map (\mv -> resolveMultiValueTypeDecl depthLeft mv decl) args) |
+            (cname, args) <- cons]
+
+containsMultiValueTypeRef :: String -> MultiValue -> Bool
+containsMultiValueTypeRef _ (MultiDiscretes _) = False
+containsMultiValueTypeRef n (MultiTypeRef m) = n == m
+containsMultiValueTypeRef n (MultiEither l r) = containsMultiValueTypeRef n l || containsMultiValueTypeRef n r
+containsMultiValueTypeRef n (MultiTuple l r) = containsMultiValueTypeRef n l || containsMultiValueTypeRef n r
+containsMultiValueTypeRef n (MultiADT constrs) = any (\(_, args) -> any (containsMultiValueTypeRef n) args) constrs
+
+pMultiDiscretes :: MonadParser m => m MultiValue
+pMultiDiscretes = dbg "multiDisc" $ do
+  symbol "["
+  csv <- pCSV
+  symbol "]"
+  return $ MultiDiscretes csv
+
+pMultiEither :: MonadParser m => m MultiValue
+pMultiEither = dbg "multiEith" $ parens $ do
+  l <- pNeuralMultiValue
+  symbol "|"
+  r <- pNeuralMultiValue
+  return $ MultiEither l r
+
+pMultiTuple :: MonadParser m => m MultiValue
+pMultiTuple = dbg "multiTuple" $ parens $ do
+  l <- pNeuralMultiValue
+  symbol ","
+  r <- pNeuralMultiValue
+  return $ MultiTuple l r
+
+pMultiADT :: MonadParser m => m MultiValue
+pMultiADT = dbg "multiADT" $ do
+  symbol "{"
+  constrs <- sepBy (
+    (do
+      cName <- pIdentifier
+      params <- many pNeuralMultiValue
+      return (cName, params))
+    ) (symbol "|")
+  symbol "}"
+  return $ MultiADT constrs
+
+validateNeuralType :: MonadFail m => RType -> MultiValue -> m ()
+validateNeuralType (TSymbol `TArrow` rt) val = validateNeuralType' rt val
+validateNeuralType _ _ = fail "Neural must be of type (Symbol -> ...)"
+
+validateNeuralType' :: MonadFail m => RType -> MultiValue -> m ()
+validateNeuralType' (TEither rtL rtR) (MultiEither vL vR) = validateNeuralType' rtL vL >> validateNeuralType' rtR vR
+validateNeuralType' (TEither rtL rtR) val = fail $ "Mismatch between neural type and possible values. Expected an Either type, but got: " ++ show val
+validateNeuralType' (Tuple rtL rtR) (MultiTuple vL vR) = validateNeuralType' rtL vL >> validateNeuralType' rtR vR
+validateNeuralType' (Tuple rtL rtR) val = fail $ "Mismatch between neural type and possible values. Expected an Tuple type, but got: " ++ show val
+validateNeuralType' (TADT _) (MultiADT _) = return () -- Cannot validate ADT types, because they are unknown at parse time
+validateNeuralType' (TADT _) val = fail $ "Mismatch between neural type and possible values. Expected an ADT type, but got: " ++ show val
+validateNeuralType' rt (MultiDiscretes vals) = do
+  let validateFunction = case rt of
+        TInt -> \v -> case v of VInt _ -> True; _ -> False
+        TFloat -> \v -> case v of VFloat _ -> True; _ -> False
+        TBool -> \v -> case v of VBool _ -> True; _ -> False
+  if all validateFunction vals then return () else fail $ "Not all values were of type: " ++ show rt ++ ": " ++ show vals
+validateNeuralType' rt _ = fail $ "Unknown type for neural declaration: " ++ show rt
+
+
+pFunction :: MonadParser m => [ADTDecl] -> m FnDecl
+pFunction adts = dbg "function" $ do
+  name <- pIdentifier
+  args <- many pIdentifier
+  _ <- symbol "="
+  e <- pExpr adts
+  let lambdas = foldr (#->#) e args
+  return (name, lambdas)
+
+pADT :: MonadParser m => m ADTDecl
+pADT = dbg "ADT" $ do
+  keyword "data"
+  name <- pIdentifier
+  symbol "="
+  constrs <- pADTConstructor `sepBy` symbol "|"
+  depth <- optional (keyword "depth" >> lexeme L.decimal)
+  return $ ADTDecl {dataName=name, constructors=constrs, maxDepth=depth}
+
+pADTConstructor :: MonadParser m => m ADTConstructorDecl
+pADTConstructor = dbg "ADT Constr" $ do
+  name <- pIdentifier
+  fields <- try pADTField `sepBy` symbol ","
+  return (name, fields)
+
+pADTField :: MonadParser m => m (String, RType)
+pADTField = do
+    fieldName <- pIdentifier
+    symbol "::"
+    fieldType <- choice [SPLL.Parser.pType <&> Left, pIdentifier <&> Right]
+    let fieldRT = case fieldType of
+                    Left rt -> rt
+                    Right adt -> TADT adt
+    return (fieldName, fieldRT)
+
+pProg :: MonadParser m => m Program
+pProg = do
+  adts <- dbg "trying ADTs" (many (try (scTop *> pADT)))
+  defs <- dbg "trying definition" (many (try (scTop *> pDefinition adts)))
+  scTop
+  _ <- eof
+  return (aggregateDefinitions adts defs)
+
+aggregateDefinitions :: [ADTDecl] -> [Either FnDecl NeuralDecl] -> Program
+aggregateDefinitions adts (Left fn : tail) = Program (fn:fns) neurals adtz
+  where
+    Program fns neurals adtz = aggregateDefinitions adts tail
+aggregateDefinitions adts (Right nr : tail) = Program fns (nr:neurals) adtz
+  where
+    Program fns neurals adtz = aggregateDefinitions adts tail
+aggregateDefinitions adts [] = Program [] [] adts
+
+tryParseExpr :: FilePath -> String -> Either (ParseErrorBundle String Void) Expr
+tryParseExpr filename src = do
+  (res, _) <- runParser (runStateT parseExpr 0) filename src
+  return res
+
+tryParseProgram :: FilePath -> String -> Either (ParseErrorBundle String Void) Program
+tryParseProgram filename src = do
+  (prog, _) <- runParser (runStateT pProg 0) filename src
+  case normalize prog of
+    Right prog -> Right prog
+    Left err -> Left $ ParseErrorBundle ((FancyError 0 (Set.singleton (ErrorFail err))) :| []) emptyPosState
+
+emptyPosState :: PosState String
+emptyPosState = PosState "" 0 (initialPos "<string>") (mkPos 0) ""
+
+testParse' :: IO ()
+testParse' = do
+  let filename = "../../test.spll"
+  source <- readFile filename
+  let result = runParser (runStateT pProg 0) filename source
+  case result of
+    Left err -> putStrLn (errorBundlePretty err)
+    Right (prog, _) -> do
+      let flatProg = prog
+      putStrLn "ASDF1"
+      mapM_ putStrLn (prettyPrintProg prog)
+      putStrLn "ASDF2"
+      putStrLn (pPrintProg prog)
+      putStrLn "ASDF3"
+      pPrint flatProg
+      putStrLn "ASDF4"
+      print prog
+
+
+pNull :: MonadParser m => m Expr
+pNull = do
+  _ <- symbol "[]"
+  return $ nul
+
+pTuple :: MonadParser m => [ADTDecl] -> m Expr
+pTuple adts = parens $ do
+  x <- expr adts
+  _ <- symbol ","
+  y <- expr adts
+  return $ tuple x y
+
+
+-- | Parse atomic expressions (no recursion)
+atom :: MonadParser m => [ADTDecl] -> m Expr
+atom adts = choice [
+    pNull,
+    try (pTuple adts),
+    try (pListExpr adts),
+    try (parens (expr adts)),  -- Parenthesized expressions first
+    pUniform,     -- Built-in distributions
+    pNormal,
+    pConst,       -- Constants (numbers)
+    var <$> pIdentifier  -- Variables last
+  ] <* sc
+
+-- | Parse expressions that start with keywords
+keywordExpr :: MonadParser m => [ADTDecl] -> m Expr
+keywordExpr adts = dbg "keywordExpr" $ choice [
+    pIfThenElse adts,
+    pLetIn adts,
+    pLambda adts,
+    pTheta adts,
+    pSubtree adts,
+    pError
+  ] <* sc
+
+-- | Lambda expressions
+pLambda :: MonadParser m => [ADTDecl] -> m Expr
+pLambda adts = do
+    _ <- symbol "\\"
+    params <- some pIdentifier
+    _ <- symbol "->"
+    body <- expr adts
+    return $ foldr (#->#) body params
+
+-- | Parse function application
+-- This handles both normal application and built-in functions like multF
+application :: MonadParser m => [ADTDecl] -> m Expr
+application adts = dbg "application" $ do
+    func <- try (atom adts)
+    args <- try $ many (try (atom adts) <|> try (parens (expr adts)))
+    case func of
+        Var _ name -> case lookup name binaryFs of
+            Just constructor -> return (construct2 constructor args)
+            Nothing -> case lookup name unaryFs of
+                Just constructor -> return (construct1 constructor args)
+                Nothing -> case lookup name (globalFEnv adts) of
+                  Just _ -> 
+                    if length args == (parameterCount adts name) then
+                      return (constructN (parameterCount adts name) (injF name) args)
+                    else if length args < (parameterCount adts name) then
+                      constructNPartial (parameterCount adts name) (injF name) args
+                    else
+                      fail $ "Function " ++ name ++ " expects " ++ show (parameterCount [] name) ++ " parameters, but got " ++ show (length args)
+                  Nothing -> return $ foldl apply func args
+        _ -> return $ foldl apply func args
+
+
+-- | Main expression parser using makeExprParser
+expr :: MonadParser m => [ADTDecl] -> m Expr
+expr adts = dbg "expr" $ makeExprParser term opTable
+  where
+    term = choice [
+        try (application adts),
+        try (keywordExpr adts),
+        atom adts
+      ]
+
+-- | Helper for debuggable subparsers
+withDebug :: MonadParser m => String -> m a -> m a
+withDebug label p = dbg label p
+
+-- | Top level entry point
+parseExpr :: MonadParser m => m Expr
+parseExpr = sc *> expr [] <* eof
+
+-- | Parse a parenthesized expression
+parens :: MonadParser m => m a -> m a
+parens = between (char '(' *> sc) (char ')' *> sc)
+
+-- | Parse an identifier (simple Haskell-style variable)
+identifier :: MonadParser m => m String
+identifier = (:) <$> letterChar <*> many alphaNumChar <* sc
+
+
+
+multLikeOpList :: [([Char], Expr -> Expr -> Expr)]
+multLikeOpList = [("**", (#<*>#)), ("*", (#*#)), ("/", (#/#)), ("&&", (#&&#))]
+
+addLikeOpList :: [([Char], Expr -> Expr -> Expr)]
+addLikeOpList = [("++", (#<+>#)), ("+", (#+#)), ("-", \a b -> a #+# (negF b)), ("||", (#||#))]
+
+listManipulationOpList :: [([Char], Expr -> Expr -> Expr)]
+listManipulationOpList = [(":", (#:#))]
+
+cmpOpList :: [([Char], Expr -> Expr -> Expr)]
+cmpOpList = [(">", (#>#)), ("<", (#<#)), (":", (#:#)), ("==", (#==#))]
+
+funLikeOps :: [([Char], Expr -> Expr)]
+funLikeOps = [("not", (#!#))]
+
+mkInfixOp :: MonadParser m => [([Char], Expr -> Expr -> Expr)] -> [Operator m Expr]
+mkInfixOp tbl = map infx tbl
+  where infx (name, f) = InfixL (f <$ symbol name)
+
+mkPrefixOp :: MonadParser m => [([Char], Expr -> Expr)] -> [Operator m Expr]
+mkPrefixOp tbl = map infx tbl
+  where infx (name, f) = Prefix (f <$ keyword name)
+
+
+-- | Operator table (precedence and associativity)
+opTable :: MonadParser m => [[Operator m Expr]]
+opTable =
+  [ mkPrefixOp funLikeOps,
+    mkInfixOp multLikeOpList,
+    mkInfixOp addLikeOpList,
+    mkInfixOp listManipulationOpList,
+    mkInfixOp cmpOpList
+  ]
+
+
+-- | Top-level parser
+expressionParser :: MonadParser m => m Expr
+expressionParser = sc *> expr [] <* eof
+
+type ExprBuilder m = [Expr] -> m (Either String Expr)
+type BuilderMap m = Map.Map String (ExprBuilder m)
+
+-- | Normalize a Program
+--  After normalization, all Vars should be properly resolved as either a ReadNN, a InjF, or a plain Var.
+normalize :: Program -> Either String Program
+normalize prog =
+  let neuralMap = buildNeuralMap (neurals prog) :: BuilderMap (State Int)
+      invMap = buildInvMap (adts prog)
+      globalFunctionMap = globalFunctions prog
+      injFMap = buildInjFMap prog
+      --benignVars = collectBenignVars prog
+      paramMap = Map.unions [neuralMap, invMap, injFMap]  -- neural builders take precedence
+      functionMap = Map.unions [globalFunctionMap, injFMap] -- InjF are in both Maps, because they can be partially applied, which means they can have zero parameters
+  in if Map.disjoint invMap neuralMap && Map.disjoint invMap globalFunctionMap && Map.disjoint neuralMap globalFunctionMap
+    then do
+      --mapExprInProgram (normalizeExpr (builderMap, functionMap, Set.empty)) prog
+      evalState (mapExprInProgram (normalizeExpr (paramMap, functionMap, Set.empty)) prog) 0
+    else Left $ "Found identifiers that are in multiple scopes."
+
+-- Build maps from identifiers to expression builders
+buildNeuralMap :: MonadState Int m => [NeuralDecl] -> BuilderMap m
+buildNeuralMap decls = Map.fromList
+  [(name, \[arg] -> return $ Right $ readNN name arg) | (name, _, _) <- decls]
+
+buildInvMap :: MonadState Int m => [ADTDecl] -> BuilderMap m
+buildInvMap adts = Map.fromList
+  [(name, \args -> case args of
+    a | length a /= parameterCount adts name -> do
+      let missingParamCnt = parameterCount adts name - length a
+      substituteParamIDs <- replicateM missingParamCnt demandUniqueNumber
+      let substituteParamNames = map (("p_m" ++) . show) substituteParamIDs
+      let extendedArgs = args ++ map var substituteParamNames
+      return $ Right $ foldl (flip (#->#)) (injF name extendedArgs) substituteParamNames
+    _ -> return $ Right $ injF name args)
+   | name <- fNames]
+  where fNames = map fst (globalFEnv adts)
+
+globalFunctions :: MonadState Int m =>  Program -> BuilderMap m
+globalFunctions prog = Map.fromList ([(name, \[] -> return $ Right $ var name) | (name, _) <- functions prog])
+
+buildInjFMap:: MonadState Int m => Program -> BuilderMap m
+buildInjFMap prog = Map.fromList 
+  [(name, \[] -> do
+      substituteParamIDs <- replicateM (parameterCount (adts prog) name) demandUniqueNumber
+      let substituteParamNames = map (("p_m" ++) . show) substituteParamIDs
+      let args = map var substituteParamNames
+      return $ Right $ foldl (flip (#->#)) (injF name args) substituteParamNames)
+    | (name, _) <- globalFEnv (adts prog)]
+
+-- Collect all variables that should not be transformed
+collectBenignVars :: Program -> Set.Set String
+collectBenignVars prog = Set.fromList [name | (name, _) <- functions prog]
+
+-- Main expression normalization function
+normalizeExpr :: MonadState Int m => (BuilderMap m, BuilderMap m, Set.Set String) -> Expr -> m (Either String Expr)
+normalizeExpr env@(parametricBuilders, atomicBuilders, benign) expr =
+  case expr of
+    -- Handle scopes first, adding bound variables before processing sub-expressions
+    Lambda ti name body -> do
+      let body' = normalizeExpr (parametricBuilders, atomicBuilders, Set.insert name benign) body
+      fmap (fmap (Lambda ti name)) body'
+
+    LetIn ti name def body -> do
+      -- def is normalized with current scope
+      let def' = normalizeExpr env def
+      -- body is normalized with name added to scope
+      let body' = normalizeExpr (parametricBuilders, atomicBuilders, Set.insert name benign) body
+      let a = fmap (fmap (LetIn ti name)) def'
+      fmap (<*>) a <*> body'
+
+    -- For all other expressions, normalize sub-expressions first then check for Apply pattern
+    _ -> do
+      subExprs <- fmap sequence (mapM (normalizeExpr env) (getSubExprs expr))
+      let mExpr = fmap (setSubExprs expr) subExprs
+      case mExpr of
+        Left s -> return $ Left s
+        Right expr' ->
+          case expr' of
+            -- Start of an Apply chain
+            Apply ti (Apply _ _ _) _ ->
+              -- Need to collect all args in the chain and find base function
+              let (base, args) = collectApplyChain expr
+              in case base of
+                Var _ fname | Just builder <- Map.lookup fname parametricBuilders -> do
+                  build <- builder args
+                  case build of
+                    Left _ -> return $ Right expr' -- This prevents InjFs, which have multiple arguments from failing to build because here only one argument is applied
+                    e -> return e
+                _ -> return $ Right expr
+            Apply ti (Var _ fname) arg
+              | not (Set.member fname benign)
+              , Just builder <- Map.lookup fname parametricBuilders -> do
+                build <- builder [arg]
+                case build of
+                  Left _ -> return $ Right expr' -- This prevents InjFs, which have multiple arguments from failing to build because here only one argument is applied
+                  e -> return e
+            Var ti fname
+              | not (Set.member fname benign)
+              , Just builder <- Map.lookup fname atomicBuilders -> builder []
+            _ -> return $ Right expr'
+
+--replaceExpr :: Expr -> Expr -> Expr
+--replaceExpr
+
+-- Returns (base expression, arguments in application order)
+collectApplyChain :: Expr -> (Expr, [Expr])
+collectApplyChain (Apply _ left arg) =
+  let (base, args) = collectApplyChain left
+  in (base, args ++ [arg])  -- maintain order of application
+-- Quick and dirty fix for multi parameter InjFs. The normalizatzion first creates a 1 parameter InjF and then stops with the normalization
+-- We bypass this by tricking the normalization  that the InjF is in reality an application on a variable
+collectApplyChain (InjF t name args) = (Var t name, args)
+collectApplyChain e = (e, [])
+
+-- Helper to map over all expressions in a program
+mapExprInProgram :: MonadState Int m => (Expr -> m (Either String Expr)) -> Program -> m (Either String Program)
+mapExprInProgram f prog = do
+  newFuncs <- mapM (\(name, expr) -> f expr >>= \e -> return (name, e)) (functions prog)
+  let newFuncs' = mapM (\(s, e) -> (e <&> \ex -> (s, ex))) newFuncs
+  case newFuncs' of
+    Right fs -> return $ Right $ prog { functions = fs }
+    Left err -> return $ Left err
