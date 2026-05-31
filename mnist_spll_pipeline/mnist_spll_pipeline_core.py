@@ -10,7 +10,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import inspect
 import math
 
@@ -29,6 +29,9 @@ from mnist_spll_common import (
     resolve_path,
     save_config,
 )
+
+
+ADAPTIVE_TOP_K_ARTIFACT_LABEL = "cutoff_topk"
 
 
 @dataclass(frozen=True)
@@ -62,26 +65,183 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+ThresholdSpec = Dict[str, Any]
+RawThreshold = Union[None, int, float, str, Dict[str, Any]]
+
+
 def threshold_label(cutoff: Optional[float]) -> str:
     if cutoff is None:
         return "exact"
     return f"cutoff_{str(cutoff).replace('.', 'p')}"
 
 
-def validate_thresholds(thresholds: Sequence[Optional[float]]) -> None:
-    for cutoff in thresholds:
-        if cutoff is None:
-            continue
-        if not (0.0 <= float(cutoff) <= 1.0):
-            raise ValueError(
-                f"Every topKCutoff value must be between 0 and 1 for this repo. Invalid value: {cutoff}"
-            )
+def _label_float(value: float) -> str:
+    return (f"{float(value):g}").replace(".", "p")
 
 
-def get_thresholds(config: Dict[str, Any]) -> List[Optional[float]]:
-    thresholds = list(config["inference"].get("approximation_thresholds", [None, 0.001, 0.01, 0.05]))
-    validate_thresholds(thresholds)
+def _normalise_cutoff_search_config(config: Dict[str, Any], threshold: Dict[str, Any]) -> Dict[str, Any]:
+    inference_cfg = config.get("inference", {}) or {}
+    global_cfg = inference_cfg.get("adaptive_top_k", {}) or {}
+    local_cfg = threshold.get("cutoff_search", {}) or {}
+    if not isinstance(global_cfg, dict):
+        raise ValueError("inference.adaptive_top_k must be a mapping when provided.")
+    if not isinstance(local_cfg, dict):
+        raise ValueError(f"cutoff_search for threshold {threshold.get('name', threshold.get('label'))!r} must be a mapping.")
+
+    def get_value(key: str, default: Any) -> Any:
+        return local_cfg.get(key, global_cfg.get(key, default))
+
+    def get_int(key: str, default: int) -> int:
+        value = get_value(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"inference.adaptive_top_k.{key} must be an integer, got {value!r}") from exc
+
+    def get_float(key: str, default: float) -> float:
+        value = get_value(key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"inference.adaptive_top_k.{key} must be numeric, got {value!r}") from exc
+
+    probe_experiments = get_int("probe_experiments", get_int("probe_cases", 20))
+    max_iterations = get_int("max_iterations", 14)
+    tolerance = get_float("tolerance", 0.02)
+    min_cutoff = get_float("min_cutoff", 0.0)
+    max_cutoff = get_float("max_cutoff", 1.0)
+
+    if probe_experiments <= 0:
+        raise ValueError("inference.adaptive_top_k.probe_experiments must be positive.")
+    if max_iterations <= 0:
+        raise ValueError("inference.adaptive_top_k.max_iterations must be positive.")
+    if tolerance < 0.0:
+        raise ValueError("inference.adaptive_top_k.tolerance must be non-negative.")
+    if not (0.0 <= min_cutoff <= 1.0 and 0.0 <= max_cutoff <= 1.0 and min_cutoff <= max_cutoff):
+        raise ValueError(
+            "inference.adaptive_top_k min_cutoff/max_cutoff must satisfy 0 <= min_cutoff <= max_cutoff <= 1."
+        )
+
+    return {
+        "probe_experiments": int(probe_experiments),
+        "max_iterations": int(max_iterations),
+        "tolerance": float(tolerance),
+        "min_cutoff": float(min_cutoff),
+        "max_cutoff": float(max_cutoff),
+    }
+
+
+def _normalise_threshold(config: Dict[str, Any], raw: RawThreshold) -> ThresholdSpec:
+    if raw is None:
+        return {
+            "threshold_label": "exact",
+            "artifact_threshold_label": threshold_label(None),
+            "cutoff": None,
+            "compile_cutoff": None,
+            "adaptive_top_k": False,
+            "posterior_mass_target": None,
+            "cutoff_search": None,
+        }
+
+    if isinstance(raw, dict):
+        item = dict(raw)
+        name = item.get("name", item.get("label"))
+        adaptive_requested = bool(item.get("adaptive_top_k", False)) or item.get("posterior_mass_target") is not None
+        raw_cutoff = item.get("top_k_cutoff", item.get("cutoff"))
+        if isinstance(raw_cutoff, str) and raw_cutoff.strip().lower() in {"auto", "adaptive"}:
+            adaptive_requested = True
+            raw_cutoff = 0.0
+        if adaptive_requested and raw_cutoff is None:
+            # Adaptive thresholds must compile through the approximate SPLL path;
+            # exact artifacts do not expose the mutable TOP_K_CUTOFF global.
+            raw_cutoff = 0.0
+
+        cutoff = None if raw_cutoff is None else float(raw_cutoff)
+        if cutoff is not None and not (0.0 <= cutoff <= 1.0):
+            raise ValueError(f"Every topKCutoff value must be between 0 and 1. Invalid value: {raw_cutoff}")
+
+        posterior_mass_target = None
+        cutoff_search = None
+        if adaptive_requested:
+            inference_cfg = config.get("inference", {}) or {}
+            global_cfg = inference_cfg.get("adaptive_top_k", {}) or {}
+            if not isinstance(global_cfg, dict):
+                raise ValueError("inference.adaptive_top_k must be a mapping when provided.")
+            target = float(item.get("posterior_mass_target", global_cfg.get("posterior_mass_target", 0.8)))
+            if not (0.0 < target <= 1.0):
+                raise ValueError(f"posterior_mass_target must be in (0, 1], got {target}")
+            posterior_mass_target = float(target)
+            cutoff_search = _normalise_cutoff_search_config(config, item)
+            if not name:
+                name = f"approx_mass_{_label_float(posterior_mass_target)}"
+        elif not name:
+            name = threshold_label(cutoff)
+
+        artifact_label = ADAPTIVE_TOP_K_ARTIFACT_LABEL if adaptive_requested else threshold_label(cutoff)
+        return {
+            "threshold_label": str(name),
+            "artifact_threshold_label": artifact_label,
+            "cutoff": cutoff,
+            "compile_cutoff": cutoff,
+            "adaptive_top_k": bool(adaptive_requested),
+            "posterior_mass_target": posterior_mass_target,
+            "cutoff_search": cutoff_search,
+        }
+
+    cutoff = float(raw)
+    if not (0.0 <= cutoff <= 1.0):
+        raise ValueError(f"Every topKCutoff value must be between 0 and 1. Invalid value: {raw}")
+    return {
+        "threshold_label": threshold_label(cutoff),
+        "artifact_threshold_label": threshold_label(cutoff),
+        "cutoff": cutoff,
+        "compile_cutoff": cutoff,
+        "adaptive_top_k": False,
+        "posterior_mass_target": None,
+        "cutoff_search": None,
+    }
+
+
+def get_thresholds(config: Dict[str, Any]) -> List[ThresholdSpec]:
+    raw_thresholds = list(config["inference"].get("approximation_thresholds", [None, 0.001, 0.01, 0.05]))
+    thresholds = [_normalise_threshold(config, raw) for raw in raw_thresholds]
+    seen = set()
+    for threshold in thresholds:
+        label = str(threshold["threshold_label"])
+        if label in seen:
+            raise ValueError(f"Duplicate inference threshold label: {label}")
+        seen.add(label)
     return thresholds
+
+
+def threshold_spec_label(threshold: ThresholdSpec) -> str:
+    return str(threshold["threshold_label"])
+
+
+def threshold_spec_artifact_label(threshold: ThresholdSpec) -> str:
+    return str(threshold.get("artifact_threshold_label") or threshold_label(threshold_spec_compile_cutoff(threshold)))
+
+
+def threshold_spec_compile_cutoff(threshold: ThresholdSpec) -> Optional[float]:
+    cutoff = threshold.get("compile_cutoff", threshold.get("cutoff"))
+    return None if cutoff is None else float(cutoff)
+
+
+def threshold_spec_runtime_seed_cutoff(threshold: ThresholdSpec) -> Optional[float]:
+    cutoff = threshold.get("cutoff", threshold.get("compile_cutoff"))
+    return None if cutoff is None else float(cutoff)
+
+
+def threshold_spec_for_json(threshold: ThresholdSpec) -> Dict[str, Any]:
+    return {
+        "threshold_label": threshold_spec_label(threshold),
+        "artifact_threshold_label": threshold_spec_artifact_label(threshold),
+        "cutoff": threshold_spec_runtime_seed_cutoff(threshold),
+        "compile_cutoff": threshold_spec_compile_cutoff(threshold),
+        "adaptive_top_k": bool(threshold.get("adaptive_top_k", False)),
+        "posterior_mass_target": threshold.get("posterior_mass_target"),
+        "cutoff_search": threshold.get("cutoff_search"),
+    }
 
 
 def normalize_cutoff_mode(mode: Any) -> str:
@@ -98,9 +258,16 @@ def get_cutoff_modes(config: Dict[str, Any]) -> List[str]:
     return ["global"]
 
 
-def compiled_program_path(compiled_root: Path, n_terms: int, cutoff_mode: str, cutoff: Optional[float]) -> Path:
-    return compiled_root / normalize_cutoff_mode(cutoff_mode) / f"sum_{int(n_terms):02d}" / threshold_label(
-        cutoff) / "program.py"
+def compiled_program_path(
+    compiled_root: Path,
+    n_terms: int,
+    cutoff_mode: str,
+    cutoff: Optional[float],
+    *,
+    artifact_label: Optional[str] = None,
+) -> Path:
+    label = str(artifact_label) if artifact_label else threshold_label(cutoff)
+    return compiled_root / normalize_cutoff_mode(cutoff_mode) / f"sum_{int(n_terms):02d}" / label / "program.py"
 
 
 def get_term_count_bounds(config: Dict[str, Any]) -> Tuple[int, int]:
@@ -477,24 +644,33 @@ def load_staged_experiments(paths: PipelinePaths) -> List[Dict[str, Any]]:
 def verify_compiled_artifacts(
         paths: PipelinePaths,
         experiments: List[Dict[str, Any]],
-        thresholds: Sequence[Optional[float]],
+        thresholds: Sequence[ThresholdSpec],
         cutoff_modes: Sequence[str],
 ) -> None:
     unique_term_counts = sorted({int(exp["n_terms"]) for exp in experiments})
     for cutoff_mode in cutoff_modes:
         for n_terms in unique_term_counts:
-            for cutoff in thresholds:
-                compiled_py_path = compiled_program_path(paths.compiled_root, n_terms, cutoff_mode, cutoff)
+            for threshold in thresholds:
+                cutoff = threshold_spec_compile_cutoff(threshold)
+                artifact_label = threshold_spec_artifact_label(threshold)
+                compiled_py_path = compiled_program_path(
+                    paths.compiled_root,
+                    n_terms,
+                    cutoff_mode,
+                    cutoff,
+                    artifact_label=artifact_label,
+                )
                 if not compiled_py_path.exists():
                     raise FileNotFoundError(
-                        f"Compiled SPLL program missing: {compiled_py_path}. Run the 'compile' step first."
+                        f"Compiled SPLL program missing for threshold {threshold_spec_label(threshold)!r}: "
+                        f"{compiled_py_path}. Run the 'compile' step first."
                     )
 
 
 def build_compiled_module_loader(
         paths: PipelinePaths,
         cutoff_modes: Sequence[str],
-        thresholds: Sequence[Optional[float]],
+        thresholds: Sequence[ThresholdSpec],
         experiments: List[Dict[str, Any]],
         read_mnist,
         *,
@@ -503,13 +679,22 @@ def build_compiled_module_loader(
     verify_compiled_artifacts(paths, experiments, thresholds, cutoff_modes)
 
     unique_targets = sorted(
-        {(normalize_cutoff_mode(mode), int(exp["n_terms"]), cutoff) for exp in experiments for mode in cutoff_modes for
-         cutoff in thresholds},
-        key=lambda item: (item[0], item[1], item[2] is not None, float(item[2] or -1.0)),
+        {
+            (
+                normalize_cutoff_mode(mode),
+                int(exp["n_terms"]),
+                threshold_spec_compile_cutoff(threshold),
+                threshold_spec_artifact_label(threshold),
+            )
+            for exp in experiments
+            for mode in cutoff_modes
+            for threshold in thresholds
+        },
+        key=lambda item: (item[0], item[1], item[3], item[2] is not None, float(item[2] or -1.0)),
     )
     total_targets = len(unique_targets)
     loaded_targets = 0
-    compiled_modules: Dict[Tuple[int, str, Optional[float]], Any] = {}
+    compiled_modules: Dict[Tuple[int, str, Optional[float], str], Any] = {}
     load_bar = TerminalProgressBar(
         total_targets,
         desc="Load compiled",
@@ -517,23 +702,34 @@ def build_compiled_module_loader(
         enabled=show_progress and total_targets > 0,
     )
 
-    def get_module(n_terms: int, cutoff_mode: str, cutoff: Optional[float]):
+    def get_module(
+        n_terms: int,
+        cutoff_mode: str,
+        cutoff: Optional[float],
+        artifact_label: Optional[str] = None,
+    ):
         nonlocal loaded_targets
         normalized_mode = normalize_cutoff_mode(cutoff_mode)
-        key = (int(n_terms), normalized_mode, cutoff)
+        label = str(artifact_label) if artifact_label else threshold_label(cutoff)
+        key = (int(n_terms), normalized_mode, cutoff, label)
         cached = compiled_modules.get(key)
         if cached is not None:
             return cached
 
-        label = threshold_label(cutoff)
-        compiled_py_path = compiled_program_path(paths.compiled_root, int(n_terms), normalized_mode, cutoff)
+        compiled_py_path = compiled_program_path(
+            paths.compiled_root,
+            int(n_terms),
+            normalized_mode,
+            cutoff,
+            artifact_label=label,
+        )
         module_name = f"spll_{normalized_mode}_{int(n_terms)}_{label}_{hashlib.sha1(str(compiled_py_path).encode()).hexdigest()[:10]}"
         module = import_compiled_module(compiled_py_path, module_name)
         setattr(module, "_spll_base_readMNist", read_mnist)
         setattr(module, "readMNist", read_mnist)
         compiled_modules[key] = module
         loaded_targets += 1
-        load_bar.update(postfix=f"cutoff_mode={normalized_mode}, terms={int(n_terms)}, cutoff={label}")
+        load_bar.update(postfix=f"cutoff_mode={normalized_mode}, terms={int(n_terms)}, artifact={label}")
         return module
 
     def finish_loading() -> None:
@@ -575,7 +771,7 @@ def build_experiment_source_bundle(config: Dict[str, Any], paths: PipelinePaths)
     return {
         "config_path": str(config.get("_config_path", "")),
         "paths": paths.to_json_dict(),
-        "thresholds": get_thresholds(config),
+        "thresholds": [threshold_spec_for_json(threshold) for threshold in get_thresholds(config)],
         "cutoff_modes": get_cutoff_modes(config),
         "term_counts": get_configured_term_counts(config),
     }

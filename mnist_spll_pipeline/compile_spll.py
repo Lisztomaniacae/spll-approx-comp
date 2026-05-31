@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from mnist_spll_common import load_config, resolve_path, set_seed, stage_message
 from mnist_spll_pipeline_core import (
@@ -15,6 +15,10 @@ from mnist_spll_pipeline_core import (
     get_thresholds,
     stage_config_snapshot,
     threshold_label,
+    threshold_spec_artifact_label,
+    threshold_spec_compile_cutoff,
+    threshold_spec_for_json,
+    threshold_spec_label,
     write_json,
 )
 
@@ -42,6 +46,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
 
     stage_message(2, 2, "Compiling SPLL programs for every configured cutoff mode and threshold")
     compile_targets: List[Dict[str, Any]] = []
+    compiled_once: Set[str] = set()
     total_targets = len(term_counts) * len(cutoff_modes) * len(thresholds)
 
     from mnist_spll_common import TerminalProgressBar
@@ -56,34 +61,53 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
     for cutoff_mode in cutoff_modes:
         for n_terms in term_counts:
             spll_path = ctx.paths.program_root / f"sum_{n_terms:02d}.spll"
-            for cutoff in thresholds:
-                label = threshold_label(cutoff)
-                compiled_py_path = compiled_program_path(ctx.paths.compiled_root, n_terms, cutoff_mode, cutoff)
-                compile_spll_program(
-                    repo_root=repo_root,
-                    spll_path=spll_path,
-                    output_py_path=compiled_py_path,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    force_recompile=force_recompile,
-                    timeout_sec=timeout_sec,
-                    stack_arch=stack_arch,
-                    count_branches=count_branches,
+            for threshold in thresholds:
+                cutoff = threshold_spec_compile_cutoff(threshold)
+                label = threshold_spec_label(threshold)
+                artifact_label = threshold_spec_artifact_label(threshold)
+                compiled_py_path = compiled_program_path(
+                    ctx.paths.compiled_root,
+                    n_terms,
+                    cutoff_mode,
+                    cutoff,
+                    artifact_label=artifact_label,
                 )
+                compiled_key = str(compiled_py_path.resolve())
+                compiled_in_this_stage = compiled_key in compiled_once
+                if not compiled_in_this_stage:
+                    compile_spll_program(
+                        repo_root=repo_root,
+                        spll_path=spll_path,
+                        output_py_path=compiled_py_path,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        force_recompile=force_recompile,
+                        timeout_sec=timeout_sec,
+                        stack_arch=stack_arch,
+                        count_branches=count_branches,
+                    )
+                    compiled_once.add(compiled_key)
                 compile_targets.append(
                     {
                         "cutoff_mode": cutoff_mode,
                         "n_terms": int(n_terms),
                         "cutoff": cutoff,
+                        "compile_cutoff": cutoff,
                         "threshold_label": label,
+                        "artifact_threshold_label": artifact_label,
+                        "compile_artifact_label": artifact_label,
+                        "adaptive_top_k": bool(threshold.get("adaptive_top_k", False)),
+                        "posterior_mass_target": threshold.get("posterior_mass_target"),
+                        "cutoff_search": threshold.get("cutoff_search"),
                         "spll_path": str(spll_path),
                         "compiled_program_path": str(compiled_py_path),
                         "python_lib_path": str(compiled_py_path.parent / "pythonLib.py"),
                         "count_branches": count_branches,
+                        "compiled_in_this_stage": not compiled_in_this_stage,
                         "exists": compiled_py_path.exists(),
                     }
                 )
-                progress_bar.update(postfix=f"cutoff_mode={cutoff_mode}, terms={n_terms}, cutoff={label}")
+                progress_bar.update(postfix=f"cutoff_mode={cutoff_mode}, terms={n_terms}, threshold={label}")
     progress_bar.finish(postfix="all compilation targets ready")
 
     manifest = {
@@ -98,7 +122,7 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
                 "count_branches": count_branches,
                 "term_counts": term_counts,
                 "cutoff_modes": cutoff_modes,
-                "thresholds": thresholds,
+                "thresholds": [threshold_spec_for_json(threshold) for threshold in thresholds],
                 "paths": ctx.paths.to_json_dict(),
             },
         ),

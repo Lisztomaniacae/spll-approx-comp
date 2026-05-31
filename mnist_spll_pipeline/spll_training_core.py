@@ -31,6 +31,7 @@ from mnist_spll_pipeline_core import (
     _get_tuple_item,
     compile_spll_program,
     extract_branch_count,
+    ADAPTIVE_TOP_K_ARTIFACT_LABEL,
     import_compiled_module,
     make_spll_program,
     threshold_label,
@@ -114,10 +115,69 @@ def get_seeds(config: Dict[str, Any]) -> List[int]:
     return [int(seed) for seed in seeds]
 
 
+def _normalized_float_config(value: Any, *, field_name: str, default: float) -> float:
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric, got {value!r}") from exc
+
+
+def _normalized_int_config(value: Any, *, field_name: str, default: int) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer, got {value!r}") from exc
+
+
+def _normalize_cutoff_search_config(config: Dict[str, Any], raw_mode: Dict[str, Any]) -> Dict[str, Any]:
+    global_cfg = config.get("adaptive_top_k", {}) or {}
+    mode_cfg = raw_mode.get("cutoff_search", {}) or {}
+    if not isinstance(global_cfg, dict):
+        raise ValueError("adaptive_top_k must be a mapping when provided.")
+    if not isinstance(mode_cfg, dict):
+        raise ValueError(f"cutoff_search for mode {raw_mode.get('name')!r} must be a mapping.")
+
+    def get_value(key: str, default: Any) -> Any:
+        return mode_cfg.get(key, global_cfg.get(key, default))
+
+    probe_cases = _normalized_int_config(get_value("probe_cases", 20), field_name="adaptive_top_k.probe_cases", default=20)
+    max_iterations = _normalized_int_config(get_value("max_iterations", 14), field_name="adaptive_top_k.max_iterations", default=14)
+    tolerance = _normalized_float_config(get_value("tolerance", 0.02), field_name="adaptive_top_k.tolerance", default=0.02)
+    min_cutoff = _normalized_float_config(get_value("min_cutoff", 0.0), field_name="adaptive_top_k.min_cutoff", default=0.0)
+    max_cutoff = _normalized_float_config(get_value("max_cutoff", 1.0), field_name="adaptive_top_k.max_cutoff", default=1.0)
+
+    if probe_cases <= 0:
+        raise ValueError("adaptive_top_k.probe_cases must be positive.")
+    if max_iterations <= 0:
+        raise ValueError("adaptive_top_k.max_iterations must be positive.")
+    if tolerance < 0.0:
+        raise ValueError("adaptive_top_k.tolerance must be non-negative.")
+    if not (0.0 <= min_cutoff <= 1.0 and 0.0 <= max_cutoff <= 1.0 and min_cutoff <= max_cutoff):
+        raise ValueError(
+            "adaptive_top_k min_cutoff/max_cutoff must satisfy 0 <= min_cutoff <= max_cutoff <= 1."
+        )
+
+    return {
+        "probe_cases": int(probe_cases),
+        "max_iterations": int(max_iterations),
+        "tolerance": float(tolerance),
+        "min_cutoff": float(min_cutoff),
+        "max_cutoff": float(max_cutoff),
+    }
+
+
 def get_inference_modes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     modes = config.get("inference_modes", [])
     if not isinstance(modes, list) or not modes:
         raise ValueError("Pipeline II config must define a non-empty inference_modes list.")
+    global_adaptive_cfg = config.get("adaptive_top_k", {}) or {}
+    if not isinstance(global_adaptive_cfg, dict):
+        raise ValueError("adaptive_top_k must be a mapping when provided.")
+
     normalized: List[Dict[str, Any]] = []
     seen = set()
     for raw in modes:
@@ -129,17 +189,56 @@ def get_inference_modes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         if name in seen:
             raise ValueError(f"Duplicate inference mode name: {name}")
         seen.add(name)
-        cutoff = raw.get("top_k_cutoff")
+
+        adaptive_requested = bool(raw.get("adaptive_top_k", False)) or raw.get("posterior_mass_target") is not None
+        raw_cutoff = raw.get("top_k_cutoff")
+        if isinstance(raw_cutoff, str) and raw_cutoff.strip().lower() in {"auto", "adaptive"}:
+            if not adaptive_requested:
+                raise ValueError(f"Mode {name!r} uses top_k_cutoff={raw_cutoff!r} but is not adaptive.")
+            raw_cutoff = 0.0
+        if adaptive_requested and raw_cutoff is None:
+            # Adaptive modes must be compiled through SPLL's approximate code path,
+            # because exact artifacts do not expose the mutable TOP_K_CUTOFF global.
+            raw_cutoff = 0.0
+
+        cutoff = raw_cutoff
         if cutoff is not None:
             cutoff = float(cutoff)
             if not (0.0 <= cutoff <= 1.0):
                 raise ValueError(f"top_k_cutoff must be in [0, 1], got {cutoff}")
-        normalized.append({"name": name, "top_k_cutoff": cutoff})
+
+        posterior_mass_target = None
+        cutoff_search = None
+        if adaptive_requested:
+            target_raw = raw.get(
+                "posterior_mass_target",
+                global_adaptive_cfg.get("posterior_mass_target", 0.8),
+            )
+            posterior_mass_target = float(target_raw)
+            if not (0.0 < posterior_mass_target <= 1.0):
+                raise ValueError(
+                    f"posterior_mass_target for adaptive mode {name!r} must be in (0, 1], "
+                    f"got {posterior_mass_target}"
+                )
+            if cutoff is None:
+                raise ValueError(f"Adaptive mode {name!r} must compile with a numeric top_k_cutoff seed.")
+            cutoff_search = _normalize_cutoff_search_config(config, raw)
+
+        normalized.append(
+            {
+                "name": name,
+                "artifact_name": ADAPTIVE_TOP_K_ARTIFACT_LABEL if adaptive_requested else name,
+                "top_k_cutoff": cutoff,
+                "adaptive_top_k": bool(adaptive_requested),
+                "posterior_mass_target": posterior_mass_target,
+                "cutoff_search": cutoff_search,
+            }
+        )
     return normalized
 
 
 def mode_artifact_dir(paths: TrainingPaths, n_terms: int, mode: Dict[str, Any]) -> Path:
-    return paths.compiled_root / f"terms_{int(n_terms):02d}" / str(mode["name"])
+    return paths.compiled_root / f"terms_{int(n_terms):02d}" / str(mode.get("artifact_name", mode["name"]))
 
 
 def compiled_program_path(paths: TrainingPaths, n_terms: int, mode: Dict[str, Any]) -> Path:
@@ -341,6 +440,7 @@ def compile_training_artifacts(config: Dict[str, Any], paths: TrainingPaths) -> 
 
     write_spll_sources(config, paths)
     targets: List[Dict[str, Any]] = []
+    compiled_once = set()
     total = len(get_experiments(config)) * len(get_inference_modes(config))
     progress = TerminalProgressBar(total, desc="Compile training SPLL", unit="targets", enabled=bool(config.get("show_progress", True)))
     for experiment in get_experiments(config):
@@ -348,26 +448,36 @@ def compile_training_artifacts(config: Dict[str, Any], paths: TrainingPaths) -> 
         spll_path = source_program_path(paths, n_terms)
         for mode in get_inference_modes(config):
             out_path = compiled_program_path(paths, n_terms, mode)
-            compile_spll_program(
-                repo_root=repo_root,
-                spll_path=spll_path,
-                output_py_path=out_path,
-                cutoff=mode.get("top_k_cutoff"),
-                cutoff_mode="global",
-                force_recompile=force_recompile,
-                timeout_sec=timeout_sec,
-                stack_arch=stack_arch,
-                count_branches=count_branches,
-            )
+            compiled_key = str(out_path.resolve())
+            compiled_in_this_stage = compiled_key in compiled_once
+            if not compiled_in_this_stage:
+                compile_spll_program(
+                    repo_root=repo_root,
+                    spll_path=spll_path,
+                    output_py_path=out_path,
+                    cutoff=mode.get("top_k_cutoff"),
+                    cutoff_mode="global",
+                    force_recompile=force_recompile,
+                    timeout_sec=timeout_sec,
+                    stack_arch=stack_arch,
+                    count_branches=count_branches,
+                )
+                compiled_once.add(compiled_key)
             manifest = {
                 "created_at_utc": utc_now_iso(),
                 "n_terms": n_terms,
                 "mode_name": mode["name"],
+                "artifact_name": mode.get("artifact_name", mode["name"]),
                 "top_k_cutoff": mode.get("top_k_cutoff"),
+                "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+                "posterior_mass_target": mode.get("posterior_mass_target"),
+                "cutoff_search": mode.get("cutoff_search"),
                 "count_branches": count_branches,
                 "spll_source": str(spll_path),
                 "compiled_python": str(out_path),
                 "threshold_label": threshold_label(mode.get("top_k_cutoff")),
+                "artifact_threshold_label": mode.get("artifact_name", mode["name"]),
+                "compiled_in_this_stage": not compiled_in_this_stage,
             }
             write_json(out_path.parent / "compile_manifest.json", manifest)
             targets.append(manifest)
@@ -659,7 +769,11 @@ def save_training_checkpoint(
             "seed": int(seed),
             "n_terms": int(n_terms),
             "inference_mode": mode["name"],
+            "artifact_name": mode.get("artifact_name", mode["name"]),
             "top_k_cutoff": mode.get("top_k_cutoff"),
+            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+            "posterior_mass_target": mode.get("posterior_mass_target"),
+            "cutoff_search": mode.get("cutoff_search"),
             "config_path": str(config.get("_config_path", "")),
             "created_at_utc": utc_now_iso(),
         },

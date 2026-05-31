@@ -153,7 +153,7 @@ Pipeline II tests whether SPLL approximation changes the **training process itse
 | `prepare_spll_training.py` | Builds split/schedule manifests and initial checkpoints. |
 | `compile_spll_training.py` | Generates and compiles exact/approximate SPLL training artifacts. |
 | `train_spll_generated.py` | Trains through generated SPLL artifacts. |
-| `visualize_spll_training.py` | Writes milestone tables and training plots. |
+| `visualize_spll_training.py` | Writes milestone tables, training plots, and adaptive top-k calibration plots. |
 | `spll_training_core.py` | Shared Pipeline II helpers. |
 
 ### Design summary
@@ -163,8 +163,20 @@ Pipeline II uses the official MNIST training partition only. It builds a balance
 ```text
 loss = mean_i(-log(p_true_sum_i + epsilon))
 ```
-my 
+
 The generated SPLL artifact remains the source of truth for exact/approximate pruning. The training loop batches CNN evaluation outside the scalar generated-SPLL calls so gradients still flow back to the CNN.
+
+Adaptive posterior-mass approximation is available through an inference mode such as:
+
+```yaml
+inference_modes:
+  - name: approx_mass_0p8
+    top_k_cutoff: auto
+    adaptive_top_k: true
+    posterior_mass_target: 0.8
+```
+
+This compiles the adaptive approximate SPLL artifact under the fixed artifact directory `cutoff_topk`, then mutates the generated module-level `TOP_K_CUTOFF` at runtime. The deterministic bounded search targets the configured mean surviving posterior mass, with `0.8` as the default thesis-facing target. Training now writes `adaptive_topk_events.csv` for selected runtime cutoffs over training and `adaptive_topk_search_trace.csv` for the per-candidate bisection path.
 
 Milestones and trace `step` values are measured in **sum cases seen**, not optimizer updates. `training.sum_batch_size: 1` recovers the old one-case-per-update behavior.
 
@@ -238,10 +250,12 @@ Important artifacts:
 | `generated/compiled_python/**/program.py` | Generated Python inference artifacts. |
 | `runs/*/train_trace.csv` | Training trace. |
 | `runs/*/validation_trace.csv` | Validation trace. |
+| `runs/*/adaptive_topk_events.csv` | Adaptive top-k refresh events: selected runtime cutoff, achieved mass, error, and search metadata. |
+| `runs/*/adaptive_topk_search_trace.csv` | Per-evaluation bisection trace for adaptive top-k cutoff search. |
 | `runs/*/milestones.json` | Reached or censored milestones. |
 | `runs/*/checkpoints/*.pt` | Milestone/final checkpoints. |
-| `visualization/tables/*.csv` | Milestone and aggregate tables. |
-| `visualization/figures/**/*.png` | Training and milestone figures. |
+| `visualization/tables/*.csv` | Milestone, aggregate, and adaptive top-k calibration tables. |
+| `visualization/figures/**/*.png` | Training, milestone, and adaptive top-k calibration figures. |
 
 The training stage is intentionally strict: it refuses to run if prepared or compiled artifacts are missing, if generated probabilities are detached/non-finite, or if gradients become invalid.
 
@@ -251,13 +265,34 @@ The training stage is intentionally strict: it refuses to run if prepared or com
 
 ### Approximation thresholds
 
-Approximation settings are represented by cutoff values in the config.
+Pipeline I accepts both fixed cutoff values and adaptive posterior-mass thresholds in `inference.approximation_thresholds`.
 
 | YAML value | Meaning |
 |---|---|
 | `null` | exact baseline; no SPLL pruning flag is passed |
 | `0.0` | approximate code path with zero cutoff; useful as overhead baseline, but not identical to exact |
 | positive number, e.g. `0.01` | approximate inference with pruning threshold passed via `-k` |
+| mapping with `top_k_cutoff: auto` | compile a separate adaptive approximate artifact named `cutoff_topk` with seed cutoff `0.0`, then tune the generated module's mutable `TOP_K_CUTOFF` to capture `posterior_mass_target` posterior mass |
+
+Default adaptive setting:
+
+```yaml
+inference:
+  adaptive_top_k:
+    posterior_mass_target: 0.8
+    probe_experiments: 20
+    max_iterations: 14
+    tolerance: 0.02
+  approximation_thresholds:
+    - null
+    - 0.01
+    - name: approx_mass_0p8
+      top_k_cutoff: auto
+      adaptive_top_k: true
+      posterior_mass_target: 0.8
+```
+
+The adaptive search is deterministic bounded bisection, not simulated annealing. Pipeline I tunes once per model, term count, cutoff mode, and adaptive threshold label, using the first configured staged probe experiments for that term count. It logs `runtime_top_k_cutoff`, `mean_surviving_posterior_mass`, `adaptive_cutoff_search_runtime_sec`, and visualizable bisection evaluations under `visualization/tables/adaptive_topk_search_trace.*`; timed posterior inference remains separate from cutoff-search runtime. The adaptive top-k search figures use a single shared legend across term-count panels instead of repeating the same legend inside each subplot. Adaptive runs use their own `cutoff_topk` artifact per term count, and fixed-cutoff runs still reset `TOP_K_CUTOFF` before every measured posterior so runtime cutoff state cannot leak across measurements.
 
 ### Inference-time `readMNist` caching
 

@@ -20,6 +20,7 @@ from mnist_spll_pipeline_core import (
     build_pipeline_context,
     build_stage_metadata,
     get_cutoff_modes,
+    get_thresholds,
     load_json,
     stage_config_snapshot,
     write_json,
@@ -123,13 +124,11 @@ def load_payload_experiments(path: Path) -> List[Dict[str, Any]]:
 
 
 def ordered_threshold_labels(config: Dict[str, Any]) -> List[str]:
-    labels: List[str] = ["exact"]
-    thresholds = config.get("inference", {}).get("approximation_thresholds", [])
-    for value in thresholds:
-        if value is None:
-            continue
-        label = str(value).replace(".", "p")
-        labels.append(f"cutoff_{label}")
+    labels: List[str] = []
+    for threshold in get_thresholds(config):
+        labels.append(str(threshold["threshold_label"]))
+    if "exact" in labels:
+        labels = ["exact"] + [label for label in labels if label != "exact"]
     seen = set()
     ordered: List[str] = []
     for label in labels:
@@ -144,6 +143,8 @@ def non_exact_threshold_labels(threshold_order: Sequence[str]) -> List[str]:
 def pretty_threshold_label(label: str) -> str:
     if label == "exact":
         return "exact"
+    if label.startswith("approx_mass_"):
+        return "mass " + label.removeprefix("approx_mass_").replace("p", ".")
     if not label.startswith("cutoff_"):
         return label
     raw = label.removeprefix("cutoff_").replace("p", ".")
@@ -239,6 +240,9 @@ def summarize_groups(
         true_candidate_runtimes = finite_float_values(items, "true_candidate_runtime_sec")
         true_candidate_branch_counts = finite_float_values(items, "true_candidate_branch_count")
         precompute_runtimes = finite_float_values(items, "read_mnist_precompute_runtime_sec")
+        runtime_top_k_cutoffs = finite_float_values(items, "runtime_top_k_cutoff")
+        surviving_masses = finite_float_values(items, "mean_surviving_posterior_mass")
+        adaptive_search_runtimes = finite_float_values(items, "adaptive_cutoff_search_runtime_sec")
         true_candidate_precompute_runtimes = finite_float_values(
             items,
             "true_candidate_read_mnist_precompute_runtime_sec",
@@ -250,6 +254,12 @@ def summarize_groups(
                 "selected_epoch": int(first.get("selected_epoch", -1)),
                 "selected_test_accuracy": float(first.get("selected_test_accuracy", 0.0)),
                 "experiments": len(items),
+                "adaptive_top_k": bool(first.get("adaptive_top_k", False)),
+                "posterior_mass_target": first.get("posterior_mass_target"),
+                "mean_runtime_top_k_cutoff": mean_or_nan(runtime_top_k_cutoffs),
+                "median_runtime_top_k_cutoff": median_or_nan(runtime_top_k_cutoffs),
+                "mean_surviving_posterior_mass": mean_or_nan(surviving_masses),
+                "mean_adaptive_cutoff_search_runtime_sec": mean_or_nan(adaptive_search_runtimes),
                 "accuracy": mean(float(item["correct"]) for item in items),
                 "mean_runtime_sec": mean(runtimes),
                 "median_runtime_sec": median(runtimes),
@@ -438,6 +448,12 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "experiment_id": int(run["experiment_id"]),
                 "threshold_label": run["threshold_label"],
                 "cutoff": run["cutoff"],
+                "compile_cutoff": run.get("compile_cutoff", run.get("cutoff")),
+                "adaptive_top_k": bool(run.get("adaptive_top_k", False)),
+                "posterior_mass_target": run.get("posterior_mass_target"),
+                "runtime_top_k_cutoff": run.get("runtime_top_k_cutoff"),
+                "mean_surviving_posterior_mass": run.get("mean_surviving_posterior_mass"),
+                "adaptive_cutoff_search_runtime_sec": float(run.get("adaptive_cutoff_search_runtime_sec", 0.0)),
                 "n_terms": int(run["n_terms"]),
                 "true_sum": true_sum,
                 "predicted_sum": predicted_sum,
@@ -889,8 +905,13 @@ def positive_cutoff_thresholds(summary_rows: List[Dict[str, Any]], threshold_ord
         cutoff_values = [row.get("cutoff") for row in summary_rows if str(row.get("threshold_label")) == label]
         if not cutoff_values:
             continue
+        adaptive_values = [
+            bool(row.get("adaptive_top_k", False))
+            for row in summary_rows
+            if str(row.get("threshold_label")) == label
+        ]
         cutoff = cutoff_values[0]
-        if cutoff is None or float(cutoff) <= 0.0:
+        if (cutoff is None or float(cutoff) <= 0.0) and not any(adaptive_values):
             continue
         selected.append(label)
     return selected
@@ -1546,6 +1567,147 @@ def plot_target_vs_achieved(summary_rows: List[Dict[str, Any]], output_path: Pat
 
 
 
+
+def adaptive_topk_search_rows(raw_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, ...]] = set()
+    for run in raw_runs:
+        state = run.get("adaptive_cutoff_state")
+        if not isinstance(state, dict):
+            continue
+        evaluations = state.get("evaluations")
+        if not isinstance(evaluations, list) or not evaluations:
+            continue
+        runtime_cutoff_for_key = state.get("runtime_top_k_cutoff")
+        key = (
+            str(run.get("model_id")),
+            str(run.get("cutoff_mode", "global")),
+            int(run.get("n_terms", -1)),
+            str(run.get("threshold_label")),
+            tuple(state.get("probe_experiment_ids") or []),
+            None if runtime_cutoff_for_key is None else float(runtime_cutoff_for_key),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        for evaluation_index, evaluation in enumerate(evaluations):
+            cutoff = evaluation.get("cutoff")
+            surviving_mass = evaluation.get("mean_surviving_mass")
+            rows.append(
+                {
+                    "model_id": str(run.get("model_id")),
+                    "cutoff_mode": str(run.get("cutoff_mode", "global")),
+                    "n_terms": int(run.get("n_terms", -1)),
+                    "threshold_label": str(run.get("threshold_label")),
+                    "artifact_threshold_label": str(run.get("artifact_threshold_label", "")),
+                    "posterior_mass_target": state.get("posterior_mass_target", run.get("posterior_mass_target")),
+                    "runtime_top_k_cutoff": state.get("runtime_top_k_cutoff", run.get("runtime_top_k_cutoff")),
+                    "selected_mean_surviving_posterior_mass": state.get("mean_surviving_posterior_mass"),
+                    "selected_abs_error": state.get("abs_error"),
+                    "iterations": state.get("iterations"),
+                    "converged": state.get("converged"),
+                    "probe_experiments": state.get("probe_experiments"),
+                    "search_runtime_sec": state.get("search_runtime_sec"),
+                    "evaluation_index": int(evaluation_index),
+                    "candidate_cutoff": None if cutoff is None else float(cutoff),
+                    "mean_surviving_mass": None if surviving_mass is None else float(surviving_mass),
+                }
+            )
+    return rows
+
+
+def plot_adaptive_topk_search_iterations(
+    *,
+    search_rows: List[Dict[str, Any]],
+    summary_rows: List[Dict[str, Any]],
+    term_counts: Sequence[int],
+    value_key: str,
+    ylabel: str,
+    output_path: Path,
+    show_target: bool = False,
+    ylim: Tuple[float, float] | None = None,
+) -> None:
+    if not search_rows:
+        return
+    nrows, ncols = term_panel_grid(term_counts)
+    fig, axes_grid = plt.subplots(nrows, ncols, figsize=(5.4 * ncols, 4.2 * nrows), squeeze=False)
+    axes = list(axes_grid.flatten())
+    model_styles = build_model_styles(summary_rows)
+    threshold_styles = cutoff_marker_styles(sorted({str(row["threshold_label"]) for row in search_rows}))
+    legend_handles: Dict[str, Any] = {}
+    plotted_any = False
+
+    for ax_idx, n_terms in enumerate(term_counts):
+        ax = axes[ax_idx]
+        term_rows = [row for row in search_rows if int(row.get("n_terms", -1)) == int(n_terms)]
+        for key in sorted({(str(row["model_id"]), str(row["threshold_label"])) for row in term_rows}):
+            model_id, threshold_label_value = key
+            group = [row for row in term_rows if str(row["model_id"]) == model_id and str(row["threshold_label"]) == threshold_label_value]
+            by_eval: Dict[int, List[float]] = defaultdict(list)
+            selected_values: List[float] = []
+            for row in group:
+                eval_idx = int(row["evaluation_index"])
+                value = row.get(value_key)
+                if value is None:
+                    continue
+                by_eval[eval_idx].append(float(value))
+                if value_key == "candidate_cutoff" and row.get("runtime_top_k_cutoff") is not None:
+                    selected_values.append(float(row["runtime_top_k_cutoff"]))
+            if not by_eval:
+                continue
+            xs = sorted(by_eval)
+            ys = [float(sum(by_eval[x]) / len(by_eval[x])) for x in xs]
+            style = model_styles.get(model_id, {"color": "#4d4d4d", "label": model_id})
+            marker = threshold_styles.get(threshold_label_value, {"marker": "o"})["marker"]
+            label = f"{style.get('label', model_id)} / {pretty_threshold_label(threshold_label_value)}"
+            line, = ax.plot(xs, ys, marker=marker, markersize=4, linewidth=1.6, color=style["color"], label=label)
+            legend_handles.setdefault(label, line)
+            if value_key == "candidate_cutoff" and selected_values:
+                selected_mean = float(sum(selected_values) / len(selected_values))
+                ax.scatter([max(xs) + 0.5], [selected_mean], marker="X", s=56, color=style["color"], zorder=4)
+            if show_target:
+                targets = [float(row["posterior_mass_target"]) for row in group if row.get("posterior_mass_target") is not None]
+                if targets:
+                    ax.axhline(sum(targets) / len(targets), color=style["color"], linestyle="--", linewidth=1.0, alpha=0.55)
+            plotted_any = True
+        ax.set_title(f"{int(n_terms)} terms", loc="left")
+        ax.set_xlabel("Cutoff-search iteration" + ("; X = selected cutoff" if value_key == "candidate_cutoff" else ""))
+        ax.set_ylabel(ylabel)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.grid(True, alpha=0.35)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    finish_panel_grid(fig, axes, len(term_counts))
+    if not plotted_any:
+        plt.close(fig)
+        return
+    title = "Adaptive top-k cutoff search path" if value_key == "candidate_cutoff" else "Adaptive top-k retained-mass search path"
+    fig.suptitle(title, y=0.995)
+    if legend_handles:
+        fig.legend(
+            list(legend_handles.values()),
+            list(legend_handles.keys()),
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.04),
+            ncol=min(3, len(legend_handles)),
+            fontsize=8,
+            frameon=True,
+        )
+    fig.text(
+        0.01,
+        0.01,
+        "No rolling mean: bisection evaluations are deterministic bracket probes; smoothing would hide convergence behavior.",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+    )
+    fig.tight_layout(rect=(0, 0.14 if legend_handles else 0.035, 1, 0.96))
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order: Sequence[str]) -> None:
     lines = [
         "Visualization bundle generated by visualize_results.py",
@@ -1566,6 +1728,8 @@ def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order:
         "",
         "Appendix / supporting figures:",
         "- target_vs_achieved_model_accuracy.png",
+        "- adaptive_topk_search_cutoff_iterations_by_terms.png",
+        "- adaptive_topk_search_mass_iterations_by_terms.png",
         "- heatmap_accuracy_by_model.png",
         "- heatmap_output_pool_by_model.png",
         "- heatmap_speedup_by_model.png",
@@ -1580,6 +1744,7 @@ def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order:
         "- summary_results.json",
         "- overhead_exact_vs_zero_summary.csv",
         "- model_accuracy_targets.csv",
+        "- adaptive_topk_search_trace.csv",
         "",
         f"Terms shown: {', '.join(str(value) for value in term_counts)}",
         f"Cutoffs shown: {', '.join(pretty_threshold_label(label) for label in threshold_order)}",
@@ -1607,6 +1772,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     stage_message(2, 3, "Computing derived metrics and exact-baseline deltas")
     top_n = int(ctx.inference_cfg.get("top_predictions_to_store", 5))
     detailed_rows = prepare_detailed_rows(raw_runs, top_n=top_n)
+    adaptive_search_rows = adaptive_topk_search_rows(raw_runs)
     summary_by_terms = summarize_groups(
         detailed_rows,
         group_keys=["cutoff_mode", "model_id", "n_terms", "threshold_label", "cutoff"],
@@ -1628,6 +1794,8 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
 
     write_csv(table_dir / "detailed_results.csv", detailed_rows)
     write_csv(table_dir / "summary_results.csv", summary_by_terms)
+    write_csv(table_dir / "adaptive_topk_search_trace.csv", adaptive_search_rows)
+    write_json(table_dir / "adaptive_topk_search_trace.json", adaptive_search_rows)
     write_json(
         table_dir / "summary_results.json",
         {
@@ -1637,6 +1805,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
                 extra={
                     "num_detailed_rows": len(detailed_rows),
                     "num_summary_rows": len(summary_by_terms),
+                    "num_adaptive_topk_search_rows": len(adaptive_search_rows),
                     "raw_inference_source": str(ctx.paths.inference_runs_path),
                     "cutoff_mode": cutoff_mode,
                 },
@@ -1738,6 +1907,24 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         output_path=appendix_dir / "target_vs_achieved_model_accuracy.png",
     )
     write_csv(table_dir / "model_accuracy_targets.csv", target_rows)
+    plot_adaptive_topk_search_iterations(
+        search_rows=[row for row in adaptive_search_rows if str(row.get("cutoff_mode", "global")) == cutoff_mode],
+        summary_rows=mode_rows,
+        term_counts=term_counts,
+        value_key="candidate_cutoff",
+        ylabel="Candidate TOP_K_CUTOFF",
+        output_path=appendix_dir / "adaptive_topk_search_cutoff_iterations_by_terms.png",
+    )
+    plot_adaptive_topk_search_iterations(
+        search_rows=[row for row in adaptive_search_rows if str(row.get("cutoff_mode", "global")) == cutoff_mode],
+        summary_rows=mode_rows,
+        term_counts=term_counts,
+        value_key="mean_surviving_mass",
+        ylabel="Mean surviving posterior mass",
+        output_path=appendix_dir / "adaptive_topk_search_mass_iterations_by_terms.png",
+        show_target=True,
+        ylim=(0.0, 1.05),
+    )
 
     for spec in heatmap_specs():
         plot_heatmap_metric(

@@ -17,7 +17,7 @@ data:
     std: 0.3081
   augmentation: none
   image_cache_device: device   # device | cpu
-  image_cache_strategy: lru    # none | lru
+  image_cache_strategy: none    # none | lru
   image_cache_max_items: 4096
 
 model:
@@ -40,7 +40,7 @@ training:
   # Number of SPLL sum cases accumulated into one optimizer update.
   # With validation.interval_steps=100, sum_batch_size=100 validates after each batch.
   sum_batch_size: 1
-  max_steps: 1000000   # measured in training sum cases, not optimizer updates
+  max_steps: 10000     # measured in training sum cases, not optimizer updates
   loss_epsilon: 1.0e-12
 
 validation:
@@ -67,6 +67,16 @@ validation:
 schedule:
   preview_size: 20
 
+adaptive_top_k:
+  # Adaptive approximate modes tune the generated artifact's mutable TOP_K_CUTOFF
+  # so the full posterior keeps about this much unnormalised mass.
+  posterior_mass_target: 0.8
+  probe_cases: 20
+  max_iterations: 14
+  tolerance: 0.02
+  min_cutoff: 0.0
+  max_cutoff: 1.0
+
 visualization:
   trace_smoothing_window_points: 100
   # Across-seed uncertainty shown in milestone error bars and smoothed traces.
@@ -82,11 +92,15 @@ visualization:
 experiments:
   - n_terms: 2
     enabled: true
-    max_steps: 1000000
+    max_steps: 10000
 
 inference_modes:
   - name: exact
     top_k_cutoff: null
+  - name: approx_mass_0p8
+    top_k_cutoff: auto
+    adaptive_top_k: true
+    posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
   - name: approx_0p05

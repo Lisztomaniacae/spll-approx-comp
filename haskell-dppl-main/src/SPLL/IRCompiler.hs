@@ -369,6 +369,10 @@ toIRNormalParams meta (InjF _ "mult" [e0, e1])
       (mu1, s1) <- toIRNormalParams meta e1
       det0 <- toIRGenerate meta e0
       return (IROp OpMult mu1 det0, IROp OpMult s1 (IRUnaryOp OpAbs det0))
+toIRNormalParams meta (InjF _ "neg" [e])
+  | pType (getTypeInfo e) == PNormal = do
+      (mu, s) <- toIRNormalParams meta e
+      return (IRUnaryOp OpNeg mu, s)
 toIRNormalParams meta (InjF _ "log" [e])
   | pType (getTypeInfo e) == PLogNormal = toIRLogNormalParams meta e
 toIRNormalParams meta (Var _ name)
@@ -898,21 +902,62 @@ toIRInference meta False (InjF TypeInfo {tags=extras, rType=rt} name [left, righ
 
   -- We now compute
   -- for each e in leftEnum:
-  --   sum += if invExpr(e, sample) in rightEnum then pLeft(e) * pRight(sample - e) else 0
-  -- For that we name e like the lhs of
-  -- We need to unfold the monad stack, because the EnumSum Works like a lambda expression and has a local scope
+  --   inv = invExpr(e, sample)
+  --   if inv not in rightEnum:
+  --     contribute 0 without evaluating left or right
+  --   else:
+  --     pLeft = P(left = e)
+  --     if acc_prob * pLeft <= TOP_K_CUTOFF:
+  --       contribute 0 without evaluating right
+  --     else:
+  --       contribute pLeft * P(right = inv)
+  --
+  -- The guard ordering matters because generated Python let-bindings are eager.
+  -- Therefore left/right inference bindings are captured in nested writers and
+  -- placed inside IRIf branches explicitly instead of being emitted before the
+  -- applicability/top-k tests.
   irTuple <- lift (runWriterT (do
-    -- the subexpr in the loop must compute p(enumVar| left) * p(inverse | right)
     setVariables [(x3, sample)]
-    (pLeft, _, _) <- toIRInference meta False left (IRVar x2)
-    (pRight, _, _) <- toIRInference meta False right invExpr
 
-    let returnExpr = case topKThreshold (compilerConfig meta) of
-          Nothing -> IRIf (IRIsPossible enumListR invExpr) (IROp OpMult pLeft pRight) (IRConst (VFloat 0))
-          Just _ -> IRIf (IROp OpAnd (IRIsPossible enumListR invExpr) (IROp OpGreaterThan (IROp OpMult (accProb meta) pLeft) (IRVar "TOP_K_CUTOFF"))) (IROp OpMult pLeft pRight) (IRConst (VFloat 0))
+    -- Compile the left side in a nested writer so its bindings can live under
+    -- the isPossible guard. This avoids NN calls for impossible inverses such as
+    -- sample-a outside the digit domain.
+    ((pLeft, _, _), pLeftBinds) <- lift $ runWriterT $
+      toIRInference meta False left (IRVar x2)
+
+    let possible = IRIsPossible enumListR invExpr
+    let accLeft = IROp OpMult (accProb meta) pLeft
+    let cutoffOk = case topKThreshold (compilerConfig meta) of
+          Nothing -> IRConst (VBool True)
+          Just _  -> IROp OpGreaterThan accLeft (IRVar "TOP_K_CUTOFF")
+
+    -- Propagate the accumulated prefix probability into the right side. This is
+    -- semantically important for nested enumerable/composite right expressions:
+    -- their own top-k checks must see acc_prob * pLeft, not the old acc_prob.
+    ((pRight, _, _), pRightBinds) <- lift $ runWriterT $
+      toIRInference (meta { accProb = accLeft }) False right invExpr
+
+    let withLeft = generateLetInExpr pLeftBinds
+    let withRight = generateLetInExpr pRightBinds
+    let zero = IRConst (VFloat 0)
+
+    -- Probability contribution: possible -> left -> cutoff -> right.
+    -- This ordering prevents both invalid-inverse left calls and pruned right calls.
+    let returnExpr = IRIf possible
+          (withLeft $ IRIf cutoffOk
+            (withRight $ IROp OpMult pLeft pRight)
+            zero)
+          zero
+
+    -- Branch count intentionally does not compile/evaluate the right side. It
+    -- still needs pLeft when top-k is enabled, because pruning depends on the
+    -- left prefix mass. Without top-k it is just the count of feasible inverses.
     let branchesExpr = case topKThreshold (compilerConfig meta) of
-          Nothing -> IRIf (IRIsPossible enumListR invExpr) (IRConst (VFloat 1)) (IRConst (VFloat 0))
-          Just _ -> IRIf (IROp OpAnd (IRIsPossible enumListR invExpr) (IROp OpGreaterThan (IROp OpMult (accProb meta) pLeft) (IRVar "TOP_K_CUTOFF"))) (IRConst (VFloat 1)) (IRConst (VFloat 0))
+          Nothing -> IRIf possible (IRConst (VFloat 1)) zero
+          Just _  -> IRIf possible
+                       (withLeft $ IRIf cutoffOk (IRConst (VFloat 1)) zero)
+                       zero
+
     return (returnExpr, const0, branchesExpr)
     )) <&> generateLetInBlock meta
   uniquePrefix <- mkVariable ""

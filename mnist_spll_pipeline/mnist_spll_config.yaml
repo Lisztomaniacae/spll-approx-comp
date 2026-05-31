@@ -163,19 +163,37 @@ training:
 
 inference:
   device: auto
-  num_experiments: 300
+  num_experiments: 100
   terms_per_sum_min: 2
   terms_per_sum_max: 4
   sample_without_replacement_within_experiment: true
   top_predictions_to_store: 5
   # In this repo, -k/--topKCutoff is a probability cutoff in [0, 1], not a literal class count.
-  # Use null for exact inference (no pruning).
-  approximation_thresholds: [null, 0.00, 0.01, 0.05, 0.1, 0.25]
+  # Use null for exact inference (no pruning). Numeric values are fixed cutoffs.
+  # Mapping entries can tune TOP_K_CUTOFF at runtime to capture a target posterior mass.
+  adaptive_top_k:
+    posterior_mass_target: 0.8
+    probe_experiments: 20
+    max_iterations: 14
+    tolerance: 0.01
+    min_cutoff: 0.0
+    max_cutoff: 1.0
+  approximation_thresholds:
+    - null
+    - 0.00
+    - 0.01
+    - 0.05
+    - 0.1
+    - 0.25
+    - name: approx_mass_0p8
+      top_k_cutoff: auto
+      adaptive_top_k: true
+      posterior_mass_target: 0.8
   # The pipeline uses the accumulated global path-mass cutoff.
   # `null` is the exact baseline (no pruning); all positive values below are global-cutoff runs.
   cutoff_modes:
   # Compile with SPLL's -c/--countBranches so each posterior query also returns a branch count.
-  count_branches: true
+  count_branches: false
   force_recompile: true
   compile_timeout_sec: 3600
   stack_arch: x86_64
@@ -185,7 +203,7 @@ inference:
   # - uncached: default thesis timing policy; every generated-SPLL readMNist call runs the MNIST model
   # - run_scoped_no_cross_run_cache: fresh cache per measured posterior/true-candidate query
   # - precomputed_per_measurement: fresh per-measurement lookup-only neural outputs; precompute time is logged separately
-  read_mnist_cache_policy: uncached
+  read_mnist_cache_policy: precomputed_per_measurement
   # Optional diagnostic-only untimed base readMNist calls before measured inference.
   # Keep this at 0 for thesis-facing benchmarks so cold-start effects are measured.
   read_mnist_warmup_calls: 0

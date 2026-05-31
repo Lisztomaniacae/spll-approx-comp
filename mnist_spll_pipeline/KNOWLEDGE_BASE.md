@@ -82,7 +82,7 @@ train_mnist.py
         v
 compile_spll.py
         |-- outputs/spll_experiments/generated/spll_programs/sum_XX.spll
-        |-- outputs/spll_experiments/generated/compiled_python/global/sum_XX/<threshold_label>/program.py
+        |-- outputs/spll_experiments/generated/compiled_python/global/sum_XX/<artifact_threshold_label>/program.py
         |-- outputs/spll_experiments/compile_manifest.json
         |
         v
@@ -163,7 +163,8 @@ Important keys under `inference:`:
 | `terms_per_sum_min`, `terms_per_sum_max` | Inclusive term-count range. A separate SPLL program is generated for each term count. |
 | `sample_without_replacement_within_experiment` | If true, one staged sum does not reuse the same inference example twice. |
 | `top_predictions_to_store` | Number of top posterior candidates serialized in detailed visualization rows. |
-| `approximation_thresholds` | List of thresholds. `null` means exact/no pruning. Numeric values mean approximate pruning thresholds. |
+| `approximation_thresholds` | List of threshold specs. `null` means exact/no pruning, numeric values mean fixed approximate pruning thresholds, and mapping entries with `top_k_cutoff: auto` enable adaptive posterior-mass cutoff tuning. |
+| `adaptive_top_k` | Optional defaults for Pipeline I adaptive threshold entries: `posterior_mass_target`, `probe_experiments`, `max_iterations`, `tolerance`, `min_cutoff`, and `max_cutoff`. |
 | `count_branches` | If true, SPLL compilation uses `-c` and compiled probability calls return branch metadata. |
 | `force_recompile` | If false and a compiled `program.py` already exists, compile can skip regeneration. |
 | `compile_timeout_sec` | Timeout for the Stack compilation subprocess. |
@@ -178,7 +179,28 @@ Current interpretation:
 
 - `null` in YAML -> exact baseline, no pruning flag passed to SPLL;
 - `0.0` -> approximate code path with zero cutoff; useful for measuring overhead of the approximation machinery versus exact;
-- positive numbers such as `0.01`, `0.05`, `0.1`, `0.25` -> approximate pruning runs.
+- positive numbers such as `0.01`, `0.05`, `0.1`, `0.25` -> fixed approximate pruning runs;
+- mapping entries with `top_k_cutoff: auto`, `adaptive_top_k: true`, and `posterior_mass_target` -> adaptive approximate runs. They compile through SPLL's approximate code path with seed cutoff `0.0`, into the dedicated artifact label `cutoff_topk`, and tune the generated module-level `TOP_K_CUTOFF` at runtime.
+
+Pipeline I adaptive threshold example:
+
+```yaml
+inference:
+  adaptive_top_k:
+    posterior_mass_target: 0.8
+    probe_experiments: 20
+    max_iterations: 14
+    tolerance: 0.02
+  approximation_thresholds:
+    - null
+    - 0.01
+    - name: approx_mass_0p8
+      top_k_cutoff: auto
+      adaptive_top_k: true
+      posterior_mass_target: 0.8
+```
+
+Pipeline I tuning is deterministic bounded monotone bisection over cutoff values. It runs once per `(model_id, cutoff_mode, n_terms, adaptive threshold label)` using the first configured staged probe experiments for that term count. The search objective is mean unnormalised posterior mass that survives pruning across full candidate-sum enumeration. Timed posterior inference remains separate from cutoff-search runtime, and raw runs log `runtime_top_k_cutoff`, `mean_surviving_posterior_mass`, `adaptive_cutoff_search_runtime_sec`, the complete `adaptive_cutoff_state`, and visualizable bisection rows in `visualization/tables/adaptive_topk_search_trace.*`. The Pipeline I adaptive top-k search figures share one figure-level legend across all term-count panels; do not reintroduce per-panel duplicate legends unless the plotted series differ by panel. Adaptive thresholds compile into their own `cutoff_topk` artifact directory for each term count, while numeric `0.0` remains `cutoff_0p0`; `InferenceRunEngine.run_one` still resets `TOP_K_CUTOFF` before every fixed-cutoff run so runtime state cannot leak across measurements.
 
 ### Cutoff mode caveat
 
@@ -259,16 +281,18 @@ compile_spll.run_compile_stage(config)
 
 Main responsibilities:
 
-1. derive thresholds, term counts, and fixed cutoff mode;
+1. derive normalized threshold specs, term counts, and fixed cutoff mode;
 2. write one SPLL source program per term count;
-3. compile each `(cutoff_mode, n_terms, threshold)` target;
+3. compile each unique `(cutoff_mode, n_terms, compile_cutoff, artifact_label)` artifact; adaptive posterior-mass thresholds use artifact label `cutoff_topk`;
 4. copy `pythonLib.py` beside each generated `program.py`;
 5. write `compile_manifest.json`.
+
+Adaptive Pipeline I thresholds have a distinct user-facing `threshold_label` such as `approx_mass_0p8`, but their `compile_cutoff` is `0.0` and their compiled artifact label is `cutoff_topk`. This keeps the adaptive generated artifact separate from fixed numeric `cutoff_0p0`; runtime code is still responsible for setting/resetting `TOP_K_CUTOFF` for the actual measurement.
 
 Canonical compiled artifact path:
 
 ```text
-outputs/spll_experiments/generated/compiled_python/global/sum_XX/<threshold_label>/program.py
+outputs/spll_experiments/generated/compiled_python/global/sum_XX/<artifact_threshold_label>/program.py
 ```
 
 The canonical path helper is:
@@ -393,7 +417,8 @@ Raw run schema highlights:
 | `cutoff_mode` | Currently always `global`. |
 | `n_terms` | Number of MNIST digits in the sum. |
 | `cutoff` | `null`, `0.0`, or positive cutoff. |
-| `threshold_label` | Stable label such as `exact`, `cutoff_0p01`. |
+| `threshold_label` | User-facing run label such as `exact`, `cutoff_0p01`, or `approx_mass_0p8`. |
+| `artifact_threshold_label` | Compiled artifact directory label; adaptive posterior-mass runs use `cutoff_topk`. |
 | `candidate_sums` | All queried candidate sums, normally `[0, ..., 9 * n_terms]`. |
 | `posterior_raw` | Raw, unnormalized probability/mass for each candidate. |
 | `branch_counts_raw` | Branch count per candidate, or `null` values if unavailable. |
@@ -715,6 +740,8 @@ Avoid creating GitHub issues or PRs unless the user explicitly asks. If asked fo
 | Approximate | SPLL compilation/inference with numeric pruning threshold passed via `-k`. |
 | `0.0` cutoff | Approximate code path with zero cutoff; useful for overhead comparison, not identical to exact. |
 | Global cutoff | Current accumulated global path-mass pruning mode; fixed pipeline policy. |
+| Adaptive top-k / posterior-mass mode | Pipeline I threshold spec or Pipeline II inference mode that mutates generated `TOP_K_CUTOFF` to target a configured surviving posterior mass, defaulting to `0.8`. |
+| Runtime top-k cutoff | The selected mutable `TOP_K_CUTOFF` value used by an adaptive mode for the current model snapshot. |
 | Candidate sum | One possible output sum from `0` to `9 * n_terms`. |
 | Full posterior | Querying every candidate sum for one staged experiment. |
 | True candidate | The ground-truth sum from labels, queried separately after the full posterior. |
@@ -791,12 +818,22 @@ Within one sum case, repeated digits must use distinct MNIST image indices. Acro
 
 ### 14.5 Exact and approximate modes
 
-Initial Pipeline II modes:
+Current Pipeline II modes include both fixed-cutoff and adaptive-posterior-mass approximation:
 
 ```yaml
+adaptive_top_k:
+  posterior_mass_target: 0.8
+  probe_cases: 20
+  max_iterations: 14
+  tolerance: 0.02
+
 inference_modes:
   - name: exact
     top_k_cutoff: null
+  - name: approx_mass_0p8
+    top_k_cutoff: auto
+    adaptive_top_k: true
+    posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
   - name: approx_0p05
@@ -805,7 +842,9 @@ inference_modes:
     top_k_cutoff: 0.1
 ```
 
-`exact` means true exact compilation without `-k`. A `-k 0.0` overhead mode is intentionally not part of the first Pipeline II run, but can be added later as another inference mode.
+`exact` means true exact compilation without `-k`. Fixed numeric modes compile and run with that numeric threshold. Adaptive modes compile through the approximate code path using `-k 0.0` as the seed artifact, then mutate the generated module-level `TOP_K_CUTOFF` at runtime. The target is the mean unnormalised posterior mass that survives pruning when the validator enumerates all candidate sums.
+
+Adaptive cutoff search is deterministic bounded monotone bisection, not simulated annealing. This was chosen because increasing `TOP_K_CUTOFF` should only prune more branch mass, so a one-dimensional bounded search is faster, reproducible, and easier to defend experimentally. The search uses deterministic validation-style probe cases from the current model snapshot, stores the selected runtime cutoff in traces/summaries, and refreshes the trainer cutoff before preflight, validation submissions, synchronous validations, and final validation. Async validation workers tune their own loaded snapshot independently.
 
 Branch counting is enabled by default as sanity metadata. The loss uses only the probability component of the generated return value.
 
@@ -819,8 +858,8 @@ Validation is interval-based. For each validation sum case, the validator enumer
 
 Important run artifacts:
 
-- `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, and gradient norm;
-- `validation_trace.csv`: backward-compatible `digit_accuracy` alias plus `sum_posterior_accuracy`, validation-case count, candidate count, mean true/predicted/total posterior mass, zero-total posterior rate, tie rate, validation branch-count mean, recent train means, validation snapshot step, trainer step when submitted/recorded, and validation lag in steps;
+- `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, gradient norm, and adaptive-cutoff metadata when applicable;
+- `validation_trace.csv`: backward-compatible `digit_accuracy` alias plus `sum_posterior_accuracy`, validation-case count, candidate count, mean true/predicted/total posterior mass, zero-total posterior rate, tie rate, validation branch-count mean, recent train means, validation snapshot step, trainer step when submitted/recorded, validation lag in steps, and adaptive runtime cutoff/search metadata when applicable;
 - `milestones.json`: first observed step/time for each milestone;
 - `checkpoints/milestone_*.pt`: first crossing snapshots;
 - `checkpoints/final.pt`: final snapshot.
@@ -828,10 +867,10 @@ Important run artifacts:
 Visualization behavior:
 
 - `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final sum-posterior accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
-- `visualize_spll_training.py` also writes `milestone_aggregate_summary.*`, which stores per-`(n_terms, mode, milestone)` reached-seed counts, means, sample standard deviations, configured uncertainty half-widths, and min/max values for steps and wall-clock time.
+- `visualize_spll_training.py` also writes `milestone_aggregate_summary.*`, which stores per-`(n_terms, mode, milestone)` reached-seed counts, means, sample standard deviations, configured uncertainty half-widths, and min/max values for steps and wall-clock time. It additionally writes `adaptive_topk_events.*` and `adaptive_topk_search_trace.*` when adaptive modes are present.
 - Main-text Pipeline II milestone figures for steps and wall-clock time are grouped bar charts split by arity: milestones are on the x-axis, the metric is on the y-axis, and inference modes are bars within each milestone group. Values are averaged across reached seeds for the same `(n_terms, mode, milestone)` cell, with configurable across-seed error bars enabled by default.
 - Pipeline II visualization uses a stable color map derived from inference-mode order. The same mode color is reused across steps-to-milestone, time-to-milestone, and trace figures.
-- Main-text Pipeline II trace figures compute rolling traces per seed first, then plot the across-seed mean with configurable uncertainty bands. This avoids hiding seed variability by smoothing only after aggregation. Raw traces are still exported to appendix figures with `_raw_trace` in the file name; raw uncertainty bands are disabled by default to keep appendix plots readable.
+- Main-text Pipeline II trace figures compute rolling traces per seed first, then plot the across-seed mean with configurable uncertainty bands. This avoids hiding seed variability by smoothing only after aggregation. Raw traces are still exported to appendix figures with `_raw_trace` in the file name; raw uncertainty bands are disabled by default to keep appendix plots readable. Adaptive top-k cutoff and mass traces intentionally do **not** use rolling means because the values are calibrated control settings and deterministic bisection probes; smoothing would hide refresh jumps and convergence behavior.
 - Milestone figures keep unreached modes visible via summary tables and a plot footnote instead of silently pretending missing modes do not exist.
 - Wall-clock milestone plots may use a log y-axis when values span more than about 5x; tick labels should remain readable scalar seconds, not opaque scientific notation.
 

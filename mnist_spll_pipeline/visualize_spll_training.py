@@ -153,6 +153,9 @@ def _collect_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "n_terms": n_terms,
                             "mode_name": mode_name,
                             "top_k_cutoff": mode.get("top_k_cutoff"),
+                            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+                            "posterior_mass_target": mode.get("posterior_mass_target"),
+                            "runtime_top_k_cutoff": summary.get("runtime_top_k_cutoff"),
                             "milestone": float(milestone),
                             "reached": bool(info.get("reached", False)),
                             "step": info.get("step"),
@@ -209,6 +212,9 @@ def _collect_milestone_aggregates(config: Dict[str, Any], rows: List[Dict[str, A
                 "n_terms": n_terms,
                 "mode_name": mode_name,
                 "top_k_cutoff": group_rows[0].get("top_k_cutoff") if group_rows else None,
+                "adaptive_top_k": group_rows[0].get("adaptive_top_k") if group_rows else None,
+                "posterior_mass_target": group_rows[0].get("posterior_mass_target") if group_rows else None,
+                "runtime_top_k_cutoff_mean": _mean([float(row["runtime_top_k_cutoff"]) for row in group_rows if row.get("runtime_top_k_cutoff") not in {None, ""}]),
                 "milestone": milestone,
                 "configured_seed_count": configured_seed_count,
                 "observed_seed_count": len({int(row["seed"]) for row in group_rows}),
@@ -304,6 +310,9 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "n_terms": n_terms,
                             "mode_name": mode_name,
                             "top_k_cutoff": mode.get("top_k_cutoff"),
+                            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+                            "posterior_mass_target": mode.get("posterior_mass_target"),
+                            "runtime_top_k_cutoff": None,
                             "status": "failed_or_missing" if failure_path.exists() else "missing",
                             "failure_report": str(failure_path) if failure_path.exists() else "",
                             "final_step": None,
@@ -352,6 +361,9 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "n_terms": n_terms,
                         "mode_name": mode_name,
                         "top_k_cutoff": mode.get("top_k_cutoff"),
+                        "adaptive_top_k": bool(summary.get("adaptive_top_k", mode.get("adaptive_top_k", False))),
+                        "posterior_mass_target": summary.get("posterior_mass_target", mode.get("posterior_mass_target")),
+                        "runtime_top_k_cutoff": summary.get("runtime_top_k_cutoff"),
                         "status": "ok",
                         "failure_report": "",
                         "final_step": final_step,
@@ -369,6 +381,31 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "final_true_mass": final_true_mass,
                     }
                 )
+    return rows
+
+
+def _collect_adaptive_topk_trace_rows(config: Dict[str, Any], filename: str) -> List[Dict[str, Any]]:
+    paths = training_paths(config)
+    rows: List[Dict[str, Any]] = []
+    for seed in get_seeds(config):
+        for experiment in get_experiments(config):
+            n_terms = int(experiment["n_terms"])
+            for mode in get_inference_modes(config):
+                if not bool(mode.get("adaptive_top_k", False)):
+                    continue
+                mode_name = str(mode["name"])
+                trace_path = run_dir(paths, seed, n_terms, mode_name) / filename
+                for row in _read_trace_csv(trace_path):
+                    enriched = dict(row)
+                    enriched.update(
+                        {
+                            "seed": int(seed),
+                            "n_terms": int(n_terms),
+                            "mode_name": mode_name,
+                            "posterior_mass_target_config": mode.get("posterior_mass_target"),
+                        }
+                    )
+                    rows.append(enriched)
     return rows
 
 
@@ -664,6 +701,163 @@ def _plot_trace(
     plt.close(fig)
 
 
+
+def _adaptive_mode_names(config: Dict[str, Any]) -> List[str]:
+    return [str(mode["name"]) for mode in get_inference_modes(config) if bool(mode.get("adaptive_top_k", False))]
+
+
+def _mode_posterior_mass_target(config: Dict[str, Any], mode_name: str) -> Optional[float]:
+    for mode in get_inference_modes(config):
+        if str(mode["name"]) == str(mode_name):
+            return _safe_float(mode.get("posterior_mass_target"))
+    return None
+
+
+def _add_no_smoothing_note(fig: Any, y: float = 0.015) -> None:
+    fig.text(
+        0.01,
+        y,
+        "No rolling mean: adaptive top-k values are calibrated control settings, not noisy per-batch observations.",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+    )
+
+
+def _plot_adaptive_topk_event_trace(
+    *,
+    config: Dict[str, Any],
+    n_terms: int,
+    value_key: str,
+    ylabel: str,
+    output_path: Path,
+    show_target: bool = False,
+    ylim: Optional[Tuple[float, float]] = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    colors = _mode_color_map(config)
+    plotted = False
+    for mode_name in _adaptive_mode_names(config):
+        xs, ys, lowers, uppers, _counts = _merged_trace_stats(
+            config,
+            n_terms,
+            mode_name,
+            "adaptive_topk_events.csv",
+            value_key,
+            smooth_window=1,
+        )
+        if not xs:
+            continue
+        ax.step(xs, ys, where="post", label=mode_name, linewidth=1.7, color=colors[mode_name])
+        ax.scatter(xs, ys, s=18, color=colors[mode_name], zorder=3)
+        if show_target:
+            target = _mode_posterior_mass_target(config, mode_name)
+            if target is not None:
+                ax.axhline(target, color=colors[mode_name], linestyle="--", linewidth=1.0, alpha=0.65)
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(f"{n_terms}-term SPLL training: adaptive top-k {ylabel}", loc="left")
+    ax.set_xlabel("Training step at cutoff refresh")
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(True, alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
+    _add_no_smoothing_note(fig)
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _latest_search_event_rows(
+    *,
+    config: Dict[str, Any],
+    seed: int,
+    n_terms: int,
+    mode_name: str,
+) -> List[Dict[str, str]]:
+    paths = training_paths(config)
+    rows = _read_trace_csv(run_dir(paths, seed, n_terms, mode_name) / "adaptive_topk_search_trace.csv")
+    if not rows:
+        return []
+    valid_steps = [_safe_int(row.get("step")) for row in rows]
+    latest_step = max((value for value in valid_steps if value is not None), default=None)
+    if latest_step is None:
+        return []
+    latest_rows = [row for row in rows if _safe_int(row.get("step")) == latest_step]
+    if not latest_rows:
+        return []
+    # If several refresh reasons happened at the same step, keep the last one as
+    # written in the trace. This is usually final_validation at run end.
+    latest_reason = latest_rows[-1].get("reason")
+    return [row for row in latest_rows if row.get("reason") == latest_reason]
+
+
+def _plot_adaptive_topk_search_iterations(
+    *,
+    config: Dict[str, Any],
+    n_terms: int,
+    value_key: str,
+    ylabel: str,
+    output_path: Path,
+    show_target: bool = False,
+    ylim: Optional[Tuple[float, float]] = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    colors = _mode_color_map(config)
+    plotted = False
+    for mode_name in _adaptive_mode_names(config):
+        by_eval: Dict[int, List[float]] = {}
+        selected_cutoffs: List[float] = []
+        for seed in get_seeds(config):
+            event_rows = _latest_search_event_rows(config=config, seed=int(seed), n_terms=n_terms, mode_name=mode_name)
+            if not event_rows:
+                continue
+            selected = _safe_float(event_rows[0].get("runtime_top_k_cutoff"))
+            if selected is not None:
+                selected_cutoffs.append(selected)
+            for row in event_rows:
+                eval_idx = _safe_int(row.get("evaluation_index"))
+                value = _safe_float(row.get(value_key))
+                if eval_idx is None or value is None:
+                    continue
+                by_eval.setdefault(eval_idx, []).append(value)
+        if not by_eval:
+            continue
+        xs = sorted(by_eval)
+        ys = [float(sum(by_eval[x]) / len(by_eval[x])) for x in xs]
+        ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.7, label=mode_name, color=colors[mode_name])
+        if value_key == "candidate_cutoff" and selected_cutoffs:
+            ax.axhline(sum(selected_cutoffs) / len(selected_cutoffs), color=colors[mode_name], linestyle="--", linewidth=1.0, alpha=0.65)
+        if show_target:
+            target = _mode_posterior_mass_target(config, mode_name)
+            if target is not None:
+                ax.axhline(target, color=colors[mode_name], linestyle="--", linewidth=1.0, alpha=0.65)
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(f"{n_terms}-term SPLL training: latest adaptive top-k search iterations", loc="left")
+    ax.set_xlabel("Cutoff-search evaluation index")
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(True, alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
+    _add_no_smoothing_note(fig)
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run_visualization_stage(config: Dict[str, Any]) -> None:
     paths = training_paths(config)
     stage_message(1, 3, "Writing resolved Pipeline II config snapshot")
@@ -673,11 +867,16 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     rows = _collect_rows(config)
     milestone_aggregates = _collect_milestone_aggregates(config, rows)
     run_summaries = _collect_run_summaries(config)
+    adaptive_topk_events = _collect_adaptive_topk_trace_rows(config, "adaptive_topk_events.csv")
+    adaptive_topk_search_rows = _collect_adaptive_topk_trace_rows(config, "adaptive_topk_search_trace.csv")
     milestone_fields = [
         "seed",
         "n_terms",
         "mode_name",
         "top_k_cutoff",
+        "adaptive_top_k",
+        "posterior_mass_target",
+        "runtime_top_k_cutoff",
         "milestone",
         "reached",
         "step",
@@ -691,6 +890,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "n_terms",
         "mode_name",
         "top_k_cutoff",
+        "adaptive_top_k",
+        "posterior_mass_target",
+        "runtime_top_k_cutoff",
         "status",
         "failure_report",
         "final_step",
@@ -711,6 +913,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "n_terms",
         "mode_name",
         "top_k_cutoff",
+        "adaptive_top_k",
+        "posterior_mass_target",
+        "runtime_top_k_cutoff_mean",
         "milestone",
         "configured_seed_count",
         "observed_seed_count",
@@ -735,6 +940,48 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     write_json(paths.tables_root / "milestone_aggregate_summary.json", milestone_aggregates)
     _write_csv(paths.tables_root / "run_summary.csv", run_summaries, run_summary_fields)
     write_json(paths.tables_root / "run_summary.json", run_summaries)
+    _write_csv(
+        paths.tables_root / "adaptive_topk_events.csv",
+        adaptive_topk_events,
+        [
+            "seed",
+            "n_terms",
+            "mode_name",
+            "step",
+            "reason",
+            "runtime_top_k_cutoff",
+            "posterior_mass_target",
+            "mean_surviving_posterior_mass",
+            "abs_error",
+            "iterations",
+            "converged",
+            "probe_cases",
+            "search_runtime_sec",
+            "evaluation_count",
+        ],
+    )
+    _write_csv(
+        paths.tables_root / "adaptive_topk_search_trace.csv",
+        adaptive_topk_search_rows,
+        [
+            "seed",
+            "n_terms",
+            "mode_name",
+            "step",
+            "reason",
+            "evaluation_index",
+            "candidate_cutoff",
+            "mean_surviving_mass",
+            "posterior_mass_target",
+            "runtime_top_k_cutoff",
+            "selected_mean_surviving_posterior_mass",
+            "selected_abs_error",
+            "iterations",
+            "converged",
+        ],
+    )
+    write_json(paths.tables_root / "adaptive_topk_events.json", adaptive_topk_events)
+    write_json(paths.tables_root / "adaptive_topk_search_trace.json", adaptive_topk_search_rows)
     print(f"Saved milestone summary to: {paths.tables_root / 'milestone_summary.csv'}")
     print(f"Saved milestone aggregate summary to: {paths.tables_root / 'milestone_aggregate_summary.csv'}")
     print(f"Saved run summary to: {paths.tables_root / 'run_summary.csv'}")
@@ -798,6 +1045,38 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             ylabel="True-sum mass",
             output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_true_mass_raw_trace.png",
             smooth_window=1,
+        )
+        _plot_adaptive_topk_event_trace(
+            config=config,
+            n_terms=n_terms,
+            value_key="runtime_top_k_cutoff",
+            ylabel="runtime TOP_K_CUTOFF",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_adaptive_topk_runtime_cutoff_trace.png",
+        )
+        _plot_adaptive_topk_event_trace(
+            config=config,
+            n_terms=n_terms,
+            value_key="mean_surviving_posterior_mass",
+            ylabel="mean surviving posterior mass",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_adaptive_topk_surviving_mass_trace.png",
+            show_target=True,
+            ylim=(0.0, 1.05),
+        )
+        _plot_adaptive_topk_search_iterations(
+            config=config,
+            n_terms=n_terms,
+            value_key="candidate_cutoff",
+            ylabel="candidate TOP_K_CUTOFF",
+            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_adaptive_topk_search_cutoff_iterations.png",
+        )
+        _plot_adaptive_topk_search_iterations(
+            config=config,
+            n_terms=n_terms,
+            value_key="mean_surviving_mass",
+            ylabel="mean surviving posterior mass",
+            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_adaptive_topk_search_mass_iterations.png",
+            show_target=True,
+            ylim=(0.0, 1.05),
         )
         _plot_trace(
             config=config,

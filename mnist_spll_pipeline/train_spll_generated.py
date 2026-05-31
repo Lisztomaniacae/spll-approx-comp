@@ -105,7 +105,11 @@ def _save_training_checkpoint_snapshot(
             "seed": int(seed),
             "n_terms": int(n_terms),
             "inference_mode": mode["name"],
+            "artifact_name": mode.get("artifact_name", mode["name"]),
             "top_k_cutoff": mode.get("top_k_cutoff"),
+            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+            "posterior_mass_target": mode.get("posterior_mass_target"),
+            "cutoff_search": mode.get("cutoff_search"),
             "config_path": str(config.get("_config_path", "")),
             "created_at_utc": utc_now_iso(),
         },
@@ -143,6 +147,19 @@ def _run_validation_snapshot(
         max_items=int(data_cfg.get("image_cache_max_items", 4096)),
         strategy=str(data_cfg.get("image_cache_strategy", "lru")),
     )
+    cutoff_state = _tune_adaptive_top_k_cutoff(
+        config=config,
+        mode=mode,
+        module=module,
+        model=model,
+        cache=cache,
+        device=device,
+        split_manifest=split_manifest,
+        seed=seed,
+        n_terms=n_terms,
+        step=step,
+        reason="async_validation",
+    )
     metrics = _evaluate_sum_posterior_validation(
         module=module,
         model=model,
@@ -154,6 +171,13 @@ def _run_validation_snapshot(
         num_cases=posterior_cases,
         zero_total_mass_tolerance=zero_total_mass_tolerance,
     )
+    if cutoff_state is not None:
+        metrics.update({f"cutoff_search_{key}": value for key, value in cutoff_state.items() if key != "evaluations"})
+        metrics["top_k_cutoff_runtime"] = cutoff_state["runtime_top_k_cutoff"]
+        metrics["posterior_mass_target"] = cutoff_state["posterior_mass_target"]
+    else:
+        metrics["top_k_cutoff_runtime"] = _get_runtime_top_k_cutoff(module, mode)
+        metrics["posterior_mass_target"] = mode.get("posterior_mass_target")
     cache.clear()
 
     cleanup_torch()
@@ -453,6 +477,236 @@ def _evaluate_sum_posterior_validation(
     }
 
 
+
+def _is_adaptive_top_k_mode(mode: Dict[str, Any]) -> bool:
+    return bool(mode.get("adaptive_top_k")) and mode.get("posterior_mass_target") is not None
+
+
+def _require_mutable_top_k_cutoff(module: Any, *, mode_name: str) -> None:
+    if not hasattr(module, "TOP_K_CUTOFF"):
+        raise RuntimeError(
+            f"Adaptive top-k mode {mode_name!r} requires a generated SPLL artifact compiled with -k. "
+            "The exact artifact does not expose TOP_K_CUTOFF. Re-run the Pipeline II compile stage."
+        )
+
+
+def _set_runtime_top_k_cutoff(module: Any, cutoff: float) -> None:
+    cutoff = max(0.0, min(1.0, float(cutoff)))
+    setattr(module, "TOP_K_CUTOFF", cutoff)
+
+
+def _get_runtime_top_k_cutoff(module: Any, mode: Dict[str, Any]) -> Optional[float]:
+    if hasattr(module, "TOP_K_CUTOFF"):
+        try:
+            return float(getattr(module, "TOP_K_CUTOFF"))
+        except (TypeError, ValueError):
+            return None
+    cutoff = mode.get("top_k_cutoff")
+    return None if cutoff is None else float(cutoff)
+
+
+def _mean_surviving_posterior_mass_for_cutoff(
+    *,
+    module: Any,
+    model: torch.nn.Module,
+    cache: TensorLRUCache,
+    device: torch.device,
+    split_manifest: Dict[str, Any],
+    seed: int,
+    n_terms: int,
+    num_cases: int,
+    cutoff: float,
+) -> float:
+    """Return mean unnormalised posterior mass surviving under one runtime cutoff.
+
+    The generated approximate artifact returns raw, unnormalised mass.  Summing it
+    over all candidate sums therefore estimates how much of the exact posterior
+    survived pruning.  This helper deliberately uses held-out validation-style
+    cases, the same deterministic generator as validation, and the current model
+    snapshot.
+    """
+
+    candidate_sums = _candidate_sums_for_terms(n_terms)
+    previous_cutoff = getattr(module, "TOP_K_CUTOFF", None)
+    previous_read_mnist = getattr(module, "readMNist", None)
+    was_training = model.training
+    _set_runtime_top_k_cutoff(module, cutoff)
+    model.eval()
+    total_masses: List[float] = []
+    try:
+        with torch.no_grad():
+            for probe_step in range(1, int(num_cases) + 1):
+                case = generate_sum_case(
+                    split_manifest,
+                    base_seed=seed + 104729,
+                    n_terms=n_terms,
+                    step=probe_step,
+                    split="validation",
+                )
+                setattr(
+                    module,
+                    "readMNist",
+                    make_precomputed_read_mnist(
+                        model=model,
+                        tensor_cache=cache,
+                        device=device,
+                        global_indices=case["global_indices"],
+                    ),
+                )
+                mass = 0.0
+                for candidate_sum in candidate_sums:
+                    probability, _branch_count = call_true_sum(
+                        module,
+                        int(candidate_sum),
+                        case["global_indices"],
+                        allow_pruned_zero=True,
+                    )
+                    value = tensor_to_float(probability)
+                    _validate_probability_value(value, candidate_sum=int(candidate_sum), case_step=int(case["step"]))
+                    mass += float(value)
+                total_masses.append(float(mass))
+    finally:
+        if previous_cutoff is not None:
+            setattr(module, "TOP_K_CUTOFF", previous_cutoff)
+        if previous_read_mnist is not None:
+            setattr(module, "readMNist", previous_read_mnist)
+        if was_training:
+            model.train()
+    return float(sum(total_masses) / len(total_masses)) if total_masses else 0.0
+
+
+def _tune_adaptive_top_k_cutoff(
+    *,
+    config: Dict[str, Any],
+    mode: Dict[str, Any],
+    module: Any,
+    model: torch.nn.Module,
+    cache: TensorLRUCache,
+    device: torch.device,
+    split_manifest: Dict[str, Any],
+    seed: int,
+    n_terms: int,
+    step: int,
+    reason: str,
+) -> Optional[Dict[str, Any]]:
+    """Tune TOP_K_CUTOFF to hit a target surviving posterior mass.
+
+    The search is bounded and deterministic rather than simulated annealing:
+    increasing TOP_K_CUTOFF should only prune more branches, so the objective is
+    effectively one-dimensional and monotone.  This is easier to reproduce and
+    easier to defend in the experimental methodology.
+    """
+
+    if not _is_adaptive_top_k_mode(mode):
+        return None
+    _require_mutable_top_k_cutoff(module, mode_name=str(mode["name"]))
+
+    target = float(mode.get("posterior_mass_target", 0.8))
+    search_cfg = dict(mode.get("cutoff_search") or {})
+    probe_cases = max(1, int(search_cfg.get("probe_cases", 20)))
+    max_iterations = max(1, int(search_cfg.get("max_iterations", 14)))
+    tolerance = max(0.0, float(search_cfg.get("tolerance", 0.02)))
+    low = max(0.0, min(1.0, float(search_cfg.get("min_cutoff", 0.0))))
+    high = max(low, min(1.0, float(search_cfg.get("max_cutoff", 1.0))))
+
+    def evaluate(cutoff: float) -> float:
+        return _mean_surviving_posterior_mass_for_cutoff(
+            module=module,
+            model=model,
+            cache=cache,
+            device=device,
+            split_manifest=split_manifest,
+            seed=seed,
+            n_terms=n_terms,
+            num_cases=probe_cases,
+            cutoff=float(cutoff),
+        )
+
+    evaluations: List[Dict[str, float]] = []
+    low_mass = evaluate(low)
+    evaluations.append({"cutoff": float(low), "mean_surviving_mass": float(low_mass)})
+    best_cutoff = float(low)
+    best_mass = float(low_mass)
+    best_error = abs(best_mass - target)
+
+    # If cutoff=0 already removes too much mass, no larger cutoff can repair it.
+    if low_mass <= target or target >= 1.0:
+        _set_runtime_top_k_cutoff(module, best_cutoff)
+        return {
+            "adaptive_top_k": True,
+            "posterior_mass_target": float(target),
+            "runtime_top_k_cutoff": float(best_cutoff),
+            "mean_surviving_posterior_mass": float(best_mass),
+            "abs_error": float(best_error),
+            "probe_cases": int(probe_cases),
+            "iterations": 0,
+            "converged": bool(best_error <= tolerance),
+            "reason": str(reason),
+            "step": int(step),
+            "search_method": "bounded_monotone_bisection",
+            "evaluations": evaluations,
+        }
+
+    high_mass = evaluate(high)
+    evaluations.append({"cutoff": float(high), "mean_surviving_mass": float(high_mass)})
+    if abs(high_mass - target) < best_error:
+        best_cutoff = float(high)
+        best_mass = float(high_mass)
+        best_error = abs(best_mass - target)
+
+    # If even the maximum cutoff keeps too much mass, use the maximum tested cutoff.
+    if high_mass >= target:
+        _set_runtime_top_k_cutoff(module, best_cutoff)
+        return {
+            "adaptive_top_k": True,
+            "posterior_mass_target": float(target),
+            "runtime_top_k_cutoff": float(best_cutoff),
+            "mean_surviving_posterior_mass": float(best_mass),
+            "abs_error": float(best_error),
+            "probe_cases": int(probe_cases),
+            "iterations": 0,
+            "converged": bool(best_error <= tolerance),
+            "reason": str(reason),
+            "step": int(step),
+            "search_method": "bounded_monotone_bisection",
+            "evaluations": evaluations,
+        }
+
+    iterations = 0
+    left = float(low)
+    right = float(high)
+    for iterations in range(1, max_iterations + 1):
+        mid = (left + right) / 2.0
+        mid_mass = evaluate(mid)
+        evaluations.append({"cutoff": float(mid), "mean_surviving_mass": float(mid_mass)})
+        mid_error = abs(float(mid_mass) - target)
+        if mid_error < best_error:
+            best_cutoff = float(mid)
+            best_mass = float(mid_mass)
+            best_error = float(mid_error)
+        if mid_error <= tolerance:
+            break
+        if mid_mass > target:
+            left = mid
+        else:
+            right = mid
+
+    _set_runtime_top_k_cutoff(module, best_cutoff)
+    return {
+        "adaptive_top_k": True,
+        "posterior_mass_target": float(target),
+        "runtime_top_k_cutoff": float(best_cutoff),
+        "mean_surviving_posterior_mass": float(best_mass),
+        "abs_error": float(best_error),
+        "probe_cases": int(probe_cases),
+        "iterations": int(iterations),
+        "converged": bool(best_error <= tolerance),
+        "reason": str(reason),
+        "step": int(step),
+        "search_method": "bounded_monotone_bisection",
+        "evaluations": evaluations,
+    }
+
 def _train_sum_batch(
     *,
     module: Any,
@@ -568,7 +822,11 @@ def _train_one_run(
         "seed": seed,
         "n_terms": n_terms,
         "mode": mode_name,
+        "artifact_name": mode.get("artifact_name", mode_name),
         "top_k_cutoff": mode.get("top_k_cutoff"),
+        "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+        "posterior_mass_target": mode.get("posterior_mass_target"),
+        "cutoff_search": mode.get("cutoff_search"),
         "mode_order_position": int(mode_order_position),
         "mode_order_offset": int(mode_order_offset),
         "run_order_index": None if run_order_index is None else int(run_order_index),
@@ -592,6 +850,20 @@ def _train_one_run(
             strategy=str(data_cfg.get("image_cache_strategy", "lru")),
         )
         read_mnist = DifferentiableReadMNIST(model, cache, device)
+        setattr(module, "readMNist", read_mnist)
+        adaptive_cutoff_state: Optional[Dict[str, Any]] = _tune_adaptive_top_k_cutoff(
+            config=config,
+            mode=mode,
+            module=module,
+            model=model,
+            cache=cache,
+            device=device,
+            split_manifest=split_manifest,
+            seed=seed,
+            n_terms=n_terms,
+            step=0,
+            reason="preflight",
+        )
         setattr(module, "readMNist", read_mnist)
 
         train_cfg = config.get("training", {})
@@ -639,6 +911,10 @@ def _train_one_run(
                 "branch_count_mean",
                 "branch_count_total",
                 "grad_norm",
+                "top_k_cutoff_runtime",
+                "posterior_mass_target",
+                "cutoff_search_mean_surviving_posterior_mass",
+                "cutoff_search_abs_error",
             ],
         )
         val_handle, val_writer = write_csv_header(
@@ -665,6 +941,44 @@ def _train_one_run(
                 "validation_snapshot_step",
                 "trainer_step_when_submitted",
                 "validation_lag_steps",
+                "top_k_cutoff_runtime",
+                "posterior_mass_target",
+                "cutoff_search_mean_surviving_posterior_mass",
+                "cutoff_search_abs_error",
+                "cutoff_search_iterations",
+                "cutoff_search_converged",
+            ],
+        )
+        topk_event_handle, topk_event_writer = write_csv_header(
+            this_run_dir / "adaptive_topk_events.csv",
+            [
+                "step",
+                "reason",
+                "runtime_top_k_cutoff",
+                "posterior_mass_target",
+                "mean_surviving_posterior_mass",
+                "abs_error",
+                "iterations",
+                "converged",
+                "probe_cases",
+                "search_runtime_sec",
+                "evaluation_count",
+            ],
+        )
+        topk_search_handle, topk_search_writer = write_csv_header(
+            this_run_dir / "adaptive_topk_search_trace.csv",
+            [
+                "step",
+                "reason",
+                "evaluation_index",
+                "candidate_cutoff",
+                "mean_surviving_mass",
+                "posterior_mass_target",
+                "runtime_top_k_cutoff",
+                "selected_mean_surviving_posterior_mass",
+                "selected_abs_error",
+                "iterations",
+                "converged",
             ],
         )
 
@@ -685,6 +999,63 @@ def _train_one_run(
         completed_validation_jobs = 0
         skipped_validation_jobs = 0
         async_stop_step: Optional[int] = None
+
+        def write_adaptive_topk_trace(step: int, reason: str, cutoff_state: Dict[str, Any]) -> None:
+            evaluations = list(cutoff_state.get("evaluations") or [])
+            topk_event_writer.writerow(
+                {
+                    "step": int(step),
+                    "reason": str(reason),
+                    "runtime_top_k_cutoff": cutoff_state.get("runtime_top_k_cutoff"),
+                    "posterior_mass_target": cutoff_state.get("posterior_mass_target"),
+                    "mean_surviving_posterior_mass": cutoff_state.get("mean_surviving_posterior_mass"),
+                    "abs_error": cutoff_state.get("abs_error"),
+                    "iterations": cutoff_state.get("iterations"),
+                    "converged": cutoff_state.get("converged"),
+                    "probe_cases": cutoff_state.get("probe_cases"),
+                    "search_runtime_sec": cutoff_state.get("search_runtime_sec"),
+                    "evaluation_count": len(evaluations),
+                }
+            )
+            for evaluation_index, evaluation in enumerate(evaluations):
+                topk_search_writer.writerow(
+                    {
+                        "step": int(step),
+                        "reason": str(reason),
+                        "evaluation_index": int(evaluation_index),
+                        "candidate_cutoff": evaluation.get("cutoff"),
+                        "mean_surviving_mass": evaluation.get("mean_surviving_mass"),
+                        "posterior_mass_target": cutoff_state.get("posterior_mass_target"),
+                        "runtime_top_k_cutoff": cutoff_state.get("runtime_top_k_cutoff"),
+                        "selected_mean_surviving_posterior_mass": cutoff_state.get("mean_surviving_posterior_mass"),
+                        "selected_abs_error": cutoff_state.get("abs_error"),
+                        "iterations": cutoff_state.get("iterations"),
+                        "converged": cutoff_state.get("converged"),
+                    }
+                )
+            topk_event_handle.flush()
+            topk_search_handle.flush()
+
+        def refresh_adaptive_cutoff(step: int, reason: str) -> Optional[Dict[str, Any]]:
+            nonlocal adaptive_cutoff_state
+            cutoff_state = _tune_adaptive_top_k_cutoff(
+                config=config,
+                mode=mode,
+                module=module,
+                model=model,
+                cache=cache,
+                device=device,
+                split_manifest=split_manifest,
+                seed=seed,
+                n_terms=n_terms,
+                step=int(step),
+                reason=reason,
+            )
+            if cutoff_state is not None:
+                adaptive_cutoff_state = cutoff_state
+                write_adaptive_topk_trace(step, reason, cutoff_state)
+            setattr(module, "readMNist", read_mnist)
+            return cutoff_state
 
         if async_enabled:
             ctx = mp.get_context("spawn")
@@ -756,6 +1127,12 @@ def _train_one_run(
                     "validation_snapshot_step": snapshot_step,
                     "trainer_step_when_submitted": trainer_step_submitted,
                     "validation_lag_steps": validation_lag_steps,
+                    "top_k_cutoff_runtime": result.get("top_k_cutoff_runtime"),
+                    "posterior_mass_target": result.get("posterior_mass_target"),
+                    "cutoff_search_mean_surviving_posterior_mass": result.get("cutoff_search_mean_surviving_posterior_mass"),
+                    "cutoff_search_abs_error": result.get("cutoff_search_abs_error"),
+                    "cutoff_search_iterations": result.get("cutoff_search_iterations"),
+                    "cutoff_search_converged": result.get("cutoff_search_converged"),
                 }
             )
             val_handle.flush()
@@ -808,6 +1185,7 @@ def _train_one_run(
             return bool(stop_at_highest and acc >= highest_milestone)
 
         def sync_validate_and_checkpoint(step: int) -> bool:
+            cutoff_state = refresh_adaptive_cutoff(step, "sync_validation")
             elapsed = time.perf_counter() - started_at
             metrics = _evaluate_sum_posterior_validation(
                 module=module,
@@ -820,6 +1198,13 @@ def _train_one_run(
                 num_cases=posterior_cases,
                 zero_total_mass_tolerance=zero_total_mass_tolerance,
             )
+            if cutoff_state is not None:
+                metrics.update({f"cutoff_search_{key}": value for key, value in cutoff_state.items() if key != "evaluations"})
+                metrics["top_k_cutoff_runtime"] = cutoff_state["runtime_top_k_cutoff"]
+                metrics["posterior_mass_target"] = cutoff_state["posterior_mass_target"]
+            else:
+                metrics["top_k_cutoff_runtime"] = _get_runtime_top_k_cutoff(module, mode)
+                metrics["posterior_mass_target"] = mode.get("posterior_mass_target")
             acc = float(metrics["sum_posterior_accuracy"])
             setattr(module, "readMNist", read_mnist)
             return record_validation_result(
@@ -840,6 +1225,7 @@ def _train_one_run(
             nonlocal submitted_validation_jobs, skipped_validation_jobs
             if not async_enabled or validation_request_queue is None:
                 return sync_validate_and_checkpoint(step)
+            refresh_adaptive_cutoff(step, "async_validation_submission")
             poll_async_validation_results(trainer_step_when_recorded=trainer_step_when_submitted)
             if len(pending_validation_snapshots) >= async_max_pending:
                 skipped_validation_jobs += 1
@@ -971,6 +1357,12 @@ def _train_one_run(
                         "branch_count_mean": branch_count_mean,
                         "branch_count_total": branch_count_total,
                         "grad_norm": batch_stats["grad_norm"],
+                        "top_k_cutoff_runtime": _get_runtime_top_k_cutoff(module, mode),
+                        "posterior_mass_target": mode.get("posterior_mass_target"),
+                        "cutoff_search_mean_surviving_posterior_mass": (
+                            adaptive_cutoff_state or {}
+                        ).get("mean_surviving_posterior_mass"),
+                        "cutoff_search_abs_error": (adaptive_cutoff_state or {}).get("abs_error"),
                     }
                 )
                 if optimizer_update % 25 == 0 or cases_seen >= max_steps:
@@ -999,6 +1391,7 @@ def _train_one_run(
                 async_stop_step = cases_seen
 
         final_elapsed = time.perf_counter() - started_at
+        cutoff_state = refresh_adaptive_cutoff(cases_seen, "final_validation")
         final_metrics = _evaluate_sum_posterior_validation(
             module=module,
             model=model,
@@ -1010,6 +1403,13 @@ def _train_one_run(
             num_cases=posterior_cases,
             zero_total_mass_tolerance=zero_total_mass_tolerance,
         )
+        if cutoff_state is not None:
+            final_metrics.update({f"cutoff_search_{key}": value for key, value in cutoff_state.items() if key != "evaluations"})
+            final_metrics["top_k_cutoff_runtime"] = cutoff_state["runtime_top_k_cutoff"]
+            final_metrics["posterior_mass_target"] = cutoff_state["posterior_mass_target"]
+        else:
+            final_metrics["top_k_cutoff_runtime"] = _get_runtime_top_k_cutoff(module, mode)
+            final_metrics["posterior_mass_target"] = mode.get("posterior_mass_target")
         setattr(module, "readMNist", read_mnist)
         final_acc = float(final_metrics["sum_posterior_accuracy"])
         save_training_checkpoint(
@@ -1033,7 +1433,13 @@ def _train_one_run(
                 "seed": int(seed),
                 "n_terms": n_terms,
                 "mode_name": mode_name,
+                "artifact_name": mode.get("artifact_name", mode_name),
                 "top_k_cutoff": mode.get("top_k_cutoff"),
+                "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
+                "posterior_mass_target": mode.get("posterior_mass_target"),
+                "cutoff_search": mode.get("cutoff_search"),
+                "runtime_top_k_cutoff": _get_runtime_top_k_cutoff(module, mode),
+                "last_cutoff_search": adaptive_cutoff_state,
                 "mode_order_position": int(mode_order_position),
                 "mode_order_offset": int(mode_order_offset),
                 "run_order_index": None if run_order_index is None else int(run_order_index),
@@ -1059,6 +1465,8 @@ def _train_one_run(
         )
         train_handle.close()
         val_handle.close()
+        topk_event_handle.close()
+        topk_search_handle.close()
         cache.clear()
         cleanup_torch()
     except BaseException as exc:

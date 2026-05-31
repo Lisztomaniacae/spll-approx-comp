@@ -30,6 +30,7 @@ from mnist_spll_pipeline_core import (
     get_thresholds,
     load_staged_experiments,
     stage_config_snapshot,
+    threshold_spec_for_json,
     write_json,
 )
 
@@ -122,7 +123,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "model_variants": [variant["id"] for variant in model_variants],
                     "device": str(device),
                     "cutoff_modes": cutoff_modes,
-                    "thresholds": thresholds,
+                    "thresholds": [threshold_spec_for_json(threshold) for threshold in thresholds],
                     "num_runs": len(raw_runs),
                     "show_inner_progress": show_inner_progress,
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
@@ -148,7 +149,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                     "model_variants": [variant["id"] for variant in model_variants],
                     "device": str(device),
                     "cutoff_modes": cutoff_modes,
-                    "thresholds": thresholds,
+                    "thresholds": [threshold_spec_for_json(threshold) for threshold in thresholds],
                     "num_runs": len(raw_runs),
                     "count_branches": bool(ctx.inference_cfg.get("count_branches", True)),
                     "true_candidate_trace": True,

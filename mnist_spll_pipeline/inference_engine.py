@@ -10,10 +10,15 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 from mnist_spll_common import TerminalProgressBar
 from mnist_spll_pipeline_core import (
     PipelinePaths,
+    ThresholdSpec,
     compiled_program_path,
     evaluate_candidate_sum,
     posterior_for_experiment,
     threshold_label,
+    threshold_spec_artifact_label,
+    threshold_spec_compile_cutoff,
+    threshold_spec_label,
+    threshold_spec_runtime_seed_cutoff,
     utc_now_iso,
 )
 
@@ -316,7 +321,7 @@ class InferenceRunEngine:
         *,
         paths: PipelinePaths,
         model: ModelInferenceContext,
-        get_compiled_module: Callable[[int, str, Optional[float]], Any],
+        get_compiled_module: Callable[[int, str, Optional[float], Optional[str]], Any],
         show_progress: bool,
         show_inner_progress: bool,
         progress_bar: Optional[TerminalProgressBar] = None,
@@ -331,6 +336,8 @@ class InferenceRunEngine:
         self.progress_bar = progress_bar
         self.read_mnist_cache_policy = normalize_read_mnist_cache_policy(read_mnist_cache_policy)
         self.read_mnist_warmup_stats = dict(read_mnist_warmup_stats or {})
+        self._adaptive_cutoff_cache: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        self._adaptive_probe_experiments: List[Dict[str, Any]] = []
 
     @contextmanager
     def _read_mnist_scope(
@@ -356,39 +363,194 @@ class InferenceRunEngine:
             setattr(module, "readMNist", previous_read_mnist)
 
     @staticmethod
-    def _rotated_thresholds(thresholds: Sequence[Optional[float]], offset: int) -> List[Optional[float]]:
+    def _rotated_thresholds(thresholds: Sequence[ThresholdSpec], offset: int) -> List[ThresholdSpec]:
         values = list(thresholds)
         if not values:
             return []
         shift = int(offset) % len(values)
         return values[shift:] + values[:shift]
 
+    @staticmethod
+    def _is_adaptive_threshold(threshold: ThresholdSpec) -> bool:
+        return bool(threshold.get("adaptive_top_k", False)) and threshold.get("posterior_mass_target") is not None
+
+    @staticmethod
+    def _set_runtime_top_k_cutoff(module: Any, cutoff: Optional[float]) -> Optional[float]:
+        if cutoff is None or not hasattr(module, "TOP_K_CUTOFF"):
+            return None
+        value = max(0.0, min(1.0, float(cutoff)))
+        setattr(module, "TOP_K_CUTOFF", value)
+        return value
+
+    @staticmethod
+    def _get_runtime_top_k_cutoff(module: Any, fallback: Optional[float]) -> Optional[float]:
+        if hasattr(module, "TOP_K_CUTOFF"):
+            try:
+                return float(getattr(module, "TOP_K_CUTOFF"))
+            except (TypeError, ValueError):
+                return None
+        return None if fallback is None else float(fallback)
+
+    def _mean_surviving_mass_for_cutoff(
+        self,
+        *,
+        module: Any,
+        n_terms: int,
+        probe_experiments: Sequence[Dict[str, Any]],
+        cutoff: float,
+    ) -> float:
+        self._set_runtime_top_k_cutoff(module, cutoff)
+        max_sum = 9 * int(n_terms)
+        masses: List[float] = []
+        for experiment in probe_experiments:
+            image_paths = [str(path) for path in experiment["image_paths"]]
+            with self._read_mnist_scope(module, image_paths=image_paths):
+                posterior_trace = posterior_for_experiment(module, image_paths, max_sum=max_sum)
+            masses.append(float(sum(float(value) for value in posterior_trace["posterior_raw"])))
+        return float(sum(masses) / len(masses)) if masses else 0.0
+
+    def _tune_adaptive_top_k_cutoff(
+        self,
+        *,
+        module: Any,
+        n_terms: int,
+        cutoff_mode: str,
+        threshold: ThresholdSpec,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._is_adaptive_threshold(threshold):
+            return None
+        if not hasattr(module, "TOP_K_CUTOFF"):
+            raise RuntimeError(
+                f"Adaptive top-k threshold {threshold_spec_label(threshold)!r} requires an artifact compiled with -k. "
+                "Re-run the Pipeline I compile stage."
+            )
+
+        key = (str(cutoff_mode), int(n_terms), threshold_spec_label(threshold))
+        cached = self._adaptive_cutoff_cache.get(key)
+        if cached is not None:
+            self._set_runtime_top_k_cutoff(module, cached.get("runtime_top_k_cutoff", 0.0))
+            return cached
+
+        search_cfg = dict(threshold.get("cutoff_search") or {})
+        probe_count = max(1, int(search_cfg.get("probe_experiments", search_cfg.get("probe_cases", 20))))
+        probe_experiments = [
+            experiment
+            for experiment in self._adaptive_probe_experiments
+            if int(experiment.get("n_terms", -1)) == int(n_terms)
+        ][:probe_count]
+        if not probe_experiments:
+            raise RuntimeError(
+                f"No staged experiments available to tune adaptive threshold {threshold_spec_label(threshold)!r} "
+                f"for n_terms={n_terms}."
+            )
+
+        target = float(threshold.get("posterior_mass_target", 0.8))
+        max_iterations = max(1, int(search_cfg.get("max_iterations", 14)))
+        tolerance = max(0.0, float(search_cfg.get("tolerance", 0.02)))
+        low = max(0.0, min(1.0, float(search_cfg.get("min_cutoff", 0.0))))
+        high = max(low, min(1.0, float(search_cfg.get("max_cutoff", 1.0))))
+
+        evaluations: List[Dict[str, float]] = []
+        started = time.perf_counter()
+
+        def evaluate(cutoff_value: float) -> float:
+            mass = self._mean_surviving_mass_for_cutoff(
+                module=module,
+                n_terms=n_terms,
+                probe_experiments=probe_experiments,
+                cutoff=float(cutoff_value),
+            )
+            evaluations.append({"cutoff": float(cutoff_value), "mean_surviving_mass": float(mass)})
+            return float(mass)
+
+        low_mass = evaluate(low)
+        best_cutoff = float(low)
+        best_mass = float(low_mass)
+        best_error = abs(best_mass - target)
+        iterations = 0
+
+        if low_mass > target and target < 1.0:
+            high_mass = evaluate(high)
+            if abs(high_mass - target) < best_error:
+                best_cutoff = float(high)
+                best_mass = float(high_mass)
+                best_error = abs(best_mass - target)
+
+            if high_mass < target:
+                left = float(low)
+                right = float(high)
+                for iterations in range(1, max_iterations + 1):
+                    mid = (left + right) / 2.0
+                    mid_mass = evaluate(mid)
+                    mid_error = abs(mid_mass - target)
+                    if mid_error < best_error:
+                        best_cutoff = float(mid)
+                        best_mass = float(mid_mass)
+                        best_error = float(mid_error)
+                    if mid_error <= tolerance:
+                        break
+                    if mid_mass > target:
+                        left = mid
+                    else:
+                        right = mid
+
+        runtime_sec = time.perf_counter() - started
+        self._set_runtime_top_k_cutoff(module, best_cutoff)
+        state = {
+            "adaptive_top_k": True,
+            "posterior_mass_target": float(target),
+            "runtime_top_k_cutoff": float(best_cutoff),
+            "mean_surviving_posterior_mass": float(best_mass),
+            "abs_error": float(best_error),
+            "probe_experiments": int(len(probe_experiments)),
+            "probe_experiment_ids": [int(experiment["experiment_id"]) for experiment in probe_experiments],
+            "iterations": int(iterations),
+            "converged": bool(best_error <= tolerance),
+            "search_method": "bounded_monotone_bisection",
+            "search_runtime_sec": float(runtime_sec),
+            "evaluations": evaluations,
+        }
+        self._adaptive_cutoff_cache[key] = state
+        return state
+
     def run_many(
         self,
         *,
         experiments: Sequence[Dict[str, Any]],
         cutoff_modes: Iterable[str],
-        thresholds: Iterable[Optional[float]],
+        thresholds: Iterable[ThresholdSpec],
     ) -> List[Dict[str, Any]]:
         raw_runs: List[Dict[str, Any]] = []
         threshold_values = list(thresholds)
+        self._adaptive_probe_experiments = list(experiments)
         measurement_order_index = 0
         for cutoff_mode in cutoff_modes:
             for experiment_index, experiment in enumerate(experiments):
-                for threshold_position, cutoff in enumerate(self._rotated_thresholds(threshold_values, experiment_index)):
-                    record = self.run_one(experiment=experiment, cutoff_mode=cutoff_mode, cutoff=cutoff)
+                for threshold_position, threshold in enumerate(self._rotated_thresholds(threshold_values, experiment_index)):
+                    record = self.run_one(experiment=experiment, cutoff_mode=cutoff_mode, threshold=threshold)
                     record["measurement_order_index"] = int(measurement_order_index)
                     record["threshold_order_position"] = int(threshold_position)
                     raw_runs.append(record)
                     measurement_order_index += 1
         return raw_runs
 
-    def run_one(self, *, experiment: Dict[str, Any], cutoff_mode: str, cutoff: Optional[float]) -> Dict[str, Any]:
+    def run_one(self, *, experiment: Dict[str, Any], cutoff_mode: str, threshold: ThresholdSpec) -> Dict[str, Any]:
         n_terms = int(experiment["n_terms"])
         image_paths = [str(path) for path in experiment["image_paths"]]
         max_sum = 9 * n_terms
-        label = threshold_label(cutoff)
-        module = self.get_compiled_module(n_terms, cutoff_mode, cutoff)
+        cutoff = threshold_spec_compile_cutoff(threshold)
+        label = threshold_spec_label(threshold)
+        artifact_label = threshold_spec_artifact_label(threshold)
+        module = self.get_compiled_module(n_terms, cutoff_mode, cutoff, artifact_label)
+        adaptive_cutoff_state = self._tune_adaptive_top_k_cutoff(
+            module=module,
+            n_terms=n_terms,
+            cutoff_mode=cutoff_mode,
+            threshold=threshold,
+        )
+        if adaptive_cutoff_state is None:
+            self._set_runtime_top_k_cutoff(module, threshold_spec_runtime_seed_cutoff(threshold))
+        runtime_top_k_cutoff = self._get_runtime_top_k_cutoff(module, threshold_spec_runtime_seed_cutoff(threshold))
 
         per_run_bar = TerminalProgressBar(
             max_sum + 1,
@@ -406,7 +568,7 @@ class InferenceRunEngine:
                 progress_bar=None,
                 progress_prefix=(
                     f"model={self.model.model_id}, cutoff_mode={cutoff_mode}, "
-                    f"exp={int(experiment['experiment_id']):04d}, terms={n_terms}, cutoff={label},"
+                    f"exp={int(experiment['experiment_id']):04d}, terms={n_terms}, threshold={label},"
                 ),
             )
             runtime_sec = time.perf_counter() - started
@@ -420,7 +582,7 @@ class InferenceRunEngine:
         per_run_bar.finish(
             postfix=(
                 f"model={self.model.model_id}, cutoff_mode={cutoff_mode}, "
-                f"exp={int(experiment['experiment_id']):04d}, terms={n_terms}, cutoff={label}, "
+                f"exp={int(experiment['experiment_id']):04d}, terms={n_terms}, threshold={label}, "
                 f"runtime={runtime_sec:.2f}s, true_sum_runtime={true_candidate_trace.runtime_sec:.4f}s"
             )
         )
@@ -429,7 +591,11 @@ class InferenceRunEngine:
             experiment=experiment,
             cutoff_mode=cutoff_mode,
             cutoff=cutoff,
+            threshold=threshold,
             label=label,
+            runtime_top_k_cutoff=runtime_top_k_cutoff,
+            adaptive_cutoff_state=adaptive_cutoff_state,
+            artifact_label=artifact_label,
             n_terms=n_terms,
             image_paths=image_paths,
             max_sum=max_sum,
@@ -445,7 +611,7 @@ class InferenceRunEngine:
             self.progress_bar.update(
                 postfix=(
                     f"model={self.model.model_id}, cutoff_mode={cutoff_mode}, "
-                    f"exp={int(experiment['experiment_id']):04d}, terms={n_terms}, cutoff={label}, "
+                    f"exp={int(experiment['experiment_id']):04d}, terms={n_terms}, threshold={label}, "
                     f"runtime={runtime_sec:.2f}s"
                 )
             )
@@ -457,7 +623,11 @@ class InferenceRunEngine:
         experiment: Dict[str, Any],
         cutoff_mode: str,
         cutoff: Optional[float],
+        threshold: ThresholdSpec,
         label: str,
+        runtime_top_k_cutoff: Optional[float],
+        adaptive_cutoff_state: Optional[Dict[str, Any]],
+        artifact_label: str,
         n_terms: int,
         image_paths: Sequence[str],
         max_sum: int,
@@ -469,7 +639,13 @@ class InferenceRunEngine:
         posterior_read_mnist_stats: Dict[str, Any],
         true_candidate_read_mnist_stats: Dict[str, Any],
     ) -> Dict[str, Any]:
-        compiled_path = compiled_program_path(self.paths.compiled_root, n_terms, cutoff_mode, cutoff)
+        compiled_path = compiled_program_path(
+            self.paths.compiled_root,
+            n_terms,
+            cutoff_mode,
+            cutoff,
+            artifact_label=artifact_label,
+        )
         compiled_program_sha256 = sha256_file(compiled_path) if compiled_path.exists() else ""
         return {
             "model_id": self.model.model_id,
@@ -480,7 +656,19 @@ class InferenceRunEngine:
             "cutoff_mode": cutoff_mode,
             "n_terms": int(n_terms),
             "cutoff": cutoff,
+            "compile_cutoff": cutoff,
             "threshold_label": label,
+            "artifact_threshold_label": artifact_label,
+            "adaptive_top_k": bool(threshold.get("adaptive_top_k", False)),
+            "posterior_mass_target": threshold.get("posterior_mass_target"),
+            "runtime_top_k_cutoff": runtime_top_k_cutoff,
+            "adaptive_cutoff_state": adaptive_cutoff_state,
+            "mean_surviving_posterior_mass": (
+                None if adaptive_cutoff_state is None else adaptive_cutoff_state.get("mean_surviving_posterior_mass")
+            ),
+            "adaptive_cutoff_search_runtime_sec": (
+                0.0 if adaptive_cutoff_state is None else float(adaptive_cutoff_state.get("search_runtime_sec", 0.0))
+            ),
             "candidate_sums": list(range(max_sum + 1)),
             "posterior_raw": [float(value) for value in posterior_trace["posterior_raw"]],
             "branch_counts_raw": [

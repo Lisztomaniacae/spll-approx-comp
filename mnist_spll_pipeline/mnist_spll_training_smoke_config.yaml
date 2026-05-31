@@ -5,6 +5,14 @@ paths:
 
 seeds: [42]
 
+adaptive_top_k:
+  posterior_mass_target: 0.8
+  probe_cases: 5
+  max_iterations: 8
+  tolerance: 0.05
+  min_cutoff: 0.0
+  max_cutoff: 1.0
+
 training:
   sum_batch_size: 50
   max_steps: 500
@@ -27,5 +35,9 @@ experiments:
 inference_modes:
   - name: exact
     top_k_cutoff: null
+  - name: approx_mass_0p8
+    top_k_cutoff: auto
+    adaptive_top_k: true
+    posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
