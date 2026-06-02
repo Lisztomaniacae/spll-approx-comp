@@ -496,9 +496,10 @@ Diagnostic artifacts:
 
 | File | Meaning |
 |---|---|
-| `timings.csv` | One measured row per generated-SPLL call. |
-| `block_summary.csv` | Mean/median/stdev/min/max plus first-10 versus last-10 timing ratios per sequence block. |
-| `summary.json` | Settings, environment metadata, program SHA-256 values, precheck probability/branch differences, block summaries, and speedup ratios. |
+| `timings.csv` | One measured row per generated-SPLL call, including total runtime plus timed `readMNist` backend time, residual generated-SPLL/inference time, call counts, unique image counts, and time shares. |
+| `block_summary.csv` | Mean/median/stdev/min/max plus first-10 versus last-10 timing ratios per sequence block; also aggregates the `readMNist` versus residual inference split. |
+| `adjacent_time_savings.csv`, `all_pair_time_savings.csv` | Exact/cutoff pair decompositions: total speedup, inference-only speedup, `readMNist` runtime ratio, saved seconds by component, and the maximum exact-time share that could be saved by inference-only improvements. |
+| `summary.json` | Settings, environment metadata, program SHA-256 values, precheck probability/branch differences, block summaries, speedup ratios, and adjacent-pair savings decomposition. |
 | `profile_exact.txt`, `profile_cutoff.txt` | Optional `cProfile` summaries when `--profile-repeats` is positive. |
 | `dis_exact_forward.txt`, `dis_cutoff_forward.txt` | Optional bytecode disassembly when `--disassemble` is set. |
 
@@ -507,6 +508,7 @@ Interpretation discipline:
 - If a speedup persists with `uniform-list`, the effect is in generated Python / CPython behavior, not the CNN or PyTorch model execution.
 - If it appears only with `uniform-tensor`, suspect torch tensor dispatch/autograd-related overhead rather than image IO or the trained model.
 - If it appears only with `real`, inspect `readMNist`, image loading, device warmup, or cache policy.
+- Use `mean_read_mnist_runtime_sec` versus `mean_inference_runtime_sec` to estimate how much measured wall time is neural backend work and how much is potentially saveable generated-SPLL/inference work. For exact/cutoff block pairs, `max_inference_only_savable_share_of_exact_total` is the rough upper bound on speedup available from making symbolic inference free while leaving MNIST calls unchanged.
 - The default sequence `exact,exact,cutoff,cutoff` tests first-block versus second-block warmup inside each artifact. Use `exact,cutoff,exact,cutoff` to test cross-artifact run-order effects.
 
 ### 6.6 Visualization stage

@@ -25,6 +25,64 @@ VariantName = str
 ReadMNistFn = Callable[[str], Sequence[float]]
 
 
+def safe_ratio(numerator: float, denominator: float) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def format_optional_fixed(value: Optional[float], digits: int = 3) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.{digits}f}"
+
+
+def format_optional_percent(value: Optional[float], digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.{digits}%}"
+
+
+class TimedReadMNistProbe:
+    """Timing/counting wrapper for the installed diagnostic readMNist backend.
+
+    The diagnostic harness intentionally keeps the generated SPLL call shape
+    unchanged.  This proxy is therefore installed in place of readMNist and
+    measures the time spent inside the selected backend, while returning the
+    backend result unchanged so list-valued, tensor-valued, and real CNN paths
+    keep their existing behavior.
+    """
+
+    def __init__(self, base_read_mnist: ReadMNistFn) -> None:
+        self.base_read_mnist = base_read_mnist
+        self.calls = 0
+        self.total_runtime_ns = 0
+        self.unique_images: Dict[str, None] = {}
+
+    def reset(self) -> None:
+        self.calls = 0
+        self.total_runtime_ns = 0
+        self.unique_images.clear()
+
+    def __call__(self, image_path: str) -> Sequence[float]:
+        self.calls += 1
+        self.unique_images[str(image_path)] = None
+        started_ns = time.perf_counter_ns()
+        try:
+            return self.base_read_mnist(image_path)
+        finally:
+            self.total_runtime_ns += time.perf_counter_ns() - started_ns
+
+    def snapshot(self) -> Dict[str, Any]:
+        runtime_sec = self.total_runtime_ns / 1_000_000_000.0
+        return {
+            "read_mnist_calls": int(self.calls),
+            "read_mnist_unique_images": int(len(self.unique_images)),
+            "read_mnist_runtime_sec": float(runtime_sec),
+            "read_mnist_avg_call_sec": safe_ratio(runtime_sec, float(self.calls)),
+        }
+
+
 def utc_now_label() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -296,6 +354,7 @@ def timed_repeat(
     block_index: int,
     variant: VariantName,
     query: Callable[[], Dict[str, Any]],
+    read_mnist_probe: TimedReadMNistProbe,
     repeats: int,
     gc_between_runs: bool,
 ) -> List[Dict[str, Any]]:
@@ -304,9 +363,14 @@ def timed_repeat(
     for iteration in range(1, repeats + 1):
         if gc_between_runs:
             gc.collect()
+        read_mnist_probe.reset()
         started_ns = time.perf_counter_ns()
         payload = query()
         elapsed_ns = time.perf_counter_ns() - started_ns
+        total_runtime_sec = elapsed_ns / 1_000_000_000.0
+        read_mnist_stats = read_mnist_probe.snapshot()
+        read_mnist_runtime_sec = float(read_mnist_stats["read_mnist_runtime_sec"])
+        inference_runtime_sec = max(0.0, total_runtime_sec - read_mnist_runtime_sec)
         probabilities = payload["probabilities"]
         # Keep a tiny data dependency on the result so accidental future rewrites
         # cannot silently skip the actual query call.
@@ -316,7 +380,14 @@ def timed_repeat(
                 "block_index": int(block_index),
                 "variant": variant,
                 "iteration": int(iteration),
-                "runtime_sec": elapsed_ns / 1_000_000_000.0,
+                "runtime_sec": total_runtime_sec,
+                "read_mnist_calls": read_mnist_stats["read_mnist_calls"],
+                "read_mnist_unique_images": read_mnist_stats["read_mnist_unique_images"],
+                "read_mnist_runtime_sec": read_mnist_runtime_sec,
+                "read_mnist_avg_call_sec": read_mnist_stats["read_mnist_avg_call_sec"],
+                "inference_runtime_sec": inference_runtime_sec,
+                "read_mnist_time_share": safe_ratio(read_mnist_runtime_sec, total_runtime_sec),
+                "inference_time_share": safe_ratio(inference_runtime_sec, total_runtime_sec),
                 "checksum": checksum,
             }
         )
@@ -325,13 +396,21 @@ def timed_repeat(
 
 def summarize_block(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     runtimes = [float(row["runtime_sec"]) for row in rows]
+    read_mnist_runtimes = [float(row["read_mnist_runtime_sec"]) for row in rows]
+    inference_runtimes = [float(row["inference_runtime_sec"]) for row in rows]
+    read_mnist_calls = [int(row["read_mnist_calls"]) for row in rows]
+    read_mnist_unique_images = [int(row["read_mnist_unique_images"]) for row in rows]
+    mean_runtime_sec = statistics.fmean(runtimes)
+    mean_read_mnist_runtime_sec = statistics.fmean(read_mnist_runtimes)
+    mean_inference_runtime_sec = statistics.fmean(inference_runtimes)
+    mean_read_mnist_calls = statistics.fmean(read_mnist_calls)
     first_count = min(10, len(runtimes))
     last_count = min(10, len(runtimes))
     return {
         "block_index": int(rows[0]["block_index"]),
         "variant": str(rows[0]["variant"]),
         "repeats": len(runtimes),
-        "mean_sec": statistics.fmean(runtimes),
+        "mean_sec": mean_runtime_sec,
         "median_sec": statistics.median(runtimes),
         "stdev_sec": statistics.stdev(runtimes) if len(runtimes) >= 2 else 0.0,
         "min_sec": min(runtimes),
@@ -345,6 +424,18 @@ def summarize_block(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             if statistics.fmean(runtimes[-last_count:]) > 0
             else None
         ),
+        "mean_read_mnist_calls": mean_read_mnist_calls,
+        "median_read_mnist_calls": statistics.median(read_mnist_calls),
+        "min_read_mnist_calls": min(read_mnist_calls),
+        "max_read_mnist_calls": max(read_mnist_calls),
+        "mean_read_mnist_unique_images": statistics.fmean(read_mnist_unique_images),
+        "mean_read_mnist_runtime_sec": mean_read_mnist_runtime_sec,
+        "median_read_mnist_runtime_sec": statistics.median(read_mnist_runtimes),
+        "mean_read_mnist_avg_call_sec": safe_ratio(mean_read_mnist_runtime_sec, mean_read_mnist_calls),
+        "mean_inference_runtime_sec": mean_inference_runtime_sec,
+        "median_inference_runtime_sec": statistics.median(inference_runtimes),
+        "read_mnist_time_share_of_mean": safe_ratio(mean_read_mnist_runtime_sec, mean_runtime_sec),
+        "inference_time_share_of_mean": safe_ratio(mean_inference_runtime_sec, mean_runtime_sec),
     }
 
 
@@ -361,6 +452,10 @@ def summarize_speedups(block_summaries: Sequence[Dict[str, Any]]) -> List[Dict[s
             cutoff_mean = float(cutoff["mean_sec"])
             if cutoff_mean <= 0:
                 continue
+            exact_inference_mean = float(exact["mean_inference_runtime_sec"])
+            cutoff_inference_mean = float(cutoff["mean_inference_runtime_sec"])
+            exact_read_mnist_mean = float(exact["mean_read_mnist_runtime_sec"])
+            cutoff_read_mnist_mean = float(cutoff["mean_read_mnist_runtime_sec"])
             results.append(
                 {
                     "exact_block_index": int(exact["block_index"]),
@@ -368,6 +463,26 @@ def summarize_speedups(block_summaries: Sequence[Dict[str, Any]]) -> List[Dict[s
                     "exact_mean_sec": exact_mean,
                     "cutoff_mean_sec": cutoff_mean,
                     "exact_over_cutoff_speedup": exact_mean / cutoff_mean,
+                    "exact_mean_inference_runtime_sec": exact_inference_mean,
+                    "cutoff_mean_inference_runtime_sec": cutoff_inference_mean,
+                    "inference_only_exact_over_cutoff_speedup": safe_ratio(exact_inference_mean, cutoff_inference_mean),
+                    "exact_mean_read_mnist_runtime_sec": exact_read_mnist_mean,
+                    "cutoff_mean_read_mnist_runtime_sec": cutoff_read_mnist_mean,
+                    "read_mnist_exact_over_cutoff_runtime_ratio": safe_ratio(exact_read_mnist_mean, cutoff_read_mnist_mean),
+                    "exact_mean_read_mnist_calls": float(exact["mean_read_mnist_calls"]),
+                    "cutoff_mean_read_mnist_calls": float(cutoff["mean_read_mnist_calls"]),
+                    "total_time_saved_sec": exact_mean - cutoff_mean,
+                    "inference_time_saved_sec": exact_inference_mean - cutoff_inference_mean,
+                    "read_mnist_time_saved_sec": exact_read_mnist_mean - cutoff_read_mnist_mean,
+                    "inference_time_saved_share_of_exact_total": safe_ratio(
+                        exact_inference_mean - cutoff_inference_mean,
+                        exact_mean,
+                    ),
+                    "read_mnist_time_saved_share_of_exact_total": safe_ratio(
+                        exact_read_mnist_mean - cutoff_read_mnist_mean,
+                        exact_mean,
+                    ),
+                    "max_inference_only_savable_share_of_exact_total": safe_ratio(exact_inference_mean, exact_mean),
                 }
             )
     adjacent: List[Dict[str, Any]] = []
@@ -381,13 +496,38 @@ def summarize_speedups(block_summaries: Sequence[Dict[str, Any]]) -> List[Dict[s
         cutoff_mean = float(cutoff["mean_sec"])
         if cutoff_mean <= 0:
             continue
+        exact_mean = float(exact["mean_sec"])
+        exact_inference_mean = float(exact["mean_inference_runtime_sec"])
+        cutoff_inference_mean = float(cutoff["mean_inference_runtime_sec"])
+        exact_read_mnist_mean = float(exact["mean_read_mnist_runtime_sec"])
+        cutoff_read_mnist_mean = float(cutoff["mean_read_mnist_runtime_sec"])
         adjacent.append(
             {
                 "block_pair": [int(current["block_index"]), int(nxt["block_index"])],
                 "first_variant": current["variant"],
-                "exact_mean_sec": float(exact["mean_sec"]),
+                "exact_mean_sec": exact_mean,
                 "cutoff_mean_sec": cutoff_mean,
-                "exact_over_cutoff_speedup": float(exact["mean_sec"]) / cutoff_mean,
+                "exact_over_cutoff_speedup": exact_mean / cutoff_mean,
+                "exact_mean_inference_runtime_sec": exact_inference_mean,
+                "cutoff_mean_inference_runtime_sec": cutoff_inference_mean,
+                "inference_only_exact_over_cutoff_speedup": safe_ratio(exact_inference_mean, cutoff_inference_mean),
+                "exact_mean_read_mnist_runtime_sec": exact_read_mnist_mean,
+                "cutoff_mean_read_mnist_runtime_sec": cutoff_read_mnist_mean,
+                "read_mnist_exact_over_cutoff_runtime_ratio": safe_ratio(exact_read_mnist_mean, cutoff_read_mnist_mean),
+                "exact_mean_read_mnist_calls": float(exact["mean_read_mnist_calls"]),
+                "cutoff_mean_read_mnist_calls": float(cutoff["mean_read_mnist_calls"]),
+                "total_time_saved_sec": exact_mean - cutoff_mean,
+                "inference_time_saved_sec": exact_inference_mean - cutoff_inference_mean,
+                "read_mnist_time_saved_sec": exact_read_mnist_mean - cutoff_read_mnist_mean,
+                "inference_time_saved_share_of_exact_total": safe_ratio(
+                    exact_inference_mean - cutoff_inference_mean,
+                    exact_mean,
+                ),
+                "read_mnist_time_saved_share_of_exact_total": safe_ratio(
+                    exact_read_mnist_mean - cutoff_read_mnist_mean,
+                    exact_mean,
+                ),
+                "max_inference_only_savable_share_of_exact_total": safe_ratio(exact_inference_mean, exact_mean),
             }
         )
     return [{"type": "all_pairs", "rows": results}, {"type": "adjacent_pairs", "rows": adjacent}]
@@ -527,8 +667,9 @@ def main() -> None:
     program_paths = resolve_program_paths(args)
     modules = {name: import_compiled_module(path, name) for name, path in program_paths.items()}
     read_mnist = build_read_mnist(args.read_mnist_source, args.config, args.model_id, args.device)
+    read_mnist_probe = TimedReadMNistProbe(read_mnist)
     for module in modules.values():
-        install_read_mnist(module, read_mnist)
+        install_read_mnist(module, read_mnist_probe)
 
     staged_experiment_id: Optional[int] = None
     if args.experiment_id is not None:
@@ -563,6 +704,7 @@ def main() -> None:
             block_index=block_index,
             variant=variant,
             query=queries[variant],
+            read_mnist_probe=read_mnist_probe,
             repeats=int(args.repeats),
             gc_between_runs=bool(args.gc_between_runs),
         )
@@ -578,6 +720,14 @@ def main() -> None:
     write_csv(output_dir / "block_summary.csv", block_summaries)
     artifacts["timings_csv"] = str(output_dir / "timings.csv")
     artifacts["block_summary_csv"] = str(output_dir / "block_summary.csv")
+
+    speedups = summarize_speedups(block_summaries)
+    all_pair_savings = next(item["rows"] for item in speedups if item["type"] == "all_pairs")
+    adjacent_savings = next(item["rows"] for item in speedups if item["type"] == "adjacent_pairs")
+    write_csv(output_dir / "all_pair_time_savings.csv", all_pair_savings)
+    write_csv(output_dir / "adjacent_time_savings.csv", adjacent_savings)
+    artifacts["all_pair_time_savings_csv"] = str(output_dir / "all_pair_time_savings.csv")
+    artifacts["adjacent_time_savings_csv"] = str(output_dir / "adjacent_time_savings.csv")
 
     if args.disassemble:
         for variant, module in modules.items():
@@ -603,6 +753,7 @@ def main() -> None:
             "n_terms": int(args.n_terms),
             "query": args.query,
             "read_mnist_source": args.read_mnist_source,
+            "read_mnist_timing_probe": True,
             "sequence": sequence,
             "repeats": int(args.repeats),
             "warmup": int(args.warmup),
@@ -620,7 +771,7 @@ def main() -> None:
         },
         "precheck": precheck,
         "block_summaries": block_summaries,
-        "speedups": summarize_speedups(block_summaries),
+        "speedups": speedups,
         "artifacts": artifacts,
     }
     write_json(output_dir / "summary.json", summary)
@@ -634,10 +785,17 @@ def main() -> None:
     )
     print("\nBlock summary:")
     for row in block_summaries:
+        read_mnist_share = row["read_mnist_time_share_of_mean"]
+        inference_share = row["inference_time_share_of_mean"]
         print(
             f"  block {row['block_index']:>2} {row['variant']:<6} "
             f"mean={row['mean_sec']:.6f}s median={row['median_sec']:.6f}s "
-            f"first10/last10={row['warmup_ratio_first10_over_last10']:.3f}"
+            f"readMNist={row['mean_read_mnist_runtime_sec']:.6f}s "
+            f"({format_optional_percent(read_mnist_share)} of total) "
+            f"inference≈{row['mean_inference_runtime_sec']:.6f}s "
+            f"({format_optional_percent(inference_share)}) "
+            f"calls≈{row['mean_read_mnist_calls']:.1f} "
+            f"first10/last10={format_optional_fixed(row['warmup_ratio_first10_over_last10'])}"
         )
     adjacent = next(item["rows"] for item in summary["speedups"] if item["type"] == "adjacent_pairs")
     if adjacent:
@@ -646,6 +804,8 @@ def main() -> None:
             print(
                 f"  blocks {row['block_pair'][0]}->{row['block_pair'][1]} "
                 f"first={row['first_variant']} exact/cutoff={row['exact_over_cutoff_speedup']:.3f}"
+                f" inference-only={format_optional_fixed(row['inference_only_exact_over_cutoff_speedup'])}"
+                f" max-inference-save-share={format_optional_percent(row['max_inference_only_savable_share_of_exact_total'])}"
             )
 
 

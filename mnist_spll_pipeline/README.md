@@ -320,7 +320,7 @@ Aliases such as `run_scoped`, `cached`, `precomputed`, `none`, or `off` are acce
 
 ### Diagnosing cutoff `0.0` timing artifacts
 
-Use `diagnose_cutoff_zero_mwe.py` when the approximate `0.0` path appears faster than exact even though branch counts and probabilities should be almost identical. The script runs the exact and `cutoff_0p0` generated Python artifacts repeatedly, writes per-call timings, and can also write `cProfile` and `dis.dis` reports.
+Use `diagnose_cutoff_zero_mwe.py` when the approximate `0.0` path appears faster than exact even though branch counts and probabilities should be almost identical. The script runs the exact and `cutoff_0p0` generated Python artifacts repeatedly, writes per-call timings, decomposes each measured call into timed `readMNist` backend time versus residual generated-SPLL/inference time, and can also write `cProfile` and `dis.dis` reports.
 
 First isolate generated-Python/interpreter overhead with a fake list-valued `readMNist`:
 
@@ -368,7 +368,9 @@ Outputs are written under:
 outputs/spll_experiments/diagnostics/cutoff_zero_mwe/<timestamp>/
 ```
 
-The most useful files are `timings.csv`, `block_summary.csv`, `summary.json`, optional `profile_*.txt`, and optional `dis_*_forward.txt`.
+The most useful files are `timings.csv`, `block_summary.csv`, `adjacent_time_savings.csv`, `all_pair_time_savings.csv`, `summary.json`, optional `profile_*.txt`, and optional `dis_*_forward.txt`.
+
+`timings.csv` includes `read_mnist_calls`, `read_mnist_unique_images`, `read_mnist_runtime_sec`, `read_mnist_avg_call_sec`, `inference_runtime_sec`, `read_mnist_time_share`, and `inference_time_share`. `block_summary.csv` aggregates the same split, and `summary.json` adds adjacent-pair savings fields such as `inference_only_exact_over_cutoff_speedup` and `max_inference_only_savable_share_of_exact_total`.
 
 ### Config inheritance
 
