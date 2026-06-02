@@ -561,6 +561,14 @@ Exact-baseline caveat:
 
 Exact-baseline deltas are computed within the same `(cutoff_mode, model_id, n_terms)` group. If the exact row is missing for a group, deltas become `NaN`.
 
+Visualization layout notes:
+
+- The main runtime–accuracy tradeoff figure is split by term count and is plotted relative to exact inference, not on raw accuracy/runtime axes. Each panel uses `runtime / exact_runtime` on the x-axis and accuracy delta in percentage points versus exact on the y-axis, with exact shown once as the `(1, 0)` reference. This keeps the plot focused on the approximation tradeoff instead of mixing it with the baseline quality differences between trained models.
+- Runtime-vs-cutoff figures keep cutoff on the numeric x-axis. Fixed cutoff runs use their configured cutoff value, while adaptive posterior-mass runs use the selected runtime `TOP_K_CUTOFF` and a visibly larger star marker.
+- Full-posterior and true-sum-only runtime-vs-cutoff figures draw dashed horizontal exact-runtime reference lines for each model in the same color as that model's approximate series. These are visual references only; the exact rows remain outside the cutoff x-axis.
+- The target-vs-achieved model-accuracy figure is vertical by metric: models sit on the x-axis and accuracy sits on the y-axis, with paired target/achieved markers connected per model.
+- Dense line/scatter figures should prefer figure-level horizontal legends in reserved space above or below the panels instead of repeated per-panel legends. Keep legend anchors inside reserved figure margins; for bottom legends, use upper-anchored legend boxes inside the reserved bottom band so stacked legend rows cannot grow into each other or into the subplot grid when `bbox_inches="tight"` is used.
+
 ## 7. Current Known Caveats / Sharp Edges
 
 Keep these visible. They are useful future patch targets.

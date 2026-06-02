@@ -163,7 +163,7 @@ training:
 
 inference:
   device: auto
-  num_experiments: 100
+  num_experiments: 1000
   terms_per_sum_min: 2
   terms_per_sum_max: 4
   sample_without_replacement_within_experiment: true
