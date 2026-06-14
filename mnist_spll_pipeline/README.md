@@ -92,7 +92,6 @@ Compile in Rosetta/x86_64:
 
 ```bash
 arch -x86_64 zsh -f
-cd /path/to/spll-approx-comp/mnist_spll_pipeline
 ./.venv-spll-x86/bin/python run_spll_pipeline.py --config mnist_spll_config.yaml compile
 ```
 
@@ -153,7 +152,7 @@ Pipeline II tests whether SPLL approximation changes the **training process itse
 | `prepare_spll_training.py` | Builds split/schedule manifests and initial checkpoints. |
 | `compile_spll_training.py` | Generates and compiles exact/approximate SPLL training artifacts. |
 | `train_spll_generated.py` | Trains through generated SPLL artifacts. |
-| `visualize_spll_training.py` | Writes milestone tables, training plots, and adaptive top-k calibration plots. |
+| `visualize_spll_training.py` | Writes fixed-budget loss/true-sum-posterior plots, checkpoint-transfer plots, and adaptive top-k calibration plots. |
 | `spll_training_core.py` | Shared Pipeline II helpers. |
 
 ### Design summary
@@ -178,9 +177,11 @@ inference_modes:
 
 This compiles the adaptive approximate SPLL artifact under the fixed artifact directory `cutoff_topk`, then mutates the generated module-level `TOP_K_CUTOFF` at runtime. The deterministic bounded search targets the configured mean surviving posterior mass, with `0.8` as the default thesis-facing target. Training now writes `adaptive_topk_events.csv` for selected runtime cutoffs over training and `adaptive_topk_search_trace.csv` for the per-candidate bisection path.
 
-Milestones and trace `step` values are measured in **sum cases seen**, not optimizer updates. `training.sum_batch_size: 1` recovers the old one-case-per-update behavior.
+Trace `step` values are measured in **training iterations / sum cases seen**. The redesigned benchmark keeps `training.sum_batch_size: 1`, so one step is one iteration. Pure exact and pure approximate runs train for the configured fixed `max_steps`; there is no validation-driven early stopping.
 
-Validation can run asynchronously if enabled in the config. Milestone checkpoints are written from validated snapshots.
+Checkpoints are now computed after all pure exact seeds finish. The pipeline first averages the exact training `p(true_sum)` trace across seeds, then applies a strict full-window rolling mean over `checkpointing.rolling_window_updates` (default 50), and then finds crossings of `checkpointing.posterior_thresholds`. The first 50-point rolling value is emitted only after 50 updates; shorter prefix windows are not used. These aggregate posterior checkpoints become the exact anchors for checkpoint-transfer approximate runs. Held-out full-posterior validation remains available as old diagnostic plumbing, but it is disabled in the default redesigned benchmark and is not used for checkpointing or plots.
+
+Checkpoint-transfer approximate runs load the per-seed exact step checkpoint at each aggregate anchor step and train for the same number of deterministic sum cases the aggregate exact curve needed to reach the next checkpoint. The same case indices `s_A+1..s_B` are reused, so the green comparison changes only the inference mode and not the training examples. In trajectory figures, exact aggregate posterior checkpoints are shown as distinct purple X markers on the displayed exact curve, and the green curve is drawn as separate pieces so segment restarts are visible.
 
 ### Smoke-test commands
 
@@ -194,7 +195,6 @@ Compile in Rosetta/x86_64:
 
 ```bash
 arch -x86_64 zsh -f
-cd /path/to/spll-approx-comp/mnist_spll_pipeline
 ./.venv-spll-x86/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml compile
 ```
 
@@ -203,6 +203,13 @@ Train and visualize in native arm64:
 ```bash
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml train
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml visualize
+```
+
+If the normal training stage completed but the checkpoint-transfer substage needs
+to be rerun, use the recovery entry point without retraining the pure runs:
+
+```bash
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_smoke_config.yaml checkpoint-transfer
 ```
 
 ### Default-run commands
@@ -215,13 +222,18 @@ Use the same stage split with the default config:
 
 ```bash
 arch -x86_64 zsh -f
-cd /path/to/spll-approx-comp/mnist_spll_pipeline
 ./.venv-spll-x86/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml compile
 ```
 
 ```bash
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml train
 ./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml visualize
+```
+
+Recovery-only checkpoint-transfer run:
+
+```bash
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml checkpoint-transfer
 ```
 
 ### Main outputs
@@ -249,13 +261,13 @@ Important artifacts:
 | `generated/spll_programs/*.spll` | Generated SPLL sum programs. |
 | `generated/compiled_python/**/program.py` | Generated Python inference artifacts. |
 | `runs/*/train_trace.csv` | Training trace. |
-| `runs/*/validation_trace.csv` | Validation trace. |
+| `aggregate_checkpoints/terms_*_exact_posterior_checkpoints.json` | Aggregate exact rolling-mean posterior checkpoints used as transfer anchors. |
 | `runs/*/adaptive_topk_events.csv` | Adaptive top-k refresh events: selected runtime cutoff, achieved mass, error, and search metadata. |
 | `runs/*/adaptive_topk_search_trace.csv` | Per-evaluation bisection trace for adaptive top-k cutoff search. |
-| `runs/*/milestones.json` | Reached or censored milestones. |
-| `runs/*/checkpoints/*.pt` | Milestone/final checkpoints. |
+| `runs/*/milestones.json` | Backward-compatible alias for posterior checkpoint crossings. |
+| `runs/*/checkpoints/steps/step_*.pt`, `posterior_*.pt`, and `final.pt` | Exact step snapshots for aggregate-anchor transfer plus per-run posterior/final snapshots. |
 | `visualization/tables/*.csv` | Milestone, aggregate, and adaptive top-k calibration tables. |
-| `visualization/figures/**/*.png` | Training, milestone, and adaptive top-k calibration figures. |
+| `visualization/figures/**/*.png` | Fixed-budget loss/posterior, checkpoint-transfer, and adaptive top-k figures. |
 
 The training stage is intentionally strict: it refuses to run if prepared or compiled artifacts are missing, if generated probabilities are detached/non-finite, or if gradients become invalid.
 

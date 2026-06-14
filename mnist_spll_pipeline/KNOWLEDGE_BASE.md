@@ -774,9 +774,9 @@ for each case i in the current sum batch:
 loss = mean_i(-log(p_true_i + epsilon))
 ```
 
-The default config uses `sum_batch_size: 100`, matching `validation.interval_steps: 100`, so validation is requested after each 100-case optimizer update. Set `sum_batch_size: 1` to recover the older one-case-per-update behavior.
+The redesigned benchmark uses `sum_batch_size: 1`, so one training step is one iteration / one sum case. Pure exact and pure approximate runs train for fixed `max_steps`; there is no validation-driven early stopping.
 
-Pipeline II supports asynchronous validation through `validation.async.enabled`. The trainer snapshots the current model and optimizer state at validation intervals, sends the CPU snapshot to a separate validator process, and continues training. The validator computes task-level `sum_posterior_accuracy` by enumerating every generated-SPLL candidate sum `0..9*n_terms` for each held-out validation sum case and comparing the argmax posterior sum to the true sum. Milestone checkpoints must be written from the validated snapshot, not from the later live model. The trainer stops only after polling a validator result that reaches the highest milestone, so stopping can overshoot by one or more training batches when validation lags. On shutdown, the trainer drains the async result queue again after joining the worker so late completed validations are still recorded. The default async validator uses CPU and `max_pending_jobs: 1` to avoid MPS/GPU contention and unbounded snapshot memory.
+Pipeline II keeps the old full-posterior validation machinery as optional diagnostic plumbing, but the default redesigned benchmark sets `validation.enabled: false` and does not use held-out validation for checkpointing or plots. The main measured signals are training loss and training true-sum posterior probability `p(true_sum)`.
 
 Pipeline II rotates inference-mode run order by seed/experiment index instead of always running exact first. Run summaries record `mode_order_position`, `mode_order_offset`, and `run_order_index` so thermal/cache/load-order effects can be audited later.
 
@@ -819,12 +819,12 @@ Preferred Apple Silicon environment split:
 Pipeline II uses the official MNIST train partition only. It materializes one global equal-count-per-digit 80/20 split:
 
 - train source pool: used to sample sum-supervised training cases;
-- validation pool: used to sample held-out sum cases for full-posterior sum-accuracy validation;
+- validation pool: materialized for compatibility and optional diagnostics, but unused by the default redesigned benchmark;
 - official MNIST test partition: reserved/unused.
 
 The training schedule is compact and random-access deterministic. `prepare` writes manifests plus a small preview, not a huge JSONL schedule up to `max_steps`. A case is reproduced from `(seed, n_terms, step, split)`.
 
-Within one sum case, repeated digits must use distinct MNIST image indices. Across steps, replacement is allowed. In batched training, `step`, `max_steps`, `validation.interval_steps`, and milestone steps are measured in sum cases seen, not optimizer updates.
+Within one sum case, repeated digits must use distinct MNIST image indices. Across steps, replacement is allowed. In the redesigned benchmark, `step` and `max_steps` are training iterations / sum cases seen.
 
 ### 14.5 Exact and approximate modes
 
@@ -854,31 +854,43 @@ inference_modes:
 
 `exact` means true exact compilation without `-k`. Fixed numeric modes compile and run with that numeric threshold. Adaptive modes compile through the approximate code path using `-k 0.0` as the seed artifact, then mutate the generated module-level `TOP_K_CUTOFF` at runtime. The target is the mean unnormalised posterior mass that survives pruning when the validator enumerates all candidate sums.
 
-Adaptive cutoff search is deterministic bounded monotone bisection, not simulated annealing. This was chosen because increasing `TOP_K_CUTOFF` should only prune more branch mass, so a one-dimensional bounded search is faster, reproducible, and easier to defend experimentally. The search uses deterministic validation-style probe cases from the current model snapshot, stores the selected runtime cutoff in traces/summaries, and refreshes the trainer cutoff before preflight, validation submissions, synchronous validations, and final validation. Async validation workers tune their own loaded snapshot independently.
+Adaptive cutoff search is deterministic bounded monotone bisection, not simulated annealing. This was chosen because increasing `TOP_K_CUTOFF` should only prune more branch mass, so a one-dimensional bounded search is faster, reproducible, and easier to defend experimentally. In the redesigned benchmark, the search uses deterministic train-pool probe cases from the current model snapshot, stores the selected runtime cutoff in traces/summaries, and refreshes the trainer cutoff at preflight and final bookkeeping.
 
 Branch counting is enabled by default as sanity metadata. The loss uses only the probability component of the generated return value.
 
 A fully pruned true-sum path may return a literal Python `0.0` from the generated artifact instead of a tensor. Pipeline II treats this as a legitimate zero-mass pruning event, converts it to a model-connected zero tensor for `-log(epsilon)` training, logs `zero_true_mass=1`, and produces a zero-gradient optimizer step. Nonzero scalar probabilities are still invalid because they would indicate a detached generated-artifact path.
 
-### 14.6 Milestones, traces, and stopping
+### 14.6 Posterior checkpoints, traces, and fixed-budget stopping
 
-Pipeline II trains from sum labels only, and milestones are task-level `sum_posterior_accuracy` thresholds. Digit labels are used only to materialize balanced train/validation pools and to construct the true sum for generated cases.
+Pipeline II trains from sum labels only. The default benchmark no longer uses task-level validation accuracy milestones. Instead, after all pure exact seeds finish, the pipeline computes aggregate exact checkpoints by averaging the exact training `p(true_sum)` trace across seeds, applying a strict full-window rolling mean over `checkpointing.rolling_window_updates` (default 50), and finding crossings of `checkpointing.posterior_thresholds`. The first 50-point rolling value is emitted only after 50 updates; shorter prefix windows are not used. These aggregate checkpoints are the source of truth for checkpoint-transfer segments.
 
-Validation is interval-based. For each validation sum case, the validator enumerates every possible candidate sum through the compiled generated SPLL artifact, computes the posterior mass for each candidate, predicts the argmax candidate, and compares it with the true sum. A case whose approximate artifact prunes every candidate to zero total posterior mass is counted as incorrect and logged through `sum_posterior_zero_total_rate`. A milestone is recorded at the first observed validation point whose sum-posterior accuracy is at or above the threshold. Milestone checkpoints are mandatory.
+Training stops only at the configured fixed `max_steps`. Loss and true-sum posterior are logged in `train_trace.csv` and are the primary comparison metrics. Pure exact runs also save step checkpoints under `checkpoints/steps/` so aggregate checkpoint starts can be loaded exactly for each seed. Per-run `posterior_checkpoints.json` and `milestones.json` remain as compatibility/diagnostic outputs, but checkpoint-transfer uses `aggregate_checkpoints/terms_*_exact_posterior_checkpoints.json`.
+
+Pipeline II also supports a checkpoint-transfer recovery stage:
+
+```bash
+./.venv-train-arm64/bin/python run_spll_training_pipeline.py --config mnist_spll_training_config.yaml checkpoint-transfer
+```
+
+This reruns only the green checkpoint-to-checkpoint approximate continuations. It rebuilds aggregate exact checkpoints if needed, loads the exact per-seed step checkpoint at aggregate step `s_A`, trains the approximate mode on the same deterministic training cases `s_A+1..s_B`, and stops after the same number of sum cases the aggregate exact curve needed to reach the next anchor.
 
 Important run artifacts:
 
 - `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, gradient norm, and adaptive-cutoff metadata when applicable;
-- `validation_trace.csv`: backward-compatible `digit_accuracy` alias plus `sum_posterior_accuracy`, validation-case count, candidate count, mean true/predicted/total posterior mass, zero-total posterior rate, tie rate, validation branch-count mean, recent train means, validation snapshot step, trainer step when submitted/recorded, validation lag in steps, and adaptive runtime cutoff/search metadata when applicable;
-- `milestones.json`: first observed step/time for each milestone;
-- `checkpoints/milestone_*.pt`: first crossing snapshots;
-- `checkpoints/final.pt`: final snapshot.
+- `aggregate_checkpoints/terms_*_exact_posterior_checkpoints.json`: aggregate exact rolling checkpoints and per-seed exact step checkpoint paths;
+- `posterior_checkpoints.json`: per-run training true-sum posterior threshold crossings kept as diagnostic/compatibility metadata;
+- `milestones.json`: backward-compatible alias for the same posterior threshold crossings;
+- `checkpoint_transfer_trace.csv`: one row per approximate checkpoint-transfer segment;
+- `checkpoint_transfer_train_trace.csv`: per-iteration loss/posterior trace for the green checkpoint-transfer curve;
+- `checkpoints/steps/step_*.pt`: exact per-step snapshots used by aggregate checkpoint-transfer;
+- `checkpoints/posterior_*.pt`: per-run posterior-threshold crossing snapshots;
+- `checkpoints/final.pt`: final fixed-budget snapshot.
 
 Visualization behavior:
 
 - `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final sum-posterior accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
 - `visualize_spll_training.py` also writes `milestone_aggregate_summary.*`, which stores per-`(n_terms, mode, milestone)` reached-seed counts, means, sample standard deviations, configured uncertainty half-widths, and min/max values for steps and wall-clock time. It additionally writes `adaptive_topk_events.*` and `adaptive_topk_search_trace.*` when adaptive modes are present.
-- Main-text Pipeline II milestone figures for steps and wall-clock time are grouped bar charts split by arity: milestones are on the x-axis, the metric is on the y-axis, and inference modes are bars within each milestone group. Values are averaged across reached seeds for the same `(n_terms, mode, milestone)` cell, with configurable across-seed error bars enabled by default.
+- Main-text Pipeline II comparison figures are written per `(n_terms, approximate mode)`: blue is pure exact, red is pure approximate from initialization, and green is approximate checkpoint-transfer. Loss and true-sum posterior are separate figures, not dual-axis plots. Aggregate exact posterior checkpoints are marked by distinct purple X markers on the displayed exact rolling curve; the green checkpoint-transfer curve is intentionally split into disconnected segment pieces at those boundaries.
 - Pipeline II visualization uses a stable color map derived from inference-mode order. The same mode color is reused across steps-to-milestone, time-to-milestone, and trace figures.
 - Main-text Pipeline II trace figures compute rolling traces per seed first, then plot the across-seed mean with configurable uncertainty bands. This avoids hiding seed variability by smoothing only after aggregation. Raw traces are still exported to appendix figures with `_raw_trace` in the file name; raw uncertainty bands are disabled by default to keep appendix plots readable. Adaptive top-k cutoff and mass traces intentionally do **not** use rolling means because the values are calibrated control settings and deterministic bisection probes; smoothing would hide refresh jumps and convergence behavior.
 - Milestone figures keep unreached modes visible via summary tables and a plot footnote instead of silently pretending missing modes do not exist.

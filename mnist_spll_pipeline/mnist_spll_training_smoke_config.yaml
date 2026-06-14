@@ -5,6 +5,13 @@ paths:
 
 seeds: [42]
 
+checkpointing:
+  enabled: true
+  metric: true_sum_posterior
+  posterior_thresholds: [0.1, 0.2]
+  rolling_window_updates: 50
+  rolling_window_policy: full
+
 adaptive_top_k:
   posterior_mass_target: 0.8
   probe_cases: 5
@@ -14,15 +21,11 @@ adaptive_top_k:
   max_cutoff: 1.0
 
 training:
-  sum_batch_size: 50
-  max_steps: 500
+  sum_batch_size: 1
+  max_steps: 100
 
 validation:
-  interval_steps: 50
-  milestones: [0.1, 0.2]
-  sum_posterior:
-    num_cases: 20
-    zero_total_mass_tolerance: 1.0e-12
+  enabled: false
 
 schedule:
   preview_size: 20
@@ -30,7 +33,7 @@ schedule:
 experiments:
   - n_terms: 2
     enabled: true
-    max_steps: 500
+    max_steps: 100
 
 inference_modes:
   - name: exact

@@ -328,6 +328,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "mean_branch_count": None,
                             "final_loss": None,
                             "final_true_mass": None,
+                            "final_loss_recent_mean": None,
+                            "final_true_mass_recent_mean": None,
                         }
                     )
                     continue
@@ -379,6 +381,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "mean_branch_count": (sum(branch_values) / len(branch_values)) if branch_values else None,
                         "final_loss": final_loss,
                         "final_true_mass": final_true_mass,
+                        "final_loss_recent_mean": summary.get("final_loss_recent_mean"),
+                        "final_true_mass_recent_mean": summary.get("final_true_mass_recent_mean"),
                     }
                 )
     return rows
@@ -407,6 +411,345 @@ def _collect_adaptive_topk_trace_rows(config: Dict[str, Any], filename: str) -> 
                     )
                     rows.append(enriched)
     return rows
+
+
+def _checkpoint_transfer_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+    raw = config.get("checkpoint_transfer", {}) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("checkpoint_transfer must be a mapping when provided.")
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "anchor_mode_name": str(raw.get("anchor_mode_name", "exact")).strip() or "exact",
+        "mode_names": raw.get("mode_names"),
+    }
+
+
+def _checkpoint_transfer_run_dir(paths: Any, seed: int, n_terms: int, mode_name: str, anchor_mode_name: str) -> Path:
+    return paths.runs_root / f"seed_{int(seed)}_terms_{int(n_terms):02d}_transfer_{mode_name}_from_{anchor_mode_name}"
+
+
+def _aggregate_checkpoint_path(paths: Any, n_terms: int, anchor_mode_name: str) -> Path:
+    return paths.root / "aggregate_checkpoints" / f"terms_{int(n_terms):02d}_{anchor_mode_name}_posterior_checkpoints.json"
+
+
+def _collect_checkpoint_transfer_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cfg = _checkpoint_transfer_cfg(config)
+    if not cfg.get("enabled", True):
+        return []
+    anchor_mode_name = str(cfg["anchor_mode_name"])
+    requested_mode_names = cfg.get("mode_names")
+    allowed = None if requested_mode_names is None else {str(v) for v in requested_mode_names}
+    paths = training_paths(config)
+    rows: List[Dict[str, Any]] = []
+    for seed in get_seeds(config):
+        for experiment in get_experiments(config):
+            n_terms = int(experiment["n_terms"])
+            for mode in get_inference_modes(config):
+                mode_name = str(mode["name"])
+                if mode_name == anchor_mode_name:
+                    continue
+                if allowed is not None and mode_name not in allowed:
+                    continue
+                trace_path = _checkpoint_transfer_run_dir(paths, seed, n_terms, mode_name, anchor_mode_name) / "checkpoint_transfer_trace.csv"
+                for row in _read_trace_csv(trace_path):
+                    enriched = dict(row)
+                    enriched.update(
+                        {
+                            "seed": int(seed),
+                            "n_terms": int(n_terms),
+                            "mode_name": mode_name,
+                            "anchor_mode_name": anchor_mode_name,
+                        }
+                    )
+                    rows.append(enriched)
+    return rows
+
+
+def _merge_series_dict(
+    series_by_seed: Dict[int, Tuple[List[float], List[float]]],
+    config: Dict[str, Any],
+    *,
+    clamp_unit_interval: bool = False,
+) -> Tuple[List[float], List[float], List[float], List[float], List[int]]:
+    merged: Dict[float, List[float]] = {}
+    for xs, ys in series_by_seed.values():
+        for x, y in zip(xs, ys):
+            merged.setdefault(float(x), []).append(float(y))
+    xs = sorted(merged)
+    means: List[float] = []
+    lowers: List[float] = []
+    uppers: List[float] = []
+    counts: List[int] = []
+    for x in xs:
+        values = merged[x]
+        mean_value = _mean(values)
+        if mean_value is None:
+            continue
+        half_width = _uncertainty_half_width(values, config)
+        means.append(mean_value)
+        counts.append(len(values))
+        if half_width is None:
+            lower = mean_value
+            upper = mean_value
+        else:
+            lower = mean_value - half_width
+            upper = mean_value + half_width
+        lower = max(0.0, lower)
+        if clamp_unit_interval:
+            upper = min(1.0, upper)
+        uppers.append(upper)
+        lowers.append(lower)
+    return xs, means, lowers, uppers, counts
+
+
+def _pure_training_series_by_seed(
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_name: str,
+    value_key: str,
+    smooth_window: int,
+) -> Dict[int, Tuple[List[float], List[float]]]:
+    return _seed_trace_series(
+        config,
+        n_terms,
+        mode_name,
+        "train_trace.csv",
+        value_key,
+        smooth_window,
+    )
+
+
+def _checkpoint_transfer_anchor_metric_key(value_key: str) -> Optional[str]:
+    if value_key in {"true_mass", "true_mass_recent_mean"}:
+        return "anchor_rolling_true_mass_exact"
+    if value_key in {"loss", "loss_recent_mean"}:
+        return "anchor_rolling_loss_exact"
+    return None
+
+
+def _checkpoint_transfer_target_metric_key(value_key: str) -> Optional[str]:
+    if value_key in {"true_mass", "true_mass_recent_mean"}:
+        return "target_rolling_true_mass_exact"
+    if value_key in {"loss", "loss_recent_mean"}:
+        return "target_rolling_loss_exact"
+    return None
+
+
+def _checkpoint_transfer_segment_series_by_seed(
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_name: str,
+    anchor_mode_name: str,
+    value_key: str,
+    smooth_window: int,
+) -> List[Dict[int, Tuple[List[float], List[float]]]]:
+    """Return green checkpoint-transfer series split by exact-checkpoint segment.
+
+    Each segment is an independent approximate continuation from an exact
+    checkpoint.  The visualization must therefore not smooth or draw lines across
+    segment boundaries; otherwise the green curve looks like one continuous run
+    and hides the restart points.
+    """
+
+    paths = training_paths(config)
+    by_segment: Dict[int, Dict[int, Tuple[List[float], List[float]]]] = {}
+    for seed in get_seeds(config):
+        this_dir = _checkpoint_transfer_run_dir(paths, seed, n_terms, mode_name, anchor_mode_name)
+        # Segment metadata is read by the summary tables.  The plotted green
+        # curve intentionally uses only approximate-training observations, not
+        # the exact anchor value, so each full-window point represents 50
+        # approximate updates after the restart.
+        _segment_rows = _read_trace_csv(this_dir / "checkpoint_transfer_trace.csv")
+
+        train_rows = _read_trace_csv(this_dir / "checkpoint_transfer_train_trace.csv")
+        per_segment_step: Dict[int, Dict[int, List[float]]] = {}
+        for row in train_rows:
+            segment_index = _safe_int(row.get("segment_index"))
+            step = _safe_int(row.get("step"))
+            value = _safe_float(row.get(value_key))
+            if segment_index is None or step is None or value is None:
+                continue
+            per_segment_step.setdefault(int(segment_index), {}).setdefault(int(step), []).append(float(value))
+
+        for segment_index, per_step in per_segment_step.items():
+            xs: List[float] = []
+            ys: List[float] = []
+            for step in sorted(per_step):
+                xs.append(float(step))
+                ys.append(float(sum(per_step[step]) / len(per_step[step])))
+            if not xs:
+                continue
+            # Smooth only within this segment, never across checkpoint boundaries.
+            # Prefix points shorter than the full window are omitted, so segment
+            # starts cannot create unstable short-window spikes.
+            rolled_xs, rolled_ys = _full_window_rolling_series(xs, ys, smooth_window)
+            if not rolled_xs:
+                continue
+            by_segment.setdefault(segment_index, {})[int(seed)] = (rolled_xs, rolled_ys)
+
+    return [by_segment[index] for index in sorted(by_segment)]
+
+
+def _exact_posterior_checkpoint_markers(
+    config: Dict[str, Any],
+    n_terms: int,
+    anchor_mode_name: str,
+    value_key: str,
+) -> Tuple[List[float], List[float]]:
+    paths = training_paths(config)
+    aggregate_path = _aggregate_checkpoint_path(paths, n_terms, anchor_mode_name)
+    if not aggregate_path.exists():
+        return [], []
+    payload = _read_json(aggregate_path)
+    metric_key = "rolling_true_mass" if value_key in {"true_mass", "true_mass_recent_mean"} else "rolling_loss"
+    xs: List[float] = []
+    ys: List[float] = []
+    checkpoints = payload.get("posterior_checkpoints") or {}
+    for threshold in sorted(checkpoints, key=lambda value: float(value)):
+        info = checkpoints[threshold]
+        if not bool(info.get("reached", False)):
+            continue
+        step = _safe_float(info.get("step"))
+        value = _safe_float(info.get(metric_key))
+        if step is None or value is None:
+            continue
+        xs.append(float(step))
+        ys.append(float(value))
+    return xs, ys
+
+def _plot_checkpoint_transfer_metric_trajectory(
+    *,
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_name: str,
+    anchor_mode_name: str,
+    value_key: str,
+    ylabel: str,
+    output_path: Path,
+    smooth_window: int,
+    as_percent: bool = False,
+) -> None:
+    exact_series = _pure_training_series_by_seed(config, n_terms, anchor_mode_name, value_key, smooth_window)
+    pure_series = _pure_training_series_by_seed(config, n_terms, mode_name, value_key, smooth_window)
+    transfer_segments = _checkpoint_transfer_segment_series_by_seed(
+        config, n_terms, mode_name, anchor_mode_name, value_key, smooth_window
+    )
+    if not exact_series or not pure_series or not transfer_segments:
+        return
+
+    clamp = value_key in {"true_mass", "true_mass_recent_mean", "zero_true_mass"}
+    exact_xs, exact_means, exact_lowers, exact_uppers, _ = _merge_series_dict(exact_series, config, clamp_unit_interval=clamp)
+    pure_xs, pure_means, pure_lowers, pure_uppers, _ = _merge_series_dict(pure_series, config, clamp_unit_interval=clamp)
+    if not exact_xs or not pure_xs:
+        return
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    colors = {
+        "exact": "#3776d6",
+        "pure": "#d62728",
+        "transfer": "#2ca02c",
+        "checkpoint": "#7b3294",
+    }
+    draw_bands = _show_trace_uncertainty_bands(config, smooth_window)
+
+    factor = 100.0 if as_percent else 1.0
+
+    def scale_points(xs: List[float], ys: List[float], lowers: List[float], uppers: List[float]):
+        return (
+            [float(x) for x in xs],
+            [factor * float(y) for y in ys],
+            [factor * float(y) for y in lowers],
+            [factor * float(y) for y in uppers],
+        )
+
+    x_exact, y_exact, l_exact, u_exact = scale_points(exact_xs, exact_means, exact_lowers, exact_uppers)
+    x_pure, y_pure, l_pure, u_pure = scale_points(pure_xs, pure_means, pure_lowers, pure_uppers)
+
+    ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=2.0, label=f"Pure {anchor_mode_name}")
+    ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=2.0, label=f"Pure {mode_name}")
+
+    checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(config, n_terms, anchor_mode_name, value_key)
+    if checkpoint_x and checkpoint_y:
+        x_marks = [float(x) for x in checkpoint_x]
+        y_marks = [factor * float(y) for y in checkpoint_y]
+        ax.scatter(
+            x_marks,
+            y_marks,
+            marker="X",
+            s=78,
+            linewidths=0.9,
+            edgecolors="white",
+            color=colors["checkpoint"],
+            label="Aggregate exact checkpoints",
+            zorder=6,
+        )
+
+    plotted_transfer_label = False
+    for segment_series in transfer_segments:
+        transfer_xs, transfer_means, transfer_lowers, transfer_uppers, _ = _merge_series_dict(
+            segment_series,
+            config,
+            clamp_unit_interval=clamp,
+        )
+        if not transfer_xs:
+            continue
+        x_transfer, y_transfer, l_transfer, u_transfer = scale_points(
+            transfer_xs,
+            transfer_means,
+            transfer_lowers,
+            transfer_uppers,
+        )
+        ax.plot(
+            x_transfer,
+            y_transfer,
+            color=colors["transfer"],
+            linewidth=2.0,
+            label=(
+                f"{mode_name} from {anchor_mode_name} checkpoints"
+                if not plotted_transfer_label
+                else None
+            ),
+        )
+        if draw_bands and any(abs(u - l) > 0.0 for l, u in zip(l_transfer, u_transfer)):
+            ax.fill_between(
+                x_transfer,
+                l_transfer,
+                u_transfer,
+                color=colors["transfer"],
+                alpha=max(0.08, _trace_band_alpha(config) * 0.8),
+                linewidth=0,
+            )
+        plotted_transfer_label = True
+
+    if draw_bands:
+        if any(abs(u - l) > 0.0 for l, u in zip(l_exact, u_exact)):
+            ax.fill_between(x_exact, l_exact, u_exact, color=colors["exact"], alpha=_trace_band_alpha(config), linewidth=0)
+        if any(abs(u - l) > 0.0 for l, u in zip(l_pure, u_pure)):
+            ax.fill_between(x_pure, l_pure, u_pure, color=colors["pure"], alpha=_trace_band_alpha(config), linewidth=0)
+
+    smoothing_suffix = f" (full-window rolling mean, {smooth_window} updates)" if smooth_window > 1 else ""
+    ax.set_title(f"{n_terms}-term SPLL training: {ylabel}{smoothing_suffix}", loc="left")
+    ax.set_xlabel("Training iteration")
+    ax.set_ylabel(ylabel)
+    if as_percent:
+        ax.set_ylim(0.0, 105.0)
+    ax.grid(True, alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="best", frameon=False)
+    fig.text(
+        0.01,
+        0.015,
+        "Purple X markers are aggregate exact checkpoints computed from the same full-window rolling curve. Green pieces are separate approximate continuations; first short-window points in each segment are omitted.",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+    )
+    _add_uncertainty_note(fig, config, enabled=draw_bands, y=0.034)
+    fig.tight_layout(rect=(0, 0.065, 1, 1))
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _censor_note(config: Dict[str, Any], summaries: List[Dict[str, Any]], n_terms: int) -> str:
@@ -545,7 +888,7 @@ def _plot_metric_for_terms(
             ax.yaxis.set_major_formatter(mticker.FuncFormatter(_format_log_tick))
             ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.set_title(f"{n_terms}-term SPLL training: {ylabel}", loc="left")
-    ax.set_xlabel("Held-out sum posterior accuracy milestone")
+    ax.set_xlabel("Training true-sum posterior checkpoint")
     ax.set_ylabel(ylabel)
     ax.set_xticks(x_positions)
     ax.set_xticklabels([_format_milestone_label(value) for value in milestones])
@@ -567,20 +910,36 @@ def _plot_metric_for_terms(
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-def _rolling_mean(values: Sequence[float], window: int) -> List[float]:
-    if window <= 1:
-        return [float(v) for v in values]
-    result: List[float] = []
+def _full_window_rolling_series(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    window: int,
+) -> Tuple[List[float], List[float]]:
+    """Return a trailing rolling series with exactly ``window`` observations.
+
+    Prefix points with fewer than ``window`` observations are omitted.  This
+    means every displayed smoothed point and checkpoint crossing is based on the
+    same amount of evidence instead of using short unstable prefix averages.
+    """
+
+    max_window = max(1, int(window))
+    if max_window <= 1:
+        return [float(x) for x in xs], [float(y) for y in ys]
+
+    rolled_xs: List[float] = []
+    rolled_ys: List[float] = []
     running: Deque[float] = deque()
     total = 0.0
-    for value in values:
-        value = float(value)
-        running.append(value)
-        total += value
-        while len(running) > window:
+    for x, raw_y in zip(xs, ys):
+        y = float(raw_y)
+        running.append(y)
+        total += y
+        while len(running) > max_window:
             total -= running.popleft()
-        result.append(total / len(running))
-    return result
+        if len(running) == max_window:
+            rolled_xs.append(float(x))
+            rolled_ys.append(float(total / max_window))
+    return rolled_xs, rolled_ys
 
 
 def _seed_trace_series(
@@ -604,9 +963,12 @@ def _seed_trace_series(
             per_step.setdefault(step, []).append(value)
         if not per_step:
             continue
-        xs = sorted(per_step)
-        ys = [float(sum(per_step[x]) / len(per_step[x])) for x in xs]
-        by_seed[int(seed)] = (xs, _rolling_mean(ys, smooth_window))
+        xs = [float(x) for x in sorted(per_step)]
+        ys = [float(sum(per_step[int(x)]) / len(per_step[int(x)])) for x in xs]
+        rolled_xs, rolled_ys = _full_window_rolling_series(xs, ys, smooth_window)
+        if not rolled_xs:
+            continue
+        by_seed[int(seed)] = (rolled_xs, rolled_ys)
     return by_seed
 
 
@@ -683,7 +1045,7 @@ def _plot_trace(
     if not plotted:
         plt.close(fig)
         return
-    smoothing_suffix = f" (rolling mean, {smooth_window} points)" if smooth_window > 1 else ""
+    smoothing_suffix = f" (full-window rolling mean, {smooth_window} points)" if smooth_window > 1 else ""
     ax.set_title(f"{n_terms}-term SPLL training: {ylabel}{smoothing_suffix}", loc="left")
     ax.set_xlabel("Training step")
     ax.set_ylabel(ylabel)
@@ -863,12 +1225,13 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     stage_message(1, 3, "Writing resolved Pipeline II config snapshot")
     save_config(config, paths.config_used_path)
 
-    stage_message(2, 3, "Collecting milestone and run summaries")
+    stage_message(2, 3, "Collecting training, checkpoint, and run summaries")
     rows = _collect_rows(config)
     milestone_aggregates = _collect_milestone_aggregates(config, rows)
     run_summaries = _collect_run_summaries(config)
     adaptive_topk_events = _collect_adaptive_topk_trace_rows(config, "adaptive_topk_events.csv")
     adaptive_topk_search_rows = _collect_adaptive_topk_trace_rows(config, "adaptive_topk_search_trace.csv")
+    checkpoint_transfer_rows = _collect_checkpoint_transfer_rows(config)
     milestone_fields = [
         "seed",
         "n_terms",
@@ -908,6 +1271,8 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "mean_branch_count",
         "final_loss",
         "final_true_mass",
+        "final_loss_recent_mean",
+        "final_true_mass_recent_mean",
     ]
     milestone_aggregate_fields = [
         "n_terms",
@@ -980,15 +1345,45 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             "converged",
         ],
     )
+    _write_csv(
+        paths.tables_root / "checkpoint_transfer_summary.csv",
+        checkpoint_transfer_rows,
+        [
+            "seed",
+            "n_terms",
+            "mode_name",
+            "anchor_mode_name",
+            "segment_index",
+            "anchor_label",
+            "anchor_step",
+            "anchor_rolling_true_mass_exact",
+            "anchor_rolling_loss_exact",
+            "target_label",
+            "target_step",
+            "target_rolling_true_mass_exact",
+            "target_rolling_loss_exact",
+            "segment_cases",
+            "segment_elapsed_seconds",
+            "end_loss_transfer",
+            "end_true_mass_transfer",
+            "end_loss_recent_mean_transfer",
+            "end_true_mass_recent_mean_transfer",
+            "end_zero_true_mass_recent_rate_transfer",
+            "top_k_cutoff_runtime",
+            "posterior_mass_target",
+        ],
+    )
     write_json(paths.tables_root / "adaptive_topk_events.json", adaptive_topk_events)
     write_json(paths.tables_root / "adaptive_topk_search_trace.json", adaptive_topk_search_rows)
+    write_json(paths.tables_root / "checkpoint_transfer_summary.json", checkpoint_transfer_rows)
     print(f"Saved milestone summary to: {paths.tables_root / 'milestone_summary.csv'}")
     print(f"Saved milestone aggregate summary to: {paths.tables_root / 'milestone_aggregate_summary.csv'}")
     print(f"Saved run summary to: {paths.tables_root / 'run_summary.csv'}")
+    print(f"Saved checkpoint-transfer summary to: {paths.tables_root / 'checkpoint_transfer_summary.csv'}")
 
     stage_message(3, 3, "Writing Pipeline II figures")
     viz_cfg = config.get("visualization", {})
-    smooth_window = int(viz_cfg.get("trace_smoothing_window_points", 100))
+    smooth_window = int(viz_cfg.get("trace_smoothing_window_points", 50))
     for experiment in get_experiments(config):
         n_terms = int(experiment["n_terms"])
         _plot_metric_for_terms(
@@ -997,8 +1392,8 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             run_summaries=run_summaries,
             n_terms=n_terms,
             metric="step",
-            ylabel="Steps to milestone",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_steps_to_sum_posterior_milestone.png",
+            ylabel="Steps to posterior checkpoint",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_steps_to_true_sum_posterior_checkpoint.png",
         )
         _plot_metric_for_terms(
             config=config,
@@ -1006,8 +1401,8 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             run_summaries=run_summaries,
             n_terms=n_terms,
             metric="elapsed_seconds",
-            ylabel="Seconds to milestone",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_time_to_sum_posterior_milestone.png",
+            ylabel="Seconds to posterior checkpoint",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_time_to_true_sum_posterior_checkpoint.png",
             maybe_log=True,
         )
         _plot_trace(
@@ -1046,6 +1441,36 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_true_mass_raw_trace.png",
             smooth_window=1,
         )
+        checkpoint_transfer_cfg = _checkpoint_transfer_cfg(config)
+        anchor_mode_name = str(checkpoint_transfer_cfg.get("anchor_mode_name", "exact"))
+        requested_transfer_modes = checkpoint_transfer_cfg.get("mode_names")
+        for mode in get_inference_modes(config):
+            mode_name = str(mode["name"])
+            if mode_name == anchor_mode_name:
+                continue
+            if isinstance(requested_transfer_modes, list) and mode_name not in {str(v) for v in requested_transfer_modes}:
+                continue
+            _plot_checkpoint_transfer_metric_trajectory(
+                config=config,
+                n_terms=n_terms,
+                mode_name=mode_name,
+                anchor_mode_name=anchor_mode_name,
+                value_key="loss",
+                ylabel="Training loss",
+                output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_loss_exact_vs_{mode_name}.png",
+                smooth_window=smooth_window,
+            )
+            _plot_checkpoint_transfer_metric_trajectory(
+                config=config,
+                n_terms=n_terms,
+                mode_name=mode_name,
+                anchor_mode_name=anchor_mode_name,
+                value_key="true_mass",
+                ylabel="True-sum posterior (%)",
+                output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_true_mass_exact_vs_{mode_name}.png",
+                smooth_window=smooth_window,
+                as_percent=True,
+            )
         _plot_adaptive_topk_event_trace(
             config=config,
             n_terms=n_terms,

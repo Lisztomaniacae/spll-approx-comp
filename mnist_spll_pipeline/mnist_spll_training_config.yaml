@@ -1,5 +1,5 @@
 seed: 42
-seeds: [42,43,44,45,46]
+seeds: [42,43,44]
 show_progress: true
 
 paths:
@@ -38,26 +38,34 @@ training:
   device: auto
   require_mps: true
   # Number of SPLL sum cases accumulated into one optimizer update.
-  # With validation.interval_steps=100, sum_batch_size=100 validates after each batch.
+  # The redesigned benchmark uses batch=1 so one training step is one iteration.
   sum_batch_size: 1
-  max_steps: 10000     # measured in training sum cases, not optimizer updates
+  max_steps: 10000     # fixed training iterations / sum cases; no early stopping
   loss_epsilon: 1.0e-12
 
+checkpointing:
+  # Training checkpoints are triggered by the rolling mean of p(true_sum),
+  # not by held-out validation accuracy. These thresholds define the exact
+  # anchors used by checkpoint-transfer approximate runs.
+  enabled: true
+  metric: true_sum_posterior
+  posterior_thresholds: [0.2, 0.4, 0.6, 0.8]
+  rolling_window_updates: 50
+  rolling_window_policy: full
+
 validation:
+  # Kept as optional diagnostic plumbing, but not used by the redesigned benchmark.
+  enabled: false
   interval_steps: 100
   digit_eval_batch_size: 1024
-  milestones: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-  stop_at_highest_milestone: true
+  milestones: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  stop_at_highest_milestone: false
   sum_probe:
     enabled: false
     num_cases: 100
     zero_total_mass_tolerance: 1.0e-12
   async:
-    # Run validation in a separate process from training. The trainer snapshots
-    # model weights every validation interval and keeps training while the
-    # validator evaluates that snapshot. Milestone checkpoints are written from
-    # the validated snapshot, not from the later live model.
-    enabled: true
+    enabled: false
     device: cpu
     max_pending_jobs: 1
     validate_step_zero_synchronously: true
@@ -66,6 +74,17 @@ validation:
 
 schedule:
   preview_size: 20
+
+checkpoint_transfer:
+  # Build green “approx from exact checkpoint to exact checkpoint” trajectories
+  # after normal fixed-budget runs. Exact posterior checkpoints define segment
+  # anchors; each approximate segment uses the same number of sum cases exact
+  # needed to reach the next anchor.
+  enabled: true
+  anchor_mode_name: exact
+  # Null / omitted means: all non-anchor inference modes.
+  mode_names: null
+  include_final_checkpoint: true
 
 adaptive_top_k:
   # Adaptive approximate modes tune the generated artifact's mutable TOP_K_CUTOFF
@@ -78,7 +97,7 @@ adaptive_top_k:
   max_cutoff: 1.0
 
 visualization:
-  trace_smoothing_window_points: 100
+  trace_smoothing_window_points: 50
   # Across-seed uncertainty shown in milestone error bars and smoothed traces.
   # Options: std, sem, ci95, none. With five seeds, std is the most honest
   # default because it shows run-to-run spread without overclaiming precision.
@@ -92,15 +111,15 @@ visualization:
 experiments:
   - n_terms: 2
     enabled: true
-    max_steps: 10000
+    max_steps: 1500
 
 inference_modes:
   - name: exact
     top_k_cutoff: null
-  - name: approx_mass_0p8
-    top_k_cutoff: auto
-    adaptive_top_k: true
-    posterior_mass_target: 0.8
+  #- name: approx_mass_0p8
+  #  top_k_cutoff: auto
+ #   adaptive_top_k: true
+  #  posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
   - name: approx_0p05

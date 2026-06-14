@@ -15,9 +15,13 @@ STAGES: Dict[str, StageSpec] = {
     "prepare": ("prepare_spll_training", "run_prepare_stage"),
     "compile": ("compile_spll_training", "run_compile_stage"),
     "train": ("train_spll_generated", "run_train_stage"),
+    "checkpoint-transfer": ("train_spll_generated", "run_checkpoint_transfer_only_stage"),
     "visualize": ("visualize_spll_training", "run_visualization_stage"),
 }
 
+# The explicit checkpoint-transfer stage is a recovery/convenience entry point.
+# It is not part of ORDER because the normal train stage already runs it as its
+# final substage.
 ORDER = ["prepare", "compile", "train", "visualize"]
 
 
@@ -52,7 +56,7 @@ def main() -> None:
         "stage",
         nargs="?",
         default="all",
-        choices=["all", *ORDER],
+        choices=["all", *STAGES.keys()],
         help="Which Pipeline II stage to run. Default: all",
     )
     args = parser.parse_args()
