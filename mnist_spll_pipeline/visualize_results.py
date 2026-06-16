@@ -178,8 +178,7 @@ def threshold_sort_key(row: Dict[str, Any], threshold_order: Sequence[str]) -> T
 
 def compact_model_name(row: Dict[str, Any]) -> str:
     target_pct = int(round(100.0 * float(row.get("target_accuracy", row.get("selected_test_accuracy", 0.0)))))
-    biased_suffix = " biased" if "biased" in str(row.get("model_id", "")) else ""
-    return f"{target_pct}%{biased_suffix}"
+    return f"{target_pct}%"
 
 
 
@@ -499,11 +498,10 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
 
 
 
-def model_order_key(model_id: str, row: Dict[str, Any]) -> Tuple[float, int, float, str]:
+def model_order_key(model_id: str, row: Dict[str, Any]) -> Tuple[float, float, str]:
     target = float(row.get("target_accuracy", row.get("selected_test_accuracy", 0.0)))
     achieved = float(row.get("selected_test_accuracy", row.get("target_accuracy", target)))
-    biased_flag = 1 if is_biased_model_id(model_id) else 0
-    return (target, biased_flag, achieved, str(model_id))
+    return (target, achieved, str(model_id))
 
 
 
@@ -861,10 +859,6 @@ def build_model_styles(summary_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str
         }
     return styles
 
-
-
-def is_biased_model_id(model_id: str) -> bool:
-    return "biased" in str(model_id)
 
 
 def cutoff_marker_styles(threshold_labels: Sequence[str]) -> Dict[str, Dict[str, Any]]:
@@ -1628,7 +1622,6 @@ def plot_true_candidate_metric_vs_cutoff(
         metric_key: str,
         ylabel: str,
         title: str,
-        biased_only: bool | None = None,
         yscale: str | None = None,
         ylim: Tuple[float, float] | None = None,
 ) -> None:
@@ -1637,8 +1630,6 @@ def plot_true_candidate_metric_vs_cutoff(
 
     model_styles = build_model_styles(summary_rows)
     model_ids = ordered_model_ids(summary_rows)
-    if biased_only is not None:
-        model_ids = [mid for mid in model_ids if is_biased_model_id(mid) == biased_only]
     approx_thresholds = non_exact_threshold_labels(threshold_order)
     if not approx_thresholds or not model_ids:
         return
@@ -1697,10 +1688,7 @@ def plot_true_candidate_metric_vs_cutoff(
         ax.grid(alpha=0.45)
 
     finish_panel_grid(fig, axes, len(term_counts))
-    if biased_only is None:
-        legend_title = "Models"
-    else:
-        legend_title = "Biased models" if biased_only else "Unbiased models"
+    legend_title = "Models"
     handles = model_line_handles(model_ids, model_styles)
     if metric_key == "median_true_candidate_runtime_sec":
         handles.append(exact_reference_handle("exact true-sum runtime"))
@@ -1724,13 +1712,12 @@ def plot_runtime_vs_cutoff(
         term_counts: Sequence[int],
         threshold_order: Sequence[str],
         output_path: Path,
-        biased_only: bool,
 ) -> None:
     if not summary_rows:
         return
 
     model_styles = build_model_styles(summary_rows)
-    model_ids = [mid for mid in ordered_model_ids(summary_rows) if is_biased_model_id(mid) == biased_only]
+    model_ids = ordered_model_ids(summary_rows)
     approx_thresholds = non_exact_threshold_labels(threshold_order)
     if not approx_thresholds or not model_ids:
         return
@@ -1792,13 +1779,13 @@ def plot_runtime_vs_cutoff(
         ax.grid(alpha=0.45)
 
     finish_panel_grid(fig, axes, len(term_counts))
-    legend_title = "Biased models" if biased_only else "Unbiased models"
+    legend_title = "Models"
     handles = model_line_handles(model_ids, model_styles)
     handles.append(exact_reference_handle("exact runtime"))
     handles.extend(adaptive_marker_handles(approx_thresholds))
     place_horizontal_legends(
         fig,
-        title=f"Median runtime vs pruning threshold — {legend_title.lower()}",
+        title="Median runtime vs pruning threshold",
         legend_rows=[(handles, legend_title)],
         top=0.72,
         first_legend_y=0.905,
@@ -2386,12 +2373,10 @@ def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order:
         "Main figures:",
         "- runtime_accuracy_tradeoff_by_terms.png",
         "- figures/tradeoff_alternatives/01_tradeoff_matrix_by_terms.png (recommended alternative to the tradeoff scatter)",
-        "- runtime_vs_cutoff_unbiased_by_terms.png",
-        "- runtime_vs_cutoff_biased_by_terms.png",
+        "- runtime_vs_cutoff_by_terms.png",
         "- overhead_exact_vs_zero_cutoff_by_terms.png",
         "- accuracy_delta_vs_exact_by_terms.png",
-        "- true_candidate_runtime_vs_cutoff_unbiased_by_terms.png",
-        "- true_candidate_runtime_vs_cutoff_biased_by_terms.png",
+        "- true_candidate_runtime_vs_cutoff_by_terms.png",
         "- true_candidate_branch_count_vs_cutoff_by_terms.png",
         "- true_candidate_survival_vs_cutoff_by_terms.png",
         "- true_candidate_probability_vs_cutoff_by_terms.png",
@@ -2506,15 +2491,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         summary_rows=mode_rows,
         term_counts=term_counts,
         threshold_order=threshold_order,
-        output_path=main_dir / "runtime_vs_cutoff_unbiased_by_terms.png",
-        biased_only=False,
-    )
-    plot_runtime_vs_cutoff(
-        summary_rows=mode_rows,
-        term_counts=term_counts,
-        threshold_order=threshold_order,
-        output_path=main_dir / "runtime_vs_cutoff_biased_by_terms.png",
-        biased_only=True,
+        output_path=main_dir / "runtime_vs_cutoff_by_terms.png",
     )
     plot_accuracy_delta_vs_cutoff(
         summary_rows=mode_rows,
@@ -2526,22 +2503,10 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         summary_rows=mode_rows,
         term_counts=term_counts,
         threshold_order=threshold_order,
-        output_path=main_dir / "true_candidate_runtime_vs_cutoff_unbiased_by_terms.png",
+        output_path=main_dir / "true_candidate_runtime_vs_cutoff_by_terms.png",
         metric_key="median_true_candidate_runtime_sec",
         ylabel="Median true-sum-only runtime (s)",
-        title="True-sum-only runtime vs pruning threshold — unbiased models",
-        biased_only=False,
-        yscale="log",
-    )
-    plot_true_candidate_metric_vs_cutoff(
-        summary_rows=mode_rows,
-        term_counts=term_counts,
-        threshold_order=threshold_order,
-        output_path=main_dir / "true_candidate_runtime_vs_cutoff_biased_by_terms.png",
-        metric_key="median_true_candidate_runtime_sec",
-        ylabel="Median true-sum-only runtime (s)",
-        title="True-sum-only runtime vs pruning threshold — biased models",
-        biased_only=True,
+        title="True-sum-only runtime vs pruning threshold",
         yscale="log",
     )
     plot_true_candidate_metric_vs_cutoff(

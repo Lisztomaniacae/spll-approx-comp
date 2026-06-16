@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 from mnist_spll_common import TerminalProgressBar
 from mnist_spll_pipeline_core import (
+    PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF,
+    PIPELINE_I_ADAPTIVE_TOP_K_MIN_CUTOFF,
     PipelinePaths,
     ThresholdSpec,
     compiled_program_path,
@@ -447,8 +449,17 @@ class InferenceRunEngine:
         target = float(threshold.get("posterior_mass_target", 0.8))
         max_iterations = max(1, int(search_cfg.get("max_iterations", 14)))
         tolerance = max(0.0, float(search_cfg.get("tolerance", 0.02)))
-        low = max(0.0, min(1.0, float(search_cfg.get("min_cutoff", 0.0))))
-        high = max(low, min(1.0, float(search_cfg.get("max_cutoff", 1.0))))
+        low = max(
+            PIPELINE_I_ADAPTIVE_TOP_K_MIN_CUTOFF,
+            min(PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF, float(search_cfg.get("min_cutoff", 0.0))),
+        )
+        high = max(
+            low,
+            min(
+                PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF,
+                float(search_cfg.get("max_cutoff", PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF)),
+            ),
+        )
 
         evaluations: List[Dict[str, float]] = []
         started = time.perf_counter()
@@ -507,6 +518,8 @@ class InferenceRunEngine:
             "iterations": int(iterations),
             "converged": bool(best_error <= tolerance),
             "search_method": "bounded_monotone_bisection",
+            "search_min_cutoff": float(low),
+            "search_max_cutoff": float(high),
             "search_runtime_sec": float(runtime_sec),
             "evaluations": evaluations,
         }

@@ -333,12 +333,6 @@ def _build_aggregate_exact_checkpoints(
                     str(seed): str(_exact_step_checkpoint_path(run_dir(paths, seed, n_terms, anchor_mode_name), step))
                     for seed in seeds
                 }
-                missing = [path for path in paths_by_seed.values() if not Path(path).exists()]
-                if missing:
-                    raise FileNotFoundError(
-                        "Missing exact step checkpoint(s) needed for aggregate checkpoint transfer:\n"
-                        + "\n".join(missing[:20])
-                    )
                 checkpoints[key] = {
                     "reached": True,
                     "step": step,
@@ -418,6 +412,144 @@ def _build_aggregate_exact_checkpoints(
     ensure_dir(target_path.parent)
     write_json(target_path, payload)
     return payload
+
+
+def _materialize_aggregate_exact_anchor_checkpoints(
+    config: Dict[str, Any],
+    split_manifest: Dict[str, Any],
+    dataset: Any,
+    *,
+    n_terms: int,
+    anchor_mode_name: str,
+) -> None:
+    """Create checkpoint-transfer anchor snapshots outside timed training.
+
+    The timed exact run should measure generated-SPLL training, not per-step disk
+    checkpoint I/O. Aggregate checkpoints are therefore first selected from the
+    exact trace, then the exact run is replayed deterministically and only the
+    selected anchor steps are persisted. This keeps checkpoint-transfer support
+    without charging exact mode for writes that approximate modes do not need.
+    """
+
+    paths = training_paths(config)
+    aggregate_path = _aggregate_checkpoint_path(paths, n_terms, anchor_mode_name)
+    if not aggregate_path.exists():
+        return
+    aggregate = load_json(aggregate_path)
+    checkpoints = dict(aggregate.get("posterior_checkpoints") or {})
+    requested_by_seed: Dict[int, Dict[int, Path]] = {}
+
+    for checkpoint in checkpoints.values():
+        if not isinstance(checkpoint, dict) or not checkpoint.get("reached"):
+            continue
+        raw_step = checkpoint.get("step")
+        if raw_step is None:
+            continue
+        step = int(raw_step)
+        if step <= 0:
+            continue
+        for raw_seed, raw_path in dict(checkpoint.get("checkpoint_paths_by_seed") or {}).items():
+            path = Path(str(raw_path))
+            if path.exists():
+                continue
+            requested_by_seed.setdefault(int(raw_seed), {})[step] = path
+
+    if not requested_by_seed:
+        return
+
+    modes_by_name = {str(mode["name"]): mode for mode in get_inference_modes(config)}
+    if anchor_mode_name not in modes_by_name:
+        raise ValueError(f"Unknown checkpoint-transfer anchor mode: {anchor_mode_name!r}")
+    mode = modes_by_name[anchor_mode_name]
+
+    train_cfg = config.get("training", {})
+    device = resolve_device(str(train_cfg.get("device", "auto")), bool(train_cfg.get("require_mps", False)))
+    loss_epsilon = float(train_cfg.get("loss_epsilon", 1.0e-12))
+    sum_batch_size = max(1, int(train_cfg.get("sum_batch_size", 1)))
+    data_cfg = config.get("data", {})
+
+    total_steps = sum(len(steps) for steps in requested_by_seed.values())
+    print(
+        f"Materializing {total_steps} exact anchor checkpoint(s) for "
+        f"terms={n_terms}, mode={anchor_mode_name} outside timed training."
+    )
+
+    for seed, step_paths in sorted(requested_by_seed.items()):
+        max_step = max(step_paths)
+        set_seed(seed)
+        model = _load_initial_model(config, initial_checkpoint_path(paths, seed, n_terms), device)
+        optimizer = _make_optimizer(config, model)
+        module = load_compiled_training_module(compiled_program_path(paths, n_terms, mode), n_terms, anchor_mode_name)
+        cache = TensorLRUCache(
+            dataset,
+            device=device,
+            cache_device=str(data_cfg.get("image_cache_device", "device")),
+            max_items=int(data_cfg.get("image_cache_max_items", 4096)),
+            strategy=str(data_cfg.get("image_cache_strategy", "lru")),
+        )
+        setattr(module, "readMNist", DifferentiableReadMNIST(model, cache, device))
+        _run_preflight(
+            module=module,
+            model=model,
+            optimizer=optimizer,
+            split_manifest=split_manifest,
+            seed=seed,
+            n_terms=n_terms,
+            loss_epsilon=loss_epsilon,
+        )
+
+        cases_seen = 0
+        started_at = time.perf_counter()
+        progress = TerminalProgressBar(
+            max_step,
+            desc=f"Replay exact anchors terms={n_terms} seed={seed}",
+            unit="iterations",
+            enabled=bool(config.get("show_progress", True)),
+        )
+        try:
+            while cases_seen < max_step:
+                case_start_step = cases_seen + 1
+                case_end_step = min(max_step, cases_seen + sum_batch_size)
+                batch_cases = [
+                    generate_sum_case(
+                        split_manifest,
+                        base_seed=seed,
+                        n_terms=n_terms,
+                        step=case_step,
+                        split="train",
+                    )
+                    for case_step in range(case_start_step, case_end_step + 1)
+                ]
+                batch_stats = _train_sum_batch(
+                    module=module,
+                    model=model,
+                    optimizer=optimizer,
+                    cache=cache,
+                    device=device,
+                    cases=batch_cases,
+                    loss_epsilon=loss_epsilon,
+                )
+                cases_seen = case_end_step
+                if cases_seen in step_paths:
+                    save_training_checkpoint(
+                        step_paths[cases_seen],
+                        model=model,
+                        optimizer=optimizer,
+                        step=cases_seen,
+                        elapsed_seconds=time.perf_counter() - started_at,
+                        digit_accuracy_value=float(batch_stats["true_mass"]),
+                        config=config,
+                        seed=seed,
+                        n_terms=n_terms,
+                        mode=mode,
+                        validation_metric_name="aggregate_anchor_replay",
+                        sum_posterior_accuracy=float(batch_stats["true_mass"]),
+                    )
+                progress.update(batch_stats["batch_size"], postfix=f"step={cases_seen}")
+            progress.finish(postfix="anchors materialized")
+        finally:
+            cache.clear()
+            cleanup_torch()
 
 
 def _write_posterior_checkpoints_json(path: Path, checkpoints_state: Dict[str, Dict[str, Any]]) -> None:
@@ -1663,12 +1795,6 @@ def _train_one_run(
         checkpoint_thresholds = list(checkpoint_cfg["posterior_thresholds"])
         checkpoint_window = int(checkpoint_cfg["rolling_window_updates"])
         checkpointing_enabled = bool(checkpoint_cfg["enabled"])
-        transfer_cfg = _checkpoint_transfer_cfg(config)
-        save_exact_step_checkpoints = (
-            bool(transfer_cfg.get("enabled", True))
-            and mode_name == str(transfer_cfg.get("anchor_mode_name", "exact"))
-        )
-
         train_handle, train_writer = write_csv_header(
             this_run_dir / "train_trace.csv",
             [
@@ -1894,21 +2020,6 @@ def _train_one_run(
                 }
             )
 
-            if save_exact_step_checkpoints:
-                save_training_checkpoint(
-                    _exact_step_checkpoint_path(this_run_dir, cases_seen),
-                    model=model,
-                    optimizer=optimizer,
-                    step=cases_seen,
-                    elapsed_seconds=elapsed,
-                    digit_accuracy_value=float(rolling_true_mass if rolling_true_mass is not None else last_true_mass),
-                    config=config,
-                    seed=seed,
-                    n_terms=n_terms,
-                    mode=mode,
-                    validation_metric_name="exact_step_training_checkpoint",
-                    sum_posterior_accuracy=float(rolling_true_mass if rolling_true_mass is not None else last_true_mass),
-                )
 
             if checkpointing_enabled and rolling_true_mass is not None:
                 reached_new = False
@@ -2090,11 +2201,19 @@ def run_train_stage(config: Dict[str, Any]) -> None:
     transfer_cfg = _checkpoint_transfer_cfg(config)
     anchor_mode_name = str(transfer_cfg.get("anchor_mode_name", "exact"))
     for experiment in experiments:
+        n_terms = int(experiment["n_terms"])
         _build_aggregate_exact_checkpoints(
             config,
-            n_terms=int(experiment["n_terms"]),
+            n_terms=n_terms,
             anchor_mode_name=anchor_mode_name,
             include_final_checkpoint=bool(transfer_cfg.get("include_final_checkpoint", True)),
+        )
+        _materialize_aggregate_exact_anchor_checkpoints(
+            config,
+            split_manifest,
+            dataset,
+            n_terms=n_terms,
+            anchor_mode_name=anchor_mode_name,
         )
     _run_checkpoint_transfer_stage(config, split_manifest, dataset)
 
@@ -2117,11 +2236,19 @@ def run_checkpoint_transfer_only_stage(config: Dict[str, Any]) -> None:
     transfer_cfg = _checkpoint_transfer_cfg(config)
     anchor_mode_name = str(transfer_cfg.get("anchor_mode_name", "exact"))
     for experiment in get_experiments(config):
+        n_terms = int(experiment["n_terms"])
         _build_aggregate_exact_checkpoints(
             config,
-            n_terms=int(experiment["n_terms"]),
+            n_terms=n_terms,
             anchor_mode_name=anchor_mode_name,
             include_final_checkpoint=bool(transfer_cfg.get("include_final_checkpoint", True)),
+        )
+        _materialize_aggregate_exact_anchor_checkpoints(
+            config,
+            split_manifest,
+            dataset,
+            n_terms=n_terms,
+            anchor_mode_name=anchor_mode_name,
         )
     _run_checkpoint_transfer_stage(config, split_manifest, dataset)
 

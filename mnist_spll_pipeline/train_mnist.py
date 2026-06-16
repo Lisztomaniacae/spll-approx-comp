@@ -58,44 +58,44 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
 
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: Adam, device: torch.device) -> Dict[str, float]:
+def train_one_batch(
+        model: nn.Module,
+        batch: Tuple[torch.Tensor, torch.Tensor],
+        optimizer: Adam,
+        device: torch.device,
+) -> Dict[str, float]:
     model.train()
-    total_loss = 0.0
-    total_correct = 0
-    total_examples = 0
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+    images, labels = batch
+    images = images.to(device)
+    labels = labels.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
-        loss = F.cross_entropy(logits, labels)
-        loss.backward()
-        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(images)
+    loss = F.cross_entropy(logits, labels)
+    loss.backward()
+    optimizer.step()
 
-        total_loss += float(loss.item()) * labels.size(0)
-        total_correct += int((logits.argmax(dim=1) == labels).sum().item())
-        total_examples += int(labels.size(0))
-
+    correct = int((logits.argmax(dim=1) == labels).sum().item())
+    total_examples = int(labels.size(0))
     return {
-        "loss": total_loss / max(total_examples, 1),
-        "accuracy": total_correct / max(total_examples, 1),
+        "loss": float(loss.item()),
+        "accuracy": correct / max(total_examples, 1),
+        "examples": total_examples,
     }
 
 
 
-def choose_epoch_nearest_target(history: List[Dict[str, float]], target_accuracy: float) -> Tuple[int, Dict[str, float]]:
+def choose_checkpoint_nearest_target(history: List[Dict[str, Any]], target_accuracy: float) -> Tuple[int, Dict[str, Any]]:
     if not history:
-        raise RuntimeError("Cannot select an epoch from an empty training history.")
-    indexed = list(enumerate(history, start=1))
-    best_index, best_row = min(
-        indexed,
-        key=lambda item: (
-            abs(float(item[1]["test_accuracy"]) - float(target_accuracy)),
-            item[0],
+        raise RuntimeError("Cannot select a checkpoint from an empty training history.")
+    best_row = min(
+        history,
+        key=lambda row: (
+            abs(float(row["test_accuracy"]) - float(target_accuracy)),
+            int(row["optimizer_step"]),
         ),
     )
-    return best_index, best_row
+    return int(best_row["optimizer_step"]), best_row
 
 
 
@@ -352,31 +352,47 @@ def train_variant(
     ensure_dir(metrics_path.parent)
     ensure_dir(used_config_path.parent)
 
+    validation_interval_batches = max(1, int(variant.get(
+        "validation_interval_batches",
+        training_cfg.get("validation_interval_batches", 1),
+    )))
+
     history: List[Dict[str, Any]] = []
-    epoch_states: Dict[int, Dict[str, torch.Tensor]] = {}
+    checkpoint_states: Dict[int, Dict[str, torch.Tensor]] = {}
     best_overall_accuracy = float("-inf")
     best_overall_epoch = -1
+    best_overall_step = -1
     stopped_early = False
     stop_reason = "max_epochs"
+    optimizer_step = 0
 
     tolerance_display = f"{target_tolerance:.1%}" if target_tolerance is not None else "disabled"
     print(
         f"\n--- Training model variant '{variant['id']}' "
         f"(target={target_accuracy:.1%}, tolerance={tolerance_display}, "
+        f"validation_interval_batches={validation_interval_batches}, "
         f"train_examples={selected_train_examples}, validation_examples={selected_validation_examples}) ---"
     )
     print(
         f"train_mode={train_selection_meta['mode']} val_mode={validation_selection_meta['mode']}"
     )
-    for epoch in range(1, epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
+
+    def record_validation_checkpoint(epoch: int, batch_in_epoch: int, train_metrics: Dict[str, float]) -> Dict[str, Any]:
+        nonlocal best_overall_accuracy, best_overall_epoch, best_overall_step
         validation_metrics = evaluate(model, validation_loader, device)
         row = {
             "model_id": variant["id"],
             "target_accuracy": target_accuracy,
             "epoch": epoch,
+            "batch_in_epoch": batch_in_epoch,
+            "optimizer_step": optimizer_step,
             "train_examples": selected_train_examples,
             "validation_examples": selected_validation_examples,
+            "train_batch_loss": train_metrics["loss"],
+            "train_batch_accuracy": train_metrics["accuracy"],
+            "train_batch_examples": int(train_metrics["examples"]),
+            # Backward-compatible column names: these are batch-local because
+            # model selection now happens inside epochs, not only after them.
             "train_loss": train_metrics["loss"],
             "train_accuracy": train_metrics["accuracy"],
             "test_loss": validation_metrics["loss"],
@@ -384,36 +400,57 @@ def train_variant(
             "accuracy_gap_to_target": abs(float(validation_metrics["accuracy"]) - target_accuracy),
             "within_target_tolerance": int(within_target_tolerance(validation_metrics["accuracy"], target_accuracy, target_tolerance)),
             "target_tolerance": "" if target_tolerance is None else target_tolerance,
+            "selection_granularity": "batch",
+            "validation_interval_batches": validation_interval_batches,
         }
         history.append(row)
-        epoch_states[epoch] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        checkpoint_states[optimizer_step] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if float(validation_metrics["accuracy"]) > best_overall_accuracy:
             best_overall_accuracy = float(validation_metrics["accuracy"])
             best_overall_epoch = epoch
+            best_overall_step = optimizer_step
 
         print(
-            f"Epoch {epoch:02d}/{epochs} | "
-            f"train_loss={row['train_loss']:.4f} train_acc={row['train_accuracy']:.4%} | "
+            f"Epoch {epoch:02d}/{epochs} batch {batch_in_epoch:04d} step {optimizer_step:05d} | "
+            f"batch_loss={row['train_batch_loss']:.4f} batch_acc={row['train_batch_accuracy']:.4%} | "
             f"val_loss={row['test_loss']:.4f} val_acc={row['test_accuracy']:.4%} | "
             f"target_gap={row['accuracy_gap_to_target']:.4%}"
         )
+        return row
 
-        if within_target_tolerance(validation_metrics["accuracy"], target_accuracy, target_tolerance):
-            stopped_early = True
-            stop_reason = "target_tolerance_reached"
-            print(
-                f"Early stopping '{variant['id']}' at epoch {epoch} because val_acc={row['test_accuracy']:.4%} "
-                f"is within ±{target_tolerance:.1%} of target {target_accuracy:.1%}."
-            )
+    for epoch in range(1, epochs + 1):
+        last_row: Dict[str, Any] | None = None
+        for batch_in_epoch, batch in enumerate(train_loader, start=1):
+            optimizer_step += 1
+            train_metrics = train_one_batch(model, batch, optimizer, device)
+            if optimizer_step % validation_interval_batches == 0:
+                last_row = record_validation_checkpoint(epoch, batch_in_epoch, train_metrics)
+                if within_target_tolerance(float(last_row["test_accuracy"]), target_accuracy, target_tolerance):
+                    stopped_early = True
+                    stop_reason = "target_tolerance_reached"
+                    print(
+                        f"Early stopping '{variant['id']}' at step {optimizer_step} "
+                        f"(epoch {epoch}, batch {batch_in_epoch}) because "
+                        f"val_acc={last_row['test_accuracy']:.4%} is within ±{target_tolerance:.1%} "
+                        f"of target {target_accuracy:.1%}."
+                    )
+                    break
+        if stopped_early:
             break
+        if optimizer_step > 0 and (last_row is None or int(last_row["optimizer_step"]) != optimizer_step):
+            # Always keep an end-of-epoch selection candidate even when the interval
+            # does not divide the number of batches exactly.
+            last_row = record_validation_checkpoint(epoch, batch_in_epoch, train_metrics)
 
-    epochs_trained = len(history)
-    selected_epoch, selected_row = choose_epoch_nearest_target(history, target_accuracy)
-    selected_state = epoch_states.get(selected_epoch)
+    epochs_trained = epoch if optimizer_step > 0 else 0
+    selected_step, selected_row = choose_checkpoint_nearest_target(history, target_accuracy)
+    selected_state = checkpoint_states.get(selected_step)
     if selected_state is None:
-        raise RuntimeError(f"Selected epoch {selected_epoch} is missing a saved model state.")
+        raise RuntimeError(f"Selected optimizer step {selected_step} is missing a saved model state.")
 
+    selected_epoch = int(selected_row["epoch"])
+    selected_batch_in_epoch = int(selected_row["batch_in_epoch"])
     model.load_state_dict(selected_state)
     checkpoint = checkpoint_payload(
         model=model,
@@ -423,10 +460,15 @@ def train_variant(
         extra={
             "model_variant_id": variant["id"],
             "target_accuracy": target_accuracy,
+            "selection_granularity": "batch",
+            "validation_interval_batches": validation_interval_batches,
             "selected_epoch": selected_epoch,
+            "selected_batch_in_epoch": selected_batch_in_epoch,
+            "selected_optimizer_step": selected_step,
             "selected_test_accuracy": float(selected_row["test_accuracy"]),
             "selected_accuracy_gap": float(selected_row["accuracy_gap_to_target"]),
             "best_overall_epoch": best_overall_epoch,
+            "best_overall_optimizer_step": best_overall_step,
             "best_overall_test_accuracy": best_overall_accuracy,
             "train_examples": selected_train_examples,
             "validation_examples": selected_validation_examples,
@@ -437,6 +479,7 @@ def train_variant(
             "train_label_counts": train_selection_meta["selected_label_counts"],
             "validation_label_counts": validation_selection_meta["selected_label_counts"],
             "epochs_trained": epochs_trained,
+            "optimizer_steps_trained": optimizer_step,
             "target_tolerance": target_tolerance,
             "stopped_early": stopped_early,
             "stop_reason": stop_reason,
@@ -447,21 +490,28 @@ def train_variant(
     save_config(config, used_config_path)
 
     print(
-        f"Selected epoch {selected_epoch} for '{variant['id']}' with val_acc={selected_row['test_accuracy']:.4%} "
+        f"Selected step {selected_step} (epoch {selected_epoch}, batch {selected_batch_in_epoch}) "
+        f"for '{variant['id']}' with val_acc={selected_row['test_accuracy']:.4%} "
         f"(target={target_accuracy:.4%}, gap={selected_row['accuracy_gap_to_target']:.4%})."
     )
     print(f"Saved model checkpoint to: {export_path}")
-    print(f"Saved per-epoch metrics to: {metrics_path}")
+    print(f"Saved batch-granular metrics to: {metrics_path}")
 
     return {
         "model_id": variant["id"],
         "target_accuracy": target_accuracy,
         "selected_epoch": selected_epoch,
+        "selected_batch_in_epoch": selected_batch_in_epoch,
+        "selected_optimizer_step": selected_step,
         "selected_test_accuracy": float(selected_row["test_accuracy"]),
         "selected_accuracy_gap": float(selected_row["accuracy_gap_to_target"]),
         "best_overall_epoch": best_overall_epoch,
+        "best_overall_optimizer_step": best_overall_step,
         "best_overall_test_accuracy": best_overall_accuracy,
         "epochs_trained": epochs_trained,
+        "optimizer_steps_trained": optimizer_step,
+        "selection_granularity": "batch",
+        "validation_interval_batches": validation_interval_batches,
         "target_tolerance": target_tolerance,
         "stopped_early": stopped_early,
         "stop_reason": stop_reason,

@@ -295,6 +295,8 @@ inference:
     probe_experiments: 20
     max_iterations: 14
     tolerance: 0.02
+    min_cutoff: 0.0
+    max_cutoff: 0.5
   approximation_thresholds:
     - null
     - 0.01
@@ -304,7 +306,7 @@ inference:
       posterior_mass_target: 0.8
 ```
 
-The adaptive search is deterministic bounded bisection, not simulated annealing. Pipeline I tunes once per model, term count, cutoff mode, and adaptive threshold label, using the first configured staged probe experiments for that term count. It logs `runtime_top_k_cutoff`, `mean_surviving_posterior_mass`, `adaptive_cutoff_search_runtime_sec`, and visualizable bisection evaluations under `visualization/tables/adaptive_topk_search_trace.*`; timed posterior inference remains separate from cutoff-search runtime. The adaptive top-k search figures use a single shared legend across term-count panels instead of repeating the same legend inside each subplot. Adaptive runs use their own `cutoff_topk` artifact per term count, and fixed-cutoff runs still reset `TOP_K_CUTOFF` before every measured posterior so runtime cutoff state cannot leak across measurements.
+The adaptive search is deterministic bounded bisection over cutoff values in `[0.0, 0.5]`, not simulated annealing. Pipeline I tunes once per model, term count, cutoff mode, and adaptive threshold label, using the first configured staged probe experiments for that term count. It logs `runtime_top_k_cutoff`, `mean_surviving_posterior_mass`, `adaptive_cutoff_search_runtime_sec`, and visualizable bisection evaluations under `visualization/tables/adaptive_topk_search_trace.*`; timed posterior inference remains separate from cutoff-search runtime. The adaptive top-k search figures use a single shared legend across term-count panels instead of repeating the same legend inside each subplot. Adaptive runs use their own `cutoff_topk` artifact per term count, and fixed-cutoff runs still reset `TOP_K_CUTOFF` before every measured posterior so runtime cutoff state cannot leak across measurements.
 
 ### Inference-time `readMNist` caching
 

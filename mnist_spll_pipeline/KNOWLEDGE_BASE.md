@@ -164,7 +164,7 @@ Important keys under `inference:`:
 | `sample_without_replacement_within_experiment` | If true, one staged sum does not reuse the same inference example twice. |
 | `top_predictions_to_store` | Number of top posterior candidates serialized in detailed visualization rows. |
 | `approximation_thresholds` | List of threshold specs. `null` means exact/no pruning, numeric values mean fixed approximate pruning thresholds, and mapping entries with `top_k_cutoff: auto` enable adaptive posterior-mass cutoff tuning. |
-| `adaptive_top_k` | Optional defaults for Pipeline I adaptive threshold entries: `posterior_mass_target`, `probe_experiments`, `max_iterations`, `tolerance`, `min_cutoff`, and `max_cutoff`. |
+| `adaptive_top_k` | Optional defaults for Pipeline I adaptive threshold entries: `posterior_mass_target`, `probe_experiments`, `max_iterations`, `tolerance`, `min_cutoff`, and `max_cutoff`. For Pipeline I, the adaptive cutoff search span is constrained to `[0.0, 0.5]`. |
 | `count_branches` | If true, SPLL compilation uses `-c` and compiled probability calls return branch metadata. |
 | `force_recompile` | If false and a compiled `program.py` already exists, compile can skip regeneration. |
 | `compile_timeout_sec` | Timeout for the Stack compilation subprocess. |
@@ -200,7 +200,7 @@ inference:
       posterior_mass_target: 0.8
 ```
 
-Pipeline I tuning is deterministic bounded monotone bisection over cutoff values. It runs once per `(model_id, cutoff_mode, n_terms, adaptive threshold label)` using the first configured staged probe experiments for that term count. The search objective is mean unnormalised posterior mass that survives pruning across full candidate-sum enumeration. Timed posterior inference remains separate from cutoff-search runtime, and raw runs log `runtime_top_k_cutoff`, `mean_surviving_posterior_mass`, `adaptive_cutoff_search_runtime_sec`, the complete `adaptive_cutoff_state`, and visualizable bisection rows in `visualization/tables/adaptive_topk_search_trace.*`. The Pipeline I adaptive top-k search figures share one figure-level legend across all term-count panels; do not reintroduce per-panel duplicate legends unless the plotted series differ by panel. Adaptive thresholds compile into their own `cutoff_topk` artifact directory for each term count, while numeric `0.0` remains `cutoff_0p0`; `InferenceRunEngine.run_one` still resets `TOP_K_CUTOFF` before every fixed-cutoff run so runtime state cannot leak across measurements.
+Pipeline I tuning is deterministic bounded monotone bisection over cutoff values in `[0.0, 0.5]`. It runs once per `(model_id, cutoff_mode, n_terms, adaptive threshold label)` using the first configured staged probe experiments for that term count. The search objective is mean unnormalised posterior mass that survives pruning across full candidate-sum enumeration. Timed posterior inference remains separate from cutoff-search runtime, and raw runs log `runtime_top_k_cutoff`, `mean_surviving_posterior_mass`, `adaptive_cutoff_search_runtime_sec`, the complete `adaptive_cutoff_state`, and visualizable bisection rows in `visualization/tables/adaptive_topk_search_trace.*`. The Pipeline I adaptive top-k search figures share one figure-level legend across all term-count panels; do not reintroduce per-panel duplicate legends unless the plotted series differ by panel. Adaptive thresholds compile into their own `cutoff_topk` artifact directory for each term count, while numeric `0.0` remains `cutoff_0p0`; `InferenceRunEngine.run_one` still resets `TOP_K_CUTOFF` before every fixed-cutoff run so runtime state cannot leak across measurements.
 
 ### Cutoff mode caveat
 
@@ -212,17 +212,9 @@ The Python pipeline currently uses only the accumulated global path-mass cutoff.
 
 The YAML may still contain a `cutoff_modes:` key for historical reasons, but it is no longer a real user-facing knob. Do not reintroduce local/global branching unless the experiment design explicitly needs it and all artifact paths, visualization grouping, and documentation are updated.
 
-### Training config and biased variants
+### Training config and target-accuracy variants
 
-Training uses configured `model_variants`. Each variant is trained and the exported checkpoint is chosen by the epoch whose validation accuracy is closest to `target_accuracy`.
-
-Current biased variants use:
-
-- an extreme broken-prior training distribution;
-- a uniform validation distribution;
-- the same global inference holdout as other variants.
-
-This design intentionally keeps inference comparable across biased and unbiased models while making the trained model priors distorted.
+Training uses configured `model_variants`. Each variant is trained once and the exported checkpoint is now chosen from batch-level validation checkpoints, not only from epoch ends. The default config keeps one model per target accuracy (`acc50`, `acc70`, `acc90`) and no longer maintains separate skewed-data model variants.
 
 ### Naming caveat: test versus validation
 
@@ -267,9 +259,8 @@ Important training functions:
 Training caveats:
 
 - Target accuracy is a selection target, not a guarantee.
-- Low-accuracy variants are produced mostly through smaller models, limited examples, and early/nearest checkpoint selection.
+- Low-accuracy variants are produced mostly through smaller models, limited examples, and nearest batch-level checkpoint selection.
 - `require_mps: true` will fail if MPS is unavailable.
-- Validation can be distribution-controlled separately from training, which is important for biased variants.
 
 ### 6.2 Compile stage
 
@@ -661,7 +652,7 @@ Use John Ousterhout-style deep modules: small interface, substantial hidden impl
 2. **Visualization metrics module.** Split metric derivation from plotting so tables can be boundary-tested without matplotlib.
 3. **Compile artifact manager.** Move SPLL source generation, artifact pathing, Stack invocation, and manifest rows behind a small compile API.
 4. **Stage experiment repository.** Represent staged experiments as typed records instead of ad-hoc dicts.
-5. **Training variant planner.** Deepen biased/unbiased subset selection and checkpoint-selection semantics into a testable plan.
+5. **Training variant planner.** Deepen target-accuracy variant and checkpoint-selection semantics into a testable plan.
 
 ## 10. Testing Strategy Guidelines
 

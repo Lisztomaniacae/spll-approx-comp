@@ -32,6 +32,8 @@ from mnist_spll_common import (
 
 
 ADAPTIVE_TOP_K_ARTIFACT_LABEL = "cutoff_topk"
+PIPELINE_I_ADAPTIVE_TOP_K_MIN_CUTOFF = 0.0
+PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF = 0.5
 
 
 @dataclass(frozen=True)
@@ -109,7 +111,7 @@ def _normalise_cutoff_search_config(config: Dict[str, Any], threshold: Dict[str,
     max_iterations = get_int("max_iterations", 14)
     tolerance = get_float("tolerance", 0.02)
     min_cutoff = get_float("min_cutoff", 0.0)
-    max_cutoff = get_float("max_cutoff", 1.0)
+    max_cutoff = get_float("max_cutoff", PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF)
 
     if probe_experiments <= 0:
         raise ValueError("inference.adaptive_top_k.probe_experiments must be positive.")
@@ -117,9 +119,16 @@ def _normalise_cutoff_search_config(config: Dict[str, Any], threshold: Dict[str,
         raise ValueError("inference.adaptive_top_k.max_iterations must be positive.")
     if tolerance < 0.0:
         raise ValueError("inference.adaptive_top_k.tolerance must be non-negative.")
-    if not (0.0 <= min_cutoff <= 1.0 and 0.0 <= max_cutoff <= 1.0 and min_cutoff <= max_cutoff):
+    if not (
+        PIPELINE_I_ADAPTIVE_TOP_K_MIN_CUTOFF
+        <= min_cutoff
+        <= max_cutoff
+        <= PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF
+    ):
         raise ValueError(
-            "inference.adaptive_top_k min_cutoff/max_cutoff must satisfy 0 <= min_cutoff <= max_cutoff <= 1."
+            "Pipeline I adaptive top-k search bounds must satisfy "
+            f"{PIPELINE_I_ADAPTIVE_TOP_K_MIN_CUTOFF:g} <= min_cutoff <= max_cutoff <= "
+            f"{PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF:g}."
         )
 
     return {
