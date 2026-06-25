@@ -214,7 +214,7 @@ The YAML may still contain a `cutoff_modes:` key for historical reasons, but it 
 
 ### Training config and target-accuracy variants
 
-Training uses configured `model_variants`. Each variant is trained once and the exported checkpoint is now chosen from batch-level validation checkpoints, not only from epoch ends. The default config keeps one model per target accuracy (`acc50`, `acc70`, `acc90`) and no longer maintains separate skewed-data model variants.
+Training uses configured `model_variants`. Each variant is trained once and the exported checkpoint is chosen from batch-level validation checkpoints, not only from epoch ends. The default config keeps standard models at 50%, 70%, and 90% targets (`acc50`, `acc70`, `acc90`) plus biased counterparts (`biased_acc50`, `biased_acc70`, `biased_acc90`). YAML merge anchors make each biased counterpart inherit the same target, architecture, budget, and optimizer settings as its standard peer; only `train_label_distribution` changes. Validation remains unskewed so the target accuracies are selected on the same distribution. Biased variants carry `visualization_group: biased_tradeoff` and are excluded from every existing figure except the dedicated biased runtime–accuracy tradeoff counterpart.
 
 ### Naming caveat: test versus validation
 
@@ -556,7 +556,7 @@ Exact-baseline deltas are computed within the same `(cutoff_mode, model_id, n_te
 
 Visualization layout notes:
 
-- The main runtime–accuracy tradeoff figure is split by term count and is plotted relative to exact inference, not on raw accuracy/runtime axes. Each panel uses `runtime / exact_runtime` on the x-axis and accuracy delta in percentage points versus exact on the y-axis, with exact shown once as the `(1, 0)` reference. This keeps the plot focused on the approximation tradeoff instead of mixing it with the baseline quality differences between trained models.
+- The main runtime–accuracy tradeoff figure is split by model target and term count. Each panel keeps cutoff on the x-axis, plots speedup (`exact runtime / approximate runtime`) on the blue left axis, accuracy retained versus the same model's exact inference on the red right axis, and a dashed mean normalized score. The adaptive mass-0.8 point is baked into the series as a star marker. `runtime_accuracy_tradeoff_by_terms.png` contains only `visualization_group: main`; `runtime_accuracy_tradeoff_biased_models_by_terms.png` repeats the identical design using only `visualization_group: biased_tradeoff`.
 - Runtime-vs-cutoff figures keep cutoff on the numeric x-axis. Fixed cutoff runs use their configured cutoff value, while adaptive posterior-mass runs use the selected runtime `TOP_K_CUTOFF` and a visibly larger star marker.
 - Full-posterior and true-sum-only runtime-vs-cutoff figures draw dashed horizontal exact-runtime reference lines for each model in the same color as that model's approximate series. These are visual references only; the exact rows remain outside the cutoff x-axis.
 - The target-vs-achieved model-accuracy figure is vertical by metric: models sit on the x-axis and accuracy sits on the y-axis, with paired target/achieved markers connected per model.

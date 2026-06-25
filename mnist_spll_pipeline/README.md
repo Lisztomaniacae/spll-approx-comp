@@ -132,9 +132,11 @@ Important artifacts:
 | `inference_manifest.json` | `infer` | Inference run metadata. |
 | `inference_runs.json` | `infer` | Raw posterior/runtime/branch-count records. |
 | `visualization/tables/*.csv` | `visualize` | Derived result tables. |
-| `visualization/figures/**/*.png` | `visualize` | Main and appendix figures. |
+| `visualization/figures/**/*.png` | `visualize` | Main and appendix figures. The standard centerpiece remains `main_text/runtime_accuracy_tradeoff_by_terms.png`; biased counterparts are isolated in `main_text/runtime_accuracy_tradeoff_biased_models_by_terms.png`. |
 
 Treat `inference_runs.json` as the main empirical artifact. Visualization should derive results from it rather than rerunning inference.
+
+The default Pipeline I config trains three standard models and three label-biased counterparts at the same 50%, 70%, and 90% validation targets. YAML merge anchors keep each biased model's architecture and training budget identical to its standard counterpart; only the training-label distribution changes. The biased runs are tagged with `visualization_group: biased_tradeoff`, so every existing plot continues to use only standard models and only the dedicated biased runtime–accuracy tradeoff figure consumes the biased rows.
 
 ---
 

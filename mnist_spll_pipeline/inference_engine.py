@@ -251,6 +251,7 @@ class ModelInferenceContext:
     """Stable model metadata copied into every raw inference run record."""
 
     model_id: str
+    visualization_group: str
     target_accuracy: float
     selected_epoch: int
     selected_test_accuracy: float
@@ -261,12 +262,14 @@ class ModelInferenceContext:
         cls,
         *,
         model_id: str,
+        visualization_group: str,
         target_accuracy: float,
         model_path: Path,
         checkpoint_meta: Dict[str, Any],
     ) -> "ModelInferenceContext":
         return cls(
             model_id=model_id,
+            visualization_group=str(visualization_group or "main"),
             target_accuracy=float(target_accuracy),
             selected_epoch=int(checkpoint_meta.get("selected_epoch", checkpoint_meta.get("best_epoch", -1))),
             selected_test_accuracy=float(
@@ -662,6 +665,7 @@ class InferenceRunEngine:
         compiled_program_sha256 = sha256_file(compiled_path) if compiled_path.exists() else ""
         return {
             "model_id": self.model.model_id,
+            "visualization_group": self.model.visualization_group,
             "target_accuracy": self.model.target_accuracy,
             "selected_epoch": self.model.selected_epoch,
             "selected_test_accuracy": self.model.selected_test_accuracy,

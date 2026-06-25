@@ -41,10 +41,11 @@ training:
   # Each variant is trained once. The exported checkpoint is the batch-level
   # validation point whose accuracy is closest to target_accuracy. Running the
   # validation suite after every optimizer step makes low/mid/high target models
-  # much easier to hit without extra skewed-data model variants.
+  # easier to hit for both the standard and biased counterpart sets.
   validation_interval_batches: 1
   model_variants:
-    - id: acc50
+    - &acc50
+      id: acc50
       target_accuracy: 0.50
       max_train_examples: 20000
       epochs: 15
@@ -53,7 +54,8 @@ training:
         conv_channels: []
         fc_hidden: 4
 
-    - id: acc70
+    - &acc70
+      id: acc70
       target_accuracy: 0.70
       max_train_examples: 9000
       target_tolerance: 0.005
@@ -62,7 +64,8 @@ training:
         conv_channels: []
         fc_hidden: 8
 
-    - id: acc90
+    - &acc90
+      id: acc90
       target_accuracy: 0.90
       epochs: 15
       target_tolerance: 0.005
@@ -72,9 +75,42 @@ training:
         fc_hidden: 12
         dropout: 0.1
 
+    # Biased counterparts are deliberately isolated from the standard figure
+    # bundle. They reuse the exact architecture/training budget/accuracy target
+    # of the anchors above and only alter the training-label distribution.
+    # Validation remains on the shared unskewed split so the nominal accuracy
+    # targets stay comparable with the standard counterparts.
+    - <<: *acc50
+      id: biased_acc50
+      visualization_group: biased_tradeoff
+      train_sampling_with_replacement: true
+      train_label_distribution: &low_digit_bias
+        0: 0.14
+        1: 0.14
+        2: 0.14
+        3: 0.14
+        4: 0.14
+        5: 0.06
+        6: 0.06
+        7: 0.06
+        8: 0.06
+        9: 0.06
+
+    - <<: *acc70
+      id: biased_acc70
+      visualization_group: biased_tradeoff
+      train_sampling_with_replacement: true
+      train_label_distribution: *low_digit_bias
+
+    - <<: *acc90
+      id: biased_acc90
+      visualization_group: biased_tradeoff
+      train_sampling_with_replacement: true
+      train_label_distribution: *low_digit_bias
+
 inference:
   device: auto
-  num_experiments: 3000
+  num_experiments: 1000
   terms_per_sum_min: 2
   terms_per_sum_max: 4
   sample_without_replacement_within_experiment: true

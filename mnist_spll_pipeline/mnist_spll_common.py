@@ -332,6 +332,7 @@ def get_model_variants(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         variant["target_accuracy"] = target_accuracy
         variant["epochs"] = int(raw_variant.get("epochs", training_cfg.get("epochs", 8)))
         variant["selection_mode"] = selection_mode
+        variant["visualization_group"] = str(raw_variant.get("visualization_group", "main")).strip() or "main"
         variant["model"] = merge_model_config(base_model_cfg, raw_variant.get("model", {}))
         variants.append(variant)
     return variants

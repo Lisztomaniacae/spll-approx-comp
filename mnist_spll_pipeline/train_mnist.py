@@ -459,6 +459,7 @@ def train_variant(
         best_test_accuracy=float(selected_row["test_accuracy"]),
         extra={
             "model_variant_id": variant["id"],
+            "visualization_group": variant.get("visualization_group", "main"),
             "target_accuracy": target_accuracy,
             "selection_granularity": "batch",
             "validation_interval_batches": validation_interval_batches,
@@ -499,6 +500,7 @@ def train_variant(
 
     return {
         "model_id": variant["id"],
+        "visualization_group": variant.get("visualization_group", "main"),
         "target_accuracy": target_accuracy,
         "selected_epoch": selected_epoch,
         "selected_batch_in_epoch": selected_batch_in_epoch,

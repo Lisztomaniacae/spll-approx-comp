@@ -77,6 +77,7 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
         checkpoint_meta = torch.load(model_path, map_location="cpu")
         model_context = ModelInferenceContext.from_checkpoint(
             model_id=model_id,
+            visualization_group=str(variant.get("visualization_group", "main")),
             target_accuracy=target_accuracy,
             model_path=model_path,
             checkpoint_meta=checkpoint_meta,
@@ -121,6 +122,9 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                 "infer",
                 extra={
                     "model_variants": [variant["id"] for variant in model_variants],
+                    "model_visualization_groups": {
+                        variant["id"]: variant.get("visualization_group", "main") for variant in model_variants
+                    },
                     "device": str(device),
                     "cutoff_modes": cutoff_modes,
                     "thresholds": [threshold_spec_for_json(threshold) for threshold in thresholds],
@@ -147,6 +151,9 @@ def run_inference_stage(config: Dict[str, Any]) -> None:
                 "infer_runs",
                 extra={
                     "model_variants": [variant["id"] for variant in model_variants],
+                    "model_visualization_groups": {
+                        variant["id"]: variant.get("visualization_group", "main") for variant in model_variants
+                    },
                     "device": str(device),
                     "cutoff_modes": cutoff_modes,
                     "thresholds": [threshold_spec_for_json(threshold) for threshold in thresholds],

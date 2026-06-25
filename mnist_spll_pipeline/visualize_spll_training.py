@@ -9,6 +9,9 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.colors import to_rgb
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 from mnist_spll_common import load_config, save_config, stage_message
 from mnist_spll_pipeline_core import write_json
@@ -278,6 +281,53 @@ def _mode_color_map(config: Dict[str, Any]) -> Dict[str, str]:
         "#BAB0AC",
     ]
     return {mode_name: palette[idx % len(palette)] for idx, mode_name in enumerate(_mode_order(config))}
+
+
+def _mode_cfg(config: Dict[str, Any], mode_name: str) -> Dict[str, Any]:
+    for mode in get_inference_modes(config):
+        if str(mode.get("name")) == str(mode_name):
+            return dict(mode)
+    return {}
+
+
+def _non_anchor_mode_names(config: Dict[str, Any], anchor_mode_name: str) -> List[str]:
+    mode_names = [mode_name for mode_name in _mode_order(config) if mode_name != anchor_mode_name]
+
+    def _sort_key(mode_name: str) -> Tuple[float, int]:
+        mode = _mode_cfg(config, mode_name)
+        cutoff = _safe_float(mode.get("top_k_cutoff"))
+        if cutoff is None:
+            return (float("inf"), mode_names.index(mode_name))
+        return (cutoff, mode_names.index(mode_name))
+
+    return sorted(mode_names, key=_sort_key)
+
+
+def _mode_compact_label(config: Dict[str, Any], mode_name: str) -> str:
+    if str(mode_name) == "exact":
+        return "exact"
+    mode = _mode_cfg(config, mode_name)
+    cutoff = _safe_float(mode.get("top_k_cutoff"))
+    if cutoff is not None:
+        return f"cutoff {cutoff:g}"
+    if bool(mode.get("adaptive_top_k", False)):
+        target = _safe_float(mode.get("posterior_mass_target"))
+        if target is not None:
+            return f"mass {target:g}"
+    return str(mode_name).replace("_", " ")
+
+
+def _mix_with_white(color: Any, amount: float) -> Tuple[float, float, float]:
+    amount = max(0.0, min(1.0, float(amount)))
+    r, g, b = to_rgb(color)
+    return (r + (1.0 - r) * amount, g + (1.0 - g) * amount, b + (1.0 - b) * amount)
+
+
+def _darken_color(color: Any, amount: float) -> Tuple[float, float, float]:
+    amount = max(0.0, min(1.0, float(amount)))
+    r, g, b = to_rgb(color)
+    factor = 1.0 - amount
+    return (r * factor, g * factor, b * factor)
 
 
 def _highest_milestone(summary: Dict[str, Any]) -> Optional[float]:
@@ -616,6 +666,413 @@ def _exact_posterior_checkpoint_markers(
         xs.append(float(step))
         ys.append(float(value))
     return xs, ys
+
+def _plot_checkpoint_transfer_metric_on_axis(
+    *,
+    ax: Any,
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_name: str,
+    anchor_mode_name: str,
+    value_key: str,
+    smooth_window: int,
+    as_percent: bool = False,
+    show_legend_label: bool = True,
+) -> List[Any]:
+    exact_xs, exact_means, exact_lowers, exact_uppers, _ = _merged_trace_stats(
+        config,
+        n_terms,
+        anchor_mode_name,
+        "train_trace.csv",
+        value_key,
+        smooth_window,
+    )
+    pure_xs, pure_means, pure_lowers, pure_uppers, _ = _merged_trace_stats(
+        config,
+        n_terms,
+        mode_name,
+        "train_trace.csv",
+        value_key,
+        smooth_window,
+    )
+    transfer_segments = _checkpoint_transfer_segment_series_by_seed(
+        config,
+        n_terms,
+        mode_name,
+        anchor_mode_name,
+        value_key=value_key,
+        smooth_window=smooth_window,
+    )
+    clamp = value_key in {"true_mass", "zero_true_mass"}
+    colors = {
+        "exact": "#3776d6",
+        "pure": "#d62728",
+        "transfer": "#2ca02c",
+        "checkpoint": "#7b3294",
+    }
+    draw_bands = _show_trace_uncertainty_bands(config, smooth_window)
+    factor = 100.0 if as_percent else 1.0
+
+    def scale_points(xs: List[float], ys: List[float], lowers: List[float], uppers: List[float]):
+        return (
+            [float(x) for x in xs],
+            [factor * float(y) for y in ys],
+            [factor * float(y) for y in lowers],
+            [factor * float(y) for y in uppers],
+        )
+
+    x_exact, y_exact, l_exact, u_exact = scale_points(exact_xs, exact_means, exact_lowers, exact_uppers)
+    x_pure, y_pure, l_pure, u_pure = scale_points(pure_xs, pure_means, pure_lowers, pure_uppers)
+
+    exact_label = f"Pure {anchor_mode_name}" if show_legend_label else None
+    pure_label = f"Pure {mode_name}" if show_legend_label else None
+    ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=2.1, label=exact_label, zorder=3)
+    ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=2.0, label=pure_label, zorder=3)
+
+    checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(config, n_terms, anchor_mode_name, value_key)
+    if checkpoint_x and checkpoint_y:
+        x_marks = [float(x) for x in checkpoint_x]
+        y_marks = [factor * float(y) for y in checkpoint_y]
+        ax.scatter(
+            x_marks,
+            y_marks,
+            marker="X",
+            s=78,
+            linewidths=0.9,
+            edgecolors="white",
+            color=colors["checkpoint"],
+            label="Aggregate exact checkpoints" if show_legend_label else None,
+            zorder=6,
+        )
+
+    plotted_transfer_label = False
+    for segment_series in transfer_segments:
+        transfer_xs, transfer_means, transfer_lowers, transfer_uppers, _ = _merge_series_dict(
+            segment_series,
+            config,
+            clamp_unit_interval=clamp,
+        )
+        if not transfer_xs:
+            continue
+        x_transfer, y_transfer, l_transfer, u_transfer = scale_points(
+            transfer_xs,
+            transfer_means,
+            transfer_lowers,
+            transfer_uppers,
+        )
+        ax.plot(
+            x_transfer,
+            y_transfer,
+            color=colors["transfer"],
+            linewidth=2.0,
+            label=(
+                f"{mode_name} from {anchor_mode_name} checkpoints"
+                if show_legend_label and not plotted_transfer_label
+                else None
+            ),
+            zorder=4,
+        )
+        if draw_bands and any(abs(u - l) > 0.0 for l, u in zip(l_transfer, u_transfer)):
+            ax.fill_between(
+                x_transfer,
+                l_transfer,
+                u_transfer,
+                color=colors["transfer"],
+                alpha=max(0.07, _trace_band_alpha(config) * 0.75),
+                linewidth=0,
+                zorder=2,
+            )
+        plotted_transfer_label = True
+
+    if draw_bands:
+        if any(abs(u - l) > 0.0 for l, u in zip(l_exact, u_exact)):
+            ax.fill_between(x_exact, l_exact, u_exact, color=colors["exact"], alpha=_trace_band_alpha(config), linewidth=0, zorder=1)
+        if any(abs(u - l) > 0.0 for l, u in zip(l_pure, u_pure)):
+            ax.fill_between(x_pure, l_pure, u_pure, color=colors["pure"], alpha=_trace_band_alpha(config), linewidth=0, zorder=1)
+
+    ax.grid(True, axis="y", alpha=0.18)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    return [
+        Line2D([0], [0], color=colors["exact"], linewidth=2.1, label=f"Pure {anchor_mode_name}"),
+        Line2D([0], [0], color=colors["pure"], linewidth=2.0, label=f"Pure {mode_name}"),
+        Line2D([0], [0], color=colors["checkpoint"], marker="X", markersize=8, linewidth=0, label="Aggregate exact checkpoints"),
+        Line2D([0], [0], color=colors["transfer"], linewidth=2.0, label=f"{mode_name} from {anchor_mode_name} checkpoints"),
+    ]
+
+
+def _plot_combined_checkpoint_transfer_metric(
+    *,
+    config: Dict[str, Any],
+    n_terms: int,
+    mode_names: Sequence[str],
+    anchor_mode_name: str,
+    value_key: str,
+    ylabel: str,
+    output_path: Path,
+    smooth_window: int,
+    as_percent: bool = False,
+) -> None:
+    if not mode_names:
+        return
+
+    fig, axes = plt.subplots(
+        1,
+        len(mode_names),
+        figsize=(4.1 * len(mode_names) + 0.9, 4.35),
+        sharey=True,
+    )
+    if not isinstance(axes, (list, tuple)):
+        import numpy as _np  # type: ignore
+        if isinstance(axes, _np.ndarray):
+            axes = list(axes.ravel())
+        else:
+            axes = [axes]
+
+    for idx, (ax, mode_name) in enumerate(zip(axes, mode_names)):
+        _plot_checkpoint_transfer_metric_on_axis(
+            ax=ax,
+            config=config,
+            n_terms=n_terms,
+            mode_name=mode_name,
+            anchor_mode_name=anchor_mode_name,
+            value_key=value_key,
+            smooth_window=smooth_window,
+            as_percent=as_percent,
+            show_legend_label=False,
+        )
+        ax.set_title(_mode_compact_label(config, mode_name), fontsize=11, pad=8)
+        ax.set_xlabel("Training iteration")
+        if value_key == "loss":
+            ax.set_yscale("log")
+            ax.set_ylim(0.4, 10.5)
+        elif as_percent:
+            ax.set_ylim(0.0, 100.0)
+        if idx != 0:
+            ax.spines["left"].set_visible(False)
+            ax.tick_params(axis="y", length=0)
+
+    colors = {
+        "exact": "#3776d6",
+        "pure": "#d62728",
+        "transfer": "#2ca02c",
+        "checkpoint": "#7b3294",
+    }
+    legend_handles = [
+        Line2D([0], [0], color=colors["exact"], linewidth=2.1, label="Pure exact"),
+        Line2D([0], [0], color=colors["pure"], linewidth=2.0, label="Pure approximate"),
+        Line2D(
+            [0],
+            [0],
+            color=colors["checkpoint"],
+            marker="X",
+            markersize=8,
+            linewidth=0,
+            label="Exact checkpoints",
+        ),
+        Line2D([0], [0], color=colors["transfer"], linewidth=2.0, label="Approx. continuation"),
+    ]
+
+    title = f"{n_terms}-term SPLL training — {ylabel}"
+    subtitle = f"Full-window rolling mean, {smooth_window} updates" if smooth_window > 1 else "Raw training trace"
+    fig.text(0.5, 0.978, title, ha="center", va="top", fontsize=15)
+    fig.text(0.5, 0.918, subtitle, ha="center", va="top", fontsize=9.5, color="#555555")
+    fig.text(0.015, 0.48, ylabel, ha="center", va="center", rotation="vertical", fontsize=11)
+    legend = fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.865),
+        ncol=4,
+        frameon=False,
+        fontsize=9,
+        columnspacing=1.15,
+        handletextpad=0.55,
+    )
+    legend.set_in_layout(False)
+    fig.subplots_adjust(left=0.08, right=0.995, top=0.735, bottom=0.14, wspace=0.08)
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
+
+def _plot_dual_axis_checkpoint_bars(
+    *,
+    config: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    run_summaries: List[Dict[str, Any]],
+    n_terms: int,
+    output_path: Path,
+) -> None:
+    term_all_rows = [row for row in rows if int(row["n_terms"]) == int(n_terms)]
+    term_rows = [
+        row
+        for row in term_all_rows
+        if row.get("reached")
+        and row.get("step") not in {None, ""}
+        and row.get("elapsed_seconds") not in {None, ""}
+    ]
+    if not term_rows:
+        return
+
+    milestones = sorted({float(row["milestone"]) for row in term_all_rows})
+    mode_names = _mode_order(config)
+    colors = _mode_color_map(config)
+    x_positions = list(range(len(milestones)))
+    mode_count = max(1, len(mode_names))
+    bar_width = min(0.8 / mode_count, 0.16)
+    group_width = bar_width * mode_count
+    series: List[Dict[str, Any]] = []
+    max_step_value = 0.0
+    max_time_value = 0.0
+    for mode_idx, mode_name in enumerate(mode_names):
+        by_milestone_steps: Dict[float, List[float]] = {}
+        by_milestone_time: Dict[float, List[float]] = {}
+        for row in term_rows:
+            if row["mode_name"] != mode_name:
+                continue
+            milestone = float(row["milestone"])
+            by_milestone_steps.setdefault(milestone, []).append(float(row["step"]))
+            by_milestone_time.setdefault(milestone, []).append(float(row["elapsed_seconds"]))
+
+        xs: List[float] = []
+        step_means: List[float] = []
+        time_means: List[float] = []
+        offset = -group_width / 2.0 + bar_width / 2.0 + mode_idx * bar_width
+        for milestone_idx, milestone in enumerate(milestones):
+            step_values = by_milestone_steps.get(milestone)
+            time_values = by_milestone_time.get(milestone)
+            if not step_values or not time_values:
+                continue
+            step_mean = _mean(step_values)
+            time_mean = _mean(time_values)
+            if step_mean is None or time_mean is None:
+                continue
+            xs.append(float(x_positions[milestone_idx]) + offset)
+            step_means.append(float(step_mean))
+            time_means.append(float(time_mean))
+            max_step_value = max(max_step_value, float(step_mean))
+            max_time_value = max(max_time_value, float(time_mean))
+
+        if xs:
+            series.append(
+                {
+                    "mode_name": mode_name,
+                    "xs": xs,
+                    "step_means": step_means,
+                    "time_means": time_means,
+                }
+            )
+
+    if not series or max_step_value <= 0.0 or max_time_value <= 0.0:
+        return
+
+    exact_series = next((data for data in series if str(data["mode_name"]) == "exact"), None)
+    if exact_series and exact_series["time_means"] and exact_series["step_means"]:
+        numerator = sum(float(step) * float(time) for step, time in zip(exact_series["step_means"], exact_series["time_means"]))
+        denominator = sum(float(time) ** 2 for time in exact_series["time_means"])
+        exact_time_to_steps = (numerator / denominator) if denominator > 0.0 else None
+    else:
+        exact_time_to_steps = None
+
+    left_top = max_step_value * 1.10
+    time_to_steps = exact_time_to_steps if exact_time_to_steps and exact_time_to_steps > 0.0 else (left_top / (max_time_value * 1.10))
+    right_top = left_top / time_to_steps
+
+    fig, ax = plt.subplots(figsize=(max(9.2, 0.9 * len(milestones) + 3.4), 5.45))
+    ax_right = ax.secondary_yaxis(
+        "right",
+        functions=(
+            lambda step_units: step_units / time_to_steps,
+            lambda seconds: seconds * time_to_steps,
+        ),
+    )
+
+    mode_handles: List[Any] = []
+    for data in series:
+        mode_name = str(data["mode_name"])
+        base_color = colors[mode_name]
+        outer_color = _mix_with_white(base_color, 0.68)
+        inner_color = _darken_color(base_color, 0.10)
+        xs = data["xs"]
+        step_means = data["step_means"]
+        time_heights = [value * time_to_steps for value in data["time_means"]]
+
+        ax.bar(
+            xs,
+            step_means,
+            width=bar_width,
+            color=outer_color,
+            edgecolor=base_color,
+            linewidth=1.0,
+            zorder=2,
+        )
+        ax.bar(
+            xs,
+            time_heights,
+            width=bar_width * 0.56,
+            color=inner_color,
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.97,
+            zorder=3,
+        )
+        mode_handles.append(
+            Patch(facecolor=inner_color, edgecolor="none", label=_mode_compact_label(config, mode_name))
+        )
+
+    ax.set_ylim(0.0, left_top)
+    ax.set_xlabel("Training true-sum posterior checkpoint")
+    ax.set_ylabel("Steps to checkpoint")
+    ax_right.set_ylabel("Wall-clock time (s)")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels([_format_milestone_label(value) for value in milestones])
+    ax.grid(True, axis="y", alpha=0.18, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax_right.spines["top"].set_visible(False)
+
+    step_metric_handle = Patch(
+        facecolor="#E4E8EE",
+        edgecolor="#7A8797",
+        linewidth=1.0,
+        label="Steps: outer bar (left axis)",
+    )
+    time_metric_handle = Patch(
+        facecolor="#7A8797",
+        edgecolor="#44515F",
+        linewidth=1.0,
+        label="Wall-clock: inner bar (right axis)",
+    )
+
+    fig.text(0.5, 0.978, f"{n_terms}-term SPLL training — Posterior checkpoints", ha="center", va="top", fontsize=15)
+    mode_legend = fig.legend(
+        handles=mode_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.950),
+        ncol=max(2, min(4, len(mode_handles))),
+        frameon=False,
+        fontsize=9,
+        title="Inference mode",
+        title_fontsize=9,
+        columnspacing=1.25,
+        handletextpad=0.55,
+    )
+    mode_legend.set_in_layout(False)
+    metric_legend = fig.legend(
+        handles=[step_metric_handle, time_metric_handle],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.875),
+        ncol=2,
+        frameon=False,
+        fontsize=8.7,
+        columnspacing=1.8,
+        handletextpad=0.7,
+    )
+    metric_legend.set_in_layout(False)
+
+    fig.subplots_adjust(left=0.09, right=0.91, top=0.79, bottom=0.14)
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
 
 def _plot_checkpoint_transfer_metric_trajectory(
     *,
@@ -1022,6 +1479,9 @@ def _plot_trace(
     ylabel: str,
     output_path: Path,
     smooth_window: int = 1,
+    legend_loc: str = "upper left",
+    legend_bbox: Optional[Tuple[float, float]] = (1.02, 1.0),
+    show_footer: bool = True,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8.5, 5.0))
     plotted = False
@@ -1052,10 +1512,16 @@ def _plot_trace(
     ax.grid(True, alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
-    _add_uncertainty_note(fig, config, enabled=draw_bands)
-    if draw_bands:
-        fig.tight_layout(rect=(0, 0.045, 1, 1))
+    legend_kwargs: Dict[str, Any] = {"loc": legend_loc, "frameon": False}
+    if legend_bbox is not None:
+        legend_kwargs["bbox_to_anchor"] = legend_bbox
+    ax.legend(**legend_kwargs)
+    if show_footer:
+        _add_uncertainty_note(fig, config, enabled=draw_bands)
+        if draw_bands:
+            fig.tight_layout(rect=(0, 0.045, 1, 1))
+        else:
+            fig.tight_layout()
     else:
         fig.tight_layout()
     ensure_dir(output_path.parent)
@@ -1386,6 +1852,13 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     smooth_window = int(viz_cfg.get("trace_smoothing_window_points", 50))
     for experiment in get_experiments(config):
         n_terms = int(experiment["n_terms"])
+        _plot_dual_axis_checkpoint_bars(
+            config=config,
+            rows=rows,
+            run_summaries=run_summaries,
+            n_terms=n_terms,
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_progress_dual_axis.png",
+        )
         _plot_metric_for_terms(
             config=config,
             rows=rows,
@@ -1393,7 +1866,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             metric="step",
             ylabel="Steps to posterior checkpoint",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_steps_to_true_sum_posterior_checkpoint.png",
+            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_steps_to_true_sum_posterior_checkpoint.png",
         )
         _plot_metric_for_terms(
             config=config,
@@ -1402,7 +1875,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             metric="elapsed_seconds",
             ylabel="Seconds to posterior checkpoint",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_time_to_true_sum_posterior_checkpoint.png",
+            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_time_to_true_sum_posterior_checkpoint.png",
             maybe_log=True,
         )
         _plot_trace(
@@ -1413,6 +1886,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             ylabel="Training loss",
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_training_loss_trace.png",
             smooth_window=smooth_window,
+            legend_loc="upper right",
+            legend_bbox=None,
+            show_footer=False,
         )
         _plot_trace(
             config=config,
@@ -1431,6 +1907,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             ylabel="True-sum mass",
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_true_mass_trace.png",
             smooth_window=smooth_window,
+            legend_loc="upper left",
+            legend_bbox=None,
+            show_footer=False,
         )
         _plot_trace(
             config=config,
@@ -1444,6 +1923,31 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         checkpoint_transfer_cfg = _checkpoint_transfer_cfg(config)
         anchor_mode_name = str(checkpoint_transfer_cfg.get("anchor_mode_name", "exact"))
         requested_transfer_modes = checkpoint_transfer_cfg.get("mode_names")
+        combined_transfer_modes = _non_anchor_mode_names(config, anchor_mode_name)
+        if isinstance(requested_transfer_modes, list):
+            allowed_transfer_modes = {str(v) for v in requested_transfer_modes}
+            combined_transfer_modes = [mode_name for mode_name in combined_transfer_modes if mode_name in allowed_transfer_modes]
+        _plot_combined_checkpoint_transfer_metric(
+            config=config,
+            n_terms=n_terms,
+            mode_names=combined_transfer_modes,
+            anchor_mode_name=anchor_mode_name,
+            value_key="loss",
+            ylabel="Training loss",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_loss_exact_vs_approx_combined.png",
+            smooth_window=smooth_window,
+        )
+        _plot_combined_checkpoint_transfer_metric(
+            config=config,
+            n_terms=n_terms,
+            mode_names=combined_transfer_modes,
+            anchor_mode_name=anchor_mode_name,
+            value_key="true_mass",
+            ylabel="True-sum posterior (%)",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_true_mass_exact_vs_approx_combined.png",
+            smooth_window=smooth_window,
+            as_percent=True,
+        )
         for mode in get_inference_modes(config):
             mode_name = str(mode["name"])
             if mode_name == anchor_mode_name:
@@ -1457,7 +1961,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
                 anchor_mode_name=anchor_mode_name,
                 value_key="loss",
                 ylabel="Training loss",
-                output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_loss_exact_vs_{mode_name}.png",
+                output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_loss_exact_vs_{mode_name}.png",
                 smooth_window=smooth_window,
             )
             _plot_checkpoint_transfer_metric_trajectory(
@@ -1467,7 +1971,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
                 anchor_mode_name=anchor_mode_name,
                 value_key="true_mass",
                 ylabel="True-sum posterior (%)",
-                output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_true_mass_exact_vs_{mode_name}.png",
+                output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_true_mass_exact_vs_{mode_name}.png",
                 smooth_window=smooth_window,
                 as_percent=True,
             )
