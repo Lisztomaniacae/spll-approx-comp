@@ -376,6 +376,88 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
 
 
 
+def add_paired_accuracy_delta_intervals(
+        summary_rows: List[Dict[str, Any]],
+        detailed_rows: List[Dict[str, Any]],
+        group_keys: Sequence[str],
+        *,
+        bootstrap_samples: int = 2000,
+        seed: int = 42,
+) -> None:
+    keys_wo_threshold = [key for key in group_keys if key not in {"threshold_label", "cutoff"}]
+
+    summary_by_group: Dict[Tuple[Any, ...], Dict[str, Any]] = {
+        tuple(row[key] for key in group_keys): row
+        for row in summary_rows
+    }
+    baseline_summary_by_group: Dict[Tuple[Any, ...], Dict[str, Any]] = {
+        tuple(row[key] for key in keys_wo_threshold): row
+        for row in summary_rows
+        if str(row.get("threshold_label")) == "exact"
+    }
+
+    detailed_grouped: Dict[Tuple[Any, ...], Dict[int, Dict[str, Any]]] = defaultdict(dict)
+    for row in detailed_rows:
+        group = tuple(row[key] for key in group_keys)
+        detailed_grouped[group][int(row["experiment_id"])] = row
+
+    rng = np.random.default_rng(seed)
+
+    for row in summary_rows:
+        row["accuracy_delta_q25_vs_exact"] = float("nan")
+        row["accuracy_delta_q75_vs_exact"] = float("nan")
+        row["accuracy_delta_ci_lower_vs_exact"] = float("nan")
+        row["accuracy_delta_ci_upper_vs_exact"] = float("nan")
+
+        current_group = tuple(row[key] for key in group_keys)
+        baseline_group = tuple(row[key] for key in keys_wo_threshold)
+        baseline_summary = baseline_summary_by_group.get(baseline_group)
+        if baseline_summary is None:
+            continue
+
+        if str(row.get("threshold_label")) == "exact":
+            row["accuracy_delta_q25_vs_exact"] = 0.0
+            row["accuracy_delta_q75_vs_exact"] = 0.0
+            row["accuracy_delta_ci_lower_vs_exact"] = 0.0
+            row["accuracy_delta_ci_upper_vs_exact"] = 0.0
+            continue
+
+        baseline_key = tuple(list(baseline_group) + ["exact", baseline_summary.get("cutoff")])
+        approx_rows_by_exp = detailed_grouped.get(current_group, {})
+        exact_rows_by_exp = detailed_grouped.get(baseline_key, {})
+        common_ids = sorted(set(approx_rows_by_exp).intersection(exact_rows_by_exp))
+        if not common_ids:
+            continue
+
+        diffs = np.asarray(
+            [
+                float(approx_rows_by_exp[exp_id]["correct"]) - float(exact_rows_by_exp[exp_id]["correct"])
+                for exp_id in common_ids
+            ],
+            dtype=float,
+        )
+        if diffs.size == 0:
+            continue
+
+        row["accuracy_delta_q25_vs_exact"] = float(np.quantile(diffs, 0.25))
+        row["accuracy_delta_q75_vs_exact"] = float(np.quantile(diffs, 0.75))
+
+        if diffs.size == 1:
+            delta_value = float(diffs[0])
+            row["accuracy_delta_ci_lower_vs_exact"] = delta_value
+            row["accuracy_delta_ci_upper_vs_exact"] = delta_value
+            continue
+
+        bootstrap_means = np.empty(int(bootstrap_samples), dtype=float)
+        n = int(diffs.size)
+        for idx in range(int(bootstrap_samples)):
+            sample_indices = rng.integers(0, n, size=n)
+            bootstrap_means[idx] = float(np.mean(diffs[sample_indices]))
+
+        row["accuracy_delta_ci_lower_vs_exact"] = float(np.quantile(bootstrap_means, 0.025))
+        row["accuracy_delta_ci_upper_vs_exact"] = float(np.quantile(bootstrap_means, 0.975))
+
+
 def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
     detailed_rows: List[Dict[str, Any]] = []
     for run in raw_runs:
@@ -1132,6 +1214,7 @@ def plot_cutoff_metric_series(
         linewidth: float = 1.8,
         alpha: float = 0.98,
         show_band: bool = False,
+        band_alpha: float = 0.14,
 ) -> None:
     if not points:
         return
@@ -1151,7 +1234,7 @@ def plot_cutoff_metric_series(
         ], dtype=float)
         finite_band = np.isfinite(lower) & np.isfinite(upper)
         if finite_band.any():
-            ax.fill_between(x[finite_band], lower[finite_band], upper[finite_band], color=color, alpha=0.14, linewidth=0)
+            ax.fill_between(x[finite_band], lower[finite_band], upper[finite_band], color=color, alpha=band_alpha, linewidth=0)
 
     fixed_points = [point for point in points if not bool(point.get("adaptive", False))]
     adaptive_points = [point for point in points if bool(point.get("adaptive", False))]
@@ -1481,136 +1564,185 @@ def plot_pareto_tradeoff(
         return
 
     approx_thresholds = positive_cutoff_thresholds(summary_rows, threshold_order)
-    if not approx_thresholds:
-        return
-
-    model_styles = build_model_styles(summary_rows)
     model_ids = ordered_model_ids(summary_rows)
-    if not model_ids:
+    if not approx_thresholds or not model_ids or not term_counts:
         return
 
-    marker_styles = cutoff_marker_styles(approx_thresholds)
-    marker_styles["exact"] = {"marker": "X", "label": "exact reference"}
+    tick_values = fixed_cutoff_tick_values(approx_thresholds)
+    include_zero = any(abs(value) < 1e-12 for value in tick_values)
+    all_x_values = [
+        value
+        for row in summary_rows
+        if str(row.get("threshold_label")) in approx_thresholds
+        and (value := cutoff_x_value_for_row(row)) is not None
+    ]
+    if not all_x_values:
+        return
 
-    nrows, ncols = term_panel_grid(term_counts)
+    speedup_color = "#1f77b4"
+    accuracy_color = "#d62728"
+    combined_color = "#7f3fbf"
+    baseline_color = "#6f6f6f"
+    positive_zone_color = "#2ca02c"
+
+    nrows = len(model_ids)
+    ncols = len(term_counts)
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(5.9 * ncols, 4.45 * nrows),
+        figsize=(5.2 * ncols, 3.55 * nrows),
         squeeze=False,
         constrained_layout=False,
+        sharex=False,
+        sharey=True,
     )
-    axes = list(axes_grid.flatten())
 
-    all_runtime_ratios: List[float] = []
-    all_delta_pp: List[float] = []
-    panel_points: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    right_axes: List[Any] = []
+    model_styles = build_model_styles(summary_rows)
+    row_labels = [model_styles[mid]["label"] for mid in model_ids]
 
-    for n_terms in term_counts:
-        for model_id in model_ids:
+    for row_idx, model_id in enumerate(model_ids):
+        for col_idx, n_terms in enumerate(term_counts):
+            ax = axes_grid[row_idx, col_idx]
+            ax_right = ax.twinx()
+            right_axes.append(ax_right)
+
+            ax.axhspan(1.0, 1.5, color=positive_zone_color, alpha=0.035, zorder=0)
+            ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.85, zorder=1)
+
             rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
             row_by_label = {str(row["threshold_label"]): row for row in rows}
             exact_row = row_by_label.get("exact")
-            if exact_row is None:
-                continue
-            exact_runtime = finite_float_or_none(exact_row.get("median_runtime_sec"))
-            exact_accuracy = finite_float_or_none(exact_row.get("accuracy"))
-            if exact_runtime is None or exact_runtime <= 0.0 or exact_accuracy is None:
-                continue
 
-            points: List[Dict[str, Any]] = []
-            for label in approx_thresholds:
-                row = row_by_label.get(label)
-                if row is None:
-                    continue
-                runtime = finite_float_or_none(row.get("median_runtime_sec"))
-                accuracy = finite_float_or_none(row.get("accuracy"))
-                if runtime is None or runtime <= 0.0 or accuracy is None:
-                    continue
-                runtime_ratio = runtime / exact_runtime
-                delta_pp = 100.0 * (accuracy - exact_accuracy)
-                points.append({"label": label, "runtime_ratio": runtime_ratio, "delta_pp": delta_pp})
-                all_runtime_ratios.append(runtime_ratio)
-                all_delta_pp.append(delta_pp)
-            panel_points[(int(n_terms), model_id)] = points
+            speedup_points: List[Dict[str, Any]] = []
+            accuracy_points: List[Dict[str, Any]] = []
+            combined_points: List[Dict[str, Any]] = []
 
-    if not all_runtime_ratios:
-        return
+            exact_accuracy = finite_float_or_none(exact_row.get("accuracy")) if exact_row is not None else None
+            if exact_accuracy is not None and exact_accuracy > 0.0:
+                for order_idx, label in enumerate(approx_thresholds):
+                    row = row_by_label.get(label)
+                    if row is None:
+                        continue
+                    x_value = cutoff_x_value_for_row(row)
+                    speedup_value = speedup_vs_exact_from_row(row)
+                    accuracy_value = finite_float_or_none(row.get("accuracy"))
+                    if x_value is None or speedup_value is None or accuracy_value is None:
+                        continue
+                    accuracy_retained_pct = 100.0 * float(accuracy_value / exact_accuracy)
+                    common = {
+                        "label": label,
+                        "order_idx": int(order_idx),
+                        "x": float(x_value),
+                        "adaptive": is_adaptive_threshold_row(row),
+                    }
+                    speedup_points.append({**common, "y": float(speedup_value)})
+                    accuracy_points.append({**common, "y": float(accuracy_retained_pct)})
+                    combined_points.append(
+                        {**common, "y": float(0.5 * (float(speedup_value) + accuracy_retained_pct / 100.0))}
+                    )
 
-    for ax, n_terms in zip(axes, term_counts):
-        ax.axhline(0.0, color="#777777", linestyle="--", linewidth=1.0, alpha=0.75, zorder=0)
-        ax.axvline(1.0, color="#777777", linestyle="--", linewidth=1.0, alpha=0.75, zorder=0)
-        ax.scatter(
-            [1.0],
-            [0.0],
-            marker="X",
-            s=96,
-            color="#4d4d4d",
-            edgecolors="white",
-            linewidths=1.0,
-            zorder=5,
-        )
-        for model_id in model_ids:
-            points = panel_points.get((int(n_terms), model_id), [])
-            if not points:
-                continue
-            color = model_styles[model_id]["color"]
-            if len(points) >= 2:
-                ax.plot(
-                    [float(point["runtime_ratio"]) for point in points],
-                    [float(point["delta_pp"]) for point in points],
-                    color=color,
-                    linewidth=1.2,
-                    alpha=0.34,
-                    zorder=1,
-                )
-            for point in points:
-                marker = marker_styles[str(point["label"])]["marker"]
-                ax.scatter(
-                    float(point["runtime_ratio"]),
-                    float(point["delta_pp"]),
-                    s=132 if marker == "*" else 62,
-                    color=color,
-                    marker=marker,
-                    edgecolors="white",
-                    linewidths=0.85,
-                    alpha=0.9,
-                    zorder=3,
-                )
-        ax.set_title(f"{int(n_terms)} terms")
-        ax.set_xlabel("Runtime / exact runtime")
-        ax.set_ylabel("Δ sum accuracy vs exact (pp)")
-        ax.set_xscale("log")
-        ax.grid(alpha=0.4)
+            speedup_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
+            accuracy_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
+            combined_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
 
-    finish_panel_grid(fig, axes, len(term_counts))
+            plot_cutoff_metric_series(
+                ax,
+                speedup_points,
+                color=speedup_color,
+                linewidth=2.0,
+                alpha=0.96,
+            )
+            plot_cutoff_metric_series(
+                ax_right,
+                accuracy_points,
+                color=accuracy_color,
+                linewidth=2.0,
+                alpha=0.96,
+            )
+            combined_line_start = len(ax.lines)
+            plot_cutoff_metric_series(
+                ax,
+                combined_points,
+                color=combined_color,
+                linewidth=1.7,
+                alpha=0.95,
+            )
+            # Restyle only the newly added combined-score line; keep its markers unchanged.
+            if len(ax.lines) > combined_line_start:
+                ax.lines[-1].set_linestyle("--")
 
-    ratio_min = min(all_runtime_ratios + [1.0])
-    ratio_max = max(all_runtime_ratios + [1.0])
-    if ratio_min > 0.0:
-        x_min = ratio_min / 1.15
-        x_max = ratio_max * 1.15
-        for ax in axes[:len(term_counts)]:
-            ax.set_xlim(x_min, x_max)
+            configure_numeric_cutoff_axis(
+                ax,
+                tick_values=tick_values,
+                point_values=all_x_values,
+                include_zero=include_zero,
+            )
+            ax.set_ylim(0.0, 1.5)
+            ax_right.set_ylim(0.0, 150.0)
+            ax.grid(axis="y", alpha=0.32)
+            ax.grid(axis="x", alpha=0.12)
 
-    max_abs_delta = max(5.0, max(abs(value) for value in all_delta_pp))
-    y_lim = 1.12 * max_abs_delta
-    for ax in axes[:len(term_counts)]:
-        ax.set_ylim(-y_lim, y_lim)
+            ax.spines["left"].set_color(speedup_color)
+            ax.spines["left"].set_linewidth(1.0)
+            ax.tick_params(axis="y", colors=speedup_color)
 
-    place_bottom_legends(
-        fig,
-        title="Runtime–accuracy tradeoff relative to exact inference",
-        legend_rows=[
-            (model_line_handles(model_ids, model_styles), "Models"),
-            (cutoff_marker_handles(["exact"] + list(approx_thresholds), marker_styles), "Inference setting"),
-        ],
-        bottom=0.40,
-        first_legend_y=0.295,
-        legend_step=0.145,
-        max_columns=8,
+            ax_right.spines["right"].set_color(accuracy_color)
+            ax_right.spines["right"].set_linewidth(1.0)
+            ax_right.tick_params(axis="y", colors=accuracy_color)
+
+            if row_idx == 0:
+                ax.set_title(f"{int(n_terms)} terms", pad=10)
+            if row_idx < nrows - 1:
+                ax.tick_params(axis="x", labelbottom=False)
+            else:
+                ax.set_xlabel("Cutoff")
+
+            if col_idx != 0:
+                ax.tick_params(axis="y", labelleft=False)
+            else:
+                ax.set_yticks([0.0, 0.5, 1.0, 1.5])
+                ax.set_yticklabels(["0", "0.5", "1.0", "1.5"], color=speedup_color)
+
+            if col_idx != ncols - 1:
+                ax_right.tick_params(axis="y", labelright=False, right=False)
+                ax_right.spines["right"].set_visible(False)
+            else:
+                ax_right.set_yticks([0.0, 50.0, 100.0, 150.0])
+                ax_right.set_yticklabels(["0%", "50%", "100%", "150%"], color=accuracy_color)
+
+    legend_handles = [
+        Line2D([0], [0], color=speedup_color, marker="o", markerfacecolor=speedup_color, markeredgecolor="white", linewidth=2.0, markersize=6, label="Speedup"),
+        Line2D([0], [0], color=accuracy_color, marker="o", markerfacecolor=accuracy_color, markeredgecolor="white", linewidth=2.0, markersize=6, label="Accuracy"),
+        Line2D([0], [0], color=combined_color, linestyle="--", linewidth=1.8, label="Mean score"),
+        Line2D([0], [0], color=baseline_color, linestyle="--", linewidth=1.0, label="Exact baseline"),
+        Line2D([0], [0], marker="*", color="#555555", markerfacecolor="#555555", markeredgecolor="white", linewidth=0, markersize=12, label="mass 0.8"),
+    ]
+
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.83, bottom=0.10, wspace=0.16, hspace=0.18)
+    fig.suptitle("Runtime–accuracy tradeoff relative to exact inference", fontsize=16, y=0.955)
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.905),
+        ncol=5,
+        fontsize=8.5,
+        frameon=True,
+        borderpad=0.6,
+        handlelength=2.2,
+        handletextpad=0.6,
+        columnspacing=1.2,
     )
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+
+    fig.text(0.028, 0.515, "Speedup", rotation=90, ha="center", va="center", fontsize=12, color=speedup_color)
+    fig.text(0.972, 0.515, "Accuracy retained", rotation=-90, ha="center", va="center", fontsize=12, color=accuracy_color)
+
+    for row_idx, label in enumerate(row_labels):
+        bbox = axes_grid[row_idx, 0].get_position(fig)
+        y_center = 0.5 * (bbox.y0 + bbox.y1)
+        fig.text(0.060, y_center, label, ha="right", va="center", fontsize=11, color="#333333")
+
+    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
 
 def plot_true_candidate_metric_vs_cutoff(
@@ -1735,7 +1867,7 @@ def plot_runtime_vs_cutoff(
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(5.9 * ncols, 4.5 * nrows),
+        figsize=(6.3 * ncols, 4.65 * nrows),
         squeeze=False,
         constrained_layout=False,
     )
@@ -1765,8 +1897,10 @@ def plot_runtime_vs_cutoff(
                 color=color,
                 label=model_styles[model_id]["label"],
                 show_band=True,
+                band_alpha=0.10,
+                linewidth=1.95,
             )
-        ax.set_title(f"{int(n_terms)} terms")
+        ax.set_title(f"{int(n_terms)} terms", pad=8)
         configure_numeric_cutoff_axis(
             ax,
             tick_values=tick_values,
@@ -1776,21 +1910,26 @@ def plot_runtime_vs_cutoff(
         ax.set_xlabel("Cutoff")
         ax.set_ylabel("Median runtime (s)")
         ax.set_yscale("log")
-        ax.grid(alpha=0.45)
+        ax.grid(alpha=0.35)
 
     finish_panel_grid(fig, axes, len(term_counts))
-    legend_title = "Models"
     handles = model_line_handles(model_ids, model_styles)
-    handles.append(exact_reference_handle("exact runtime"))
+    handles.append(exact_reference_handle("Exact runtime"))
     handles.extend(adaptive_marker_handles(approx_thresholds))
-    place_horizontal_legends(
-        fig,
-        title="Median runtime vs pruning threshold",
-        legend_rows=[(handles, legend_title)],
-        top=0.72,
-        first_legend_y=0.905,
-        legend_step=0.080,
-        max_columns=7,
+
+    fig.subplots_adjust(top=0.78, left=0.07, right=0.985, bottom=0.10, hspace=0.32, wspace=0.24)
+    fig.suptitle("Median runtime vs pruning threshold", fontsize=16, y=0.96)
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.905),
+        ncol=min(5, len(handles)),
+        fontsize=8.7,
+        frameon=True,
+        borderpad=0.6,
+        handlelength=2.0,
+        handletextpad=0.55,
+        columnspacing=1.15,
     )
     fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
@@ -1817,27 +1956,31 @@ def plot_accuracy_delta_vs_cutoff(
         and (value := cutoff_x_value_for_row(row)) is not None
     ]
 
-    all_deltas: List[float] = []
+    all_bounds: List[float] = []
     for row in summary_rows:
         label = str(row.get("threshold_label"))
-        if label in positive_thresholds and math.isfinite(float(row.get("accuracy_delta_vs_exact", float("nan")))):
-            all_deltas.append(100.0 * float(row["accuracy_delta_vs_exact"]))
-    max_abs_delta = max(5.0, max((abs(value) for value in all_deltas), default=5.0))
-    ylim = (-1.12 * max_abs_delta, 1.12 * max_abs_delta)
+        if label not in positive_thresholds:
+            continue
+        for key in ("accuracy_delta_ci_lower_vs_exact", "accuracy_delta_ci_upper_vs_exact", "accuracy_delta_vs_exact"):
+            value = finite_float_or_none(row.get(key))
+            if value is not None:
+                all_bounds.append(100.0 * float(value))
+    max_abs_delta = max(5.0, max((abs(value) for value in all_bounds), default=5.0))
+    ylim = (-1.15 * max_abs_delta, 1.15 * max_abs_delta)
 
     nrows, ncols = term_panel_grid(term_counts)
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(5.9 * ncols, 4.6 * nrows),
+        figsize=(6.3 * ncols, 4.75 * nrows),
         squeeze=False,
-        constrained_layout=True,
+        constrained_layout=False,
     )
     axes = list(axes_grid.flatten())
 
     for ax, n_terms in zip(axes, term_counts):
         endpoints: List[Dict[str, Any]] = []
-        ax.axhline(0.0, color="#888888", linestyle="--", linewidth=1.0)
+        ax.axhline(0.0, color="#888888", linestyle="--", linewidth=1.0, alpha=0.85)
         for model_id in model_ids:
             rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
             row_by_label = {str(row["threshold_label"]): row for row in rows}
@@ -1845,10 +1988,19 @@ def plot_accuracy_delta_vs_cutoff(
                 row_by_label,
                 positive_thresholds,
                 "accuracy_delta_vs_exact",
+                lower_key="accuracy_delta_ci_lower_vs_exact",
+                upper_key="accuracy_delta_ci_upper_vs_exact",
                 value_scale=100.0,
             )
             color = model_styles[model_id]["color"]
-            plot_cutoff_metric_series(ax, points, color=color, linewidth=1.7)
+            plot_cutoff_metric_series(
+                ax,
+                points,
+                color=color,
+                linewidth=1.9,
+                show_band=True,
+                band_alpha=0.12,
+            )
             if points:
                 last_point = max(points, key=lambda point: float(point["x"]))
                 endpoints.append(
@@ -1866,18 +2018,34 @@ def plot_accuracy_delta_vs_cutoff(
             include_zero=False,
         )
         annotate_series_right_rail(ax, endpoints, ylim=ylim, x_axes=1.03, min_gap_axes=0.085, y_margin_axes=0.08)
-        ax.set_title(f"{int(n_terms)} terms")
+        ax.set_title(f"{int(n_terms)} terms", pad=8)
         ax.set_ylim(*ylim)
         ax.set_xlabel("Cutoff")
         ax.set_ylabel("Δ accuracy vs exact (pp)")
-        ax.grid(alpha=0.45)
+        ax.grid(alpha=0.35)
 
     finish_panel_grid(fig, axes, len(term_counts))
-    if axes:
-        handles = adaptive_marker_handles(positive_thresholds)
-        if handles:
-            axes[0].legend(handles=handles, loc="upper left", fontsize=9)
-    fig.suptitle("Accuracy change relative to exact inference", fontsize=15)
+    handles = model_line_handles(model_ids, model_styles)
+    handles.extend([
+        exact_reference_handle("Exact baseline"),
+        Line2D([0], [0], marker="*", color="#555555", markerfacecolor="#555555", markeredgecolor="white", linewidth=0, markersize=11, label="mass 0.8"),
+        Line2D([0], [0], color="#555555", linewidth=5.0, alpha=0.12, label="95% CI"),
+    ])
+
+    fig.subplots_adjust(top=0.78, left=0.07, right=0.955, bottom=0.10, hspace=0.32, wspace=0.24)
+    fig.suptitle("Accuracy change relative to exact inference", fontsize=16, y=0.96)
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.905),
+        ncol=min(6, len(handles)),
+        fontsize=8.7,
+        frameon=True,
+        borderpad=0.6,
+        handlelength=2.0,
+        handletextpad=0.55,
+        columnspacing=1.15,
+    )
     fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
 
@@ -2355,7 +2523,7 @@ def write_tradeoff_alternatives_readme(path: Path) -> None:
         "How much speedup versus exact inference does each approximate setting produce, and how much sum-accuracy change does it cost?",
         "",
         "Files:",
-        "- 01_tradeoff_matrix_by_terms.png  [recommended thesis-facing summary]",
+        "- 01_tradeoff_matrix_by_terms.png  [supporting alternative view]",
         "",
         "Reading guide:",
         "- Rows are models, columns are inference settings, and term counts stay in separate panels.",
@@ -2371,8 +2539,8 @@ def write_bundle_readme(path: Path, term_counts: Sequence[int], threshold_order:
         "Visualization bundle generated by visualize_results.py",
         "",
         "Main figures:",
-        "- runtime_accuracy_tradeoff_by_terms.png",
-        "- figures/tradeoff_alternatives/01_tradeoff_matrix_by_terms.png (recommended alternative to the tradeoff scatter)",
+        "- runtime_accuracy_tradeoff_by_terms.png  [main thesis-facing centerpiece figure]",
+        "- figures/tradeoff_alternatives/01_tradeoff_matrix_by_terms.png (supporting alternative to the main tradeoff figure)",
         "- runtime_vs_cutoff_by_terms.png",
         "- overhead_exact_vs_zero_cutoff_by_terms.png",
         "- accuracy_delta_vs_exact_by_terms.png",
@@ -2436,6 +2604,13 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         threshold_order=threshold_order,
     )
     add_exact_baseline_columns(summary_by_terms, ["cutoff_mode", "model_id", "n_terms", "threshold_label", "cutoff"])
+    add_paired_accuracy_delta_intervals(
+        summary_by_terms,
+        detailed_rows,
+        ["cutoff_mode", "model_id", "n_terms", "threshold_label", "cutoff"],
+        bootstrap_samples=2000,
+        seed=int(config.get("seed", 42)),
+    )
 
     mode_rows = [row for row in summary_by_terms if str(row.get("cutoff_mode", "global")) == cutoff_mode]
     if not mode_rows:
