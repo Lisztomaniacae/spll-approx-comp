@@ -70,15 +70,19 @@ Pipeline I evaluates trained MNIST models under exact and approximate SPLL infer
 | File | Role |
 |---|---|
 | `mnist_spll_config.yaml` | Main config. |
-| `run_spll_pipeline.py` | Stage dispatcher. |
+| `run_spll_pipeline.py` | Lazy stage dispatcher. |
 | `train_mnist.py` | Trains MNIST model variants. |
 | `compile_spll.py` | Generates and compiles SPLL inference artifacts. |
 | `stage_experiments.py` | Samples fixed digit-addition experiments. |
-| `infer_experiments.py` | Runs posterior inference and writes raw JSON. |
-| `visualize_results.py` | Writes derived tables and plots. |
-| `mnist_spll_pipeline_core.py` | Shared Pipeline I helpers. |
+| `infer_experiments.py`, `inference_engine.py` | Run posterior inference and write raw JSON. |
+| `visualize_results.py` | Coordinates derived tables and plots. |
+| `pipeline1_config.py`, `pipeline1_models.py`, `pipeline1_data.py` | Pipeline I configuration, model-variant, and data boundaries. |
+| `spll_artifacts.py` | SPLL source generation, compilation, loading, and generated-value extraction. |
+| `pipeline1_analysis.py`, `pipeline1_plotting.py` | Metric derivation and figure construction. |
+| `pipeline_support.py`, `mnist_model.py` | Lightweight shared infrastructure and torch-dependent MNIST model code. |
+| `mnist_spll_common.py`, `mnist_spll_pipeline_core.py` | Compatibility facades for historical scripts and the unchanged diagnostic utility. |
 
-`run_spll_sum_experiments.py` is a legacy wrapper. Prefer `run_spll_pipeline.py`.
+The broken legacy wrapper `run_spll_sum_experiments.py` was removed. Use `run_spll_pipeline.py`.
 
 ### Commands
 
@@ -150,12 +154,15 @@ Pipeline II tests whether SPLL approximation changes the **training process itse
 |---|---|
 | `mnist_spll_training_config.yaml` | Default Pipeline II config. |
 | `mnist_spll_training_smoke_config.yaml` | Small smoke-test override. |
-| `run_spll_training_pipeline.py` | Stage dispatcher. |
+| `run_spll_training_pipeline.py` | Lazy stage dispatcher. |
 | `prepare_spll_training.py` | Builds split/schedule manifests and initial checkpoints. |
 | `compile_spll_training.py` | Generates and compiles exact/approximate SPLL training artifacts. |
-| `train_spll_generated.py` | Trains through generated SPLL artifacts. |
-| `visualize_spll_training.py` | Writes fixed-budget loss/true-sum-posterior plots, checkpoint-transfer plots, and adaptive top-k calibration plots. |
-| `spll_training_core.py` | Shared Pipeline II helpers. |
+| `train_spll_generated.py` | Coordinates the active fixed-budget training path. |
+| `visualize_spll_training.py` | Coordinates tables and figures. |
+| `pipeline2_config.py`, `pipeline2_data.py`, `pipeline2_artifacts.py` | Pipeline II configuration, dataset/schedule, and generated-artifact boundaries. |
+| `pipeline2_runtime.py`, `pipeline2_adaptive.py` | Differentiable runtime primitives and adaptive cutoff search. |
+| `pipeline2_checkpoint_transfer.py` | Aggregate exact-checkpoint selection and approximate transfer runs. |
+| `pipeline2_analysis.py`, `pipeline2_plotting.py` | Training-result aggregation and figure construction. |
 
 ### Design summary
 
@@ -390,7 +397,7 @@ The most useful files are `timings.csv`, `block_summary.csv`, `adjacent_time_sav
 
 ### Config inheritance
 
-`mnist_spll_common.load_config(...)` supports one `extends` level. This is used by `mnist_spll_training_smoke_config.yaml`.
+`pipeline_support.load_config(...)` supports one `extends` level. This is used by `mnist_spll_training_smoke_config.yaml`.
 
 Merge semantics:
 
@@ -414,6 +421,14 @@ inference:
 ---
 
 ## 5. Notes for future changes
+
+Run the focused regression suite from the repository root after changing pipeline code:
+
+```bash
+PYTHONPATH=mnist_spll_pipeline python -m unittest discover -s mnist_spll_pipeline/tests -v
+```
+
+The tests cover deterministic source/case generation, config and path contracts, cache behavior, adaptive cutoff order, strict rolling windows, checkpoint selection/schema, analysis aggregation, lightweight imports, the diagnostic compatibility facades, and a tiny fixed-budget Pipeline II training run.
 
 - Update [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md) in the same patch whenever behavior, workflow, schemas, commands, caveats, or architecture change.
 - Keep exact and approximate inference comparable. Avoid process-global caching or other run-order effects that can make one cutoff look faster for external reasons.

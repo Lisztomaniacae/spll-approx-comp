@@ -24,9 +24,6 @@ training:
   sum_batch_size: 1
   max_steps: 100
 
-validation:
-  enabled: false
-
 schedule:
   preview_size: 20
 

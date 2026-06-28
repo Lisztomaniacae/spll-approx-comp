@@ -22,7 +22,6 @@ training:
   epochs: 12
   learning_rate: 0.001
   weight_decay: 0.0
-  selection_mode: nearest
   target_tolerance: 0.03
   normalize:
     mean: 0.1307
@@ -138,7 +137,6 @@ inference:
       posterior_mass_target: 0.8
   # The pipeline uses the accumulated global path-mass cutoff.
   # `null` is the exact baseline (no pruning); all positive values below are global-cutoff runs.
-  cutoff_modes:
   # Compile with SPLL's -c/--countBranches so each posterior query also returns a branch count.
   count_branches: false
   force_recompile: true

@@ -2,19 +2,25 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from mnist_spll_common import load_config, save_config, set_seed, stage_message
-from spll_training_core import (
+from mnist_model import set_seed
+from pipeline2_config import training_paths
+from pipeline2_data import (
     build_balanced_split_manifest,
-    training_paths,
     write_initial_checkpoints,
-    write_json,
     write_schedule_artifacts,
+)
+from pipeline_support import (
+    run_configured_stage_cli,
+    save_config,
+    stage_message,
+    write_json,
 )
 
 
 def run_prepare_stage(config: Dict[str, Any]) -> None:
     set_seed(int(config.get("seed", 42)))
     paths = training_paths(config)
+    paths.ensure_prepare_dirs()
 
     stage_message(1, 4, "Writing resolved Pipeline II config snapshot")
     save_config(config, paths.config_used_path)
@@ -34,12 +40,11 @@ def run_prepare_stage(config: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Prepare data splits, schedules, and initial checkpoints for Pipeline II.")
-    parser.add_argument("--config", required=True, help="Path to the Pipeline II YAML config.")
-    args = parser.parse_args()
-    run_prepare_stage(load_config(args.config))
+    run_configured_stage_cli(
+        run_prepare_stage,
+        description="Prepare data splits, schedules, and initial checkpoints for Pipeline II.",
+        config_help="Path to the Pipeline II YAML config.",
+    )
 
 
 if __name__ == "__main__":

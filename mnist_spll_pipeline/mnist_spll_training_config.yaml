@@ -15,7 +15,6 @@ data:
   normalize:
     mean: 0.1307
     std: 0.3081
-  augmentation: none
   image_cache_device: device   # device | cpu
   image_cache_strategy: none    # none | lru
   image_cache_max_items: 4096
@@ -30,7 +29,6 @@ model:
   dropout: 0.25
 
 optimizer:
-  name: adam
   learning_rate: 0.001
   weight_decay: 0.0
 
@@ -52,25 +50,6 @@ checkpointing:
   posterior_thresholds: [0.2, 0.4, 0.6, 0.8]
   rolling_window_updates: 50
   rolling_window_policy: full
-
-validation:
-  # Kept as optional diagnostic plumbing, but not used by the redesigned benchmark.
-  enabled: false
-  interval_steps: 100
-  digit_eval_batch_size: 1024
-  milestones: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-  stop_at_highest_milestone: false
-  sum_probe:
-    enabled: false
-    num_cases: 100
-    zero_total_mass_tolerance: 1.0e-12
-  async:
-    enabled: false
-    device: cpu
-    max_pending_jobs: 1
-    validate_step_zero_synchronously: true
-    torch_num_threads: 1
-    join_timeout_sec: 5.0
 
 schedule:
   preview_size: 20
@@ -99,7 +78,7 @@ adaptive_top_k:
 visualization:
   trace_smoothing_window_points: 50
   # Across-seed uncertainty shown in milestone error bars and smoothed traces.
-  # Options: std, sem, ci95, none. With five seeds, std is the most honest
+  # Options: std, sem, ci95, none. With three seeds, std is the most honest
   # default because it shows run-to-run spread without overclaiming precision.
   uncertainty_interval: std
   min_uncertainty_samples: 2
@@ -116,10 +95,10 @@ experiments:
 inference_modes:
   - name: exact
     top_k_cutoff: null
-  #- name: approx_mass_0p8
-  #  top_k_cutoff: auto
- #   adaptive_top_k: true
-  #  posterior_mass_target: 0.8
+  # - name: approx_mass_0p8
+  #   top_k_cutoff: auto
+  #   adaptive_top_k: true
+  #   posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
   - name: approx_0p05

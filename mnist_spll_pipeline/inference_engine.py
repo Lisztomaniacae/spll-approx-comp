@@ -7,22 +7,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
-from mnist_spll_common import TerminalProgressBar
-from mnist_spll_pipeline_core import (
+from pipeline1_config import (
     PIPELINE_I_ADAPTIVE_TOP_K_MAX_CUTOFF,
     PIPELINE_I_ADAPTIVE_TOP_K_MIN_CUTOFF,
     PipelinePaths,
     ThresholdSpec,
-    compiled_program_path,
-    evaluate_candidate_sum,
-    posterior_for_experiment,
-    threshold_label,
     threshold_spec_artifact_label,
     threshold_spec_compile_cutoff,
     threshold_spec_label,
     threshold_spec_runtime_seed_cutoff,
-    utc_now_iso,
 )
+from pipeline1_data import evaluate_candidate_sum, posterior_for_experiment
+from pipeline_support import TerminalProgressBar, utc_now_iso
+from spll_artifacts import compiled_program_path
 
 
 READ_MNIST_CACHE_POLICY_RUN_SCOPED = "run_scoped_no_cross_run_cache"
@@ -32,47 +29,20 @@ READ_MNIST_CACHE_POLICY_DEFAULT = READ_MNIST_CACHE_POLICY_UNCACHED
 
 
 def normalize_read_mnist_cache_policy(value: Any) -> str:
-    """Return the canonical inference-time readMNist cache policy.
+    """Validate and return the canonical inference-time readMNist cache policy."""
 
-    Accepted aliases are intentionally lenient so old local configs can be
-    updated without breaking immediately. The canonical values written to raw
-    result metadata are:
-
-    - ``run_scoped_no_cross_run_cache``: cache repeated image probabilities
-      only inside one measured generated-SPLL query.
-    - ``precomputed_per_measurement``: compute the probabilities for the
-      current measurement's image paths immediately before timing, install a
-      lookup-only ``readMNist`` for the timed generated-SPLL query, and discard
-      it immediately afterwards.  This isolates symbolic/probabilistic
-      inference time without allowing exact runs to warm approximate runs.
-    - ``uncached``: call the base MNIST model for every generated-SPLL
-      ``readMNist`` invocation. This is the default thesis timing policy.
-    """
-
-    text = str(value or READ_MNIST_CACHE_POLICY_DEFAULT).strip().lower().replace("-", "_")
-    if text in {
-        "cached",
-        "run_scoped",
-        "run_scoped_cache",
-        "run_scoped_no_cross_run_cache",
-    }:
-        return READ_MNIST_CACHE_POLICY_RUN_SCOPED
-    if text in {
-        "precomputed",
-        "precompute",
-        "precomputed_lookup",
-        "precomputed_per_measurement",
-        "lookup_only",
-    }:
-        return READ_MNIST_CACHE_POLICY_PRECOMPUTED
-    if text in {"uncached", "no_cache", "none", "off", "disabled", "false"}:
-        return READ_MNIST_CACHE_POLICY_UNCACHED
-    raise ValueError(
-        "inference.read_mnist_cache_policy must be one of "
-        f"'{READ_MNIST_CACHE_POLICY_UNCACHED}', '{READ_MNIST_CACHE_POLICY_RUN_SCOPED}', "
-        f"or '{READ_MNIST_CACHE_POLICY_PRECOMPUTED}' "
-        f"(got {value!r})."
-    )
+    policy = str(value or READ_MNIST_CACHE_POLICY_DEFAULT).strip()
+    valid = {
+        READ_MNIST_CACHE_POLICY_RUN_SCOPED,
+        READ_MNIST_CACHE_POLICY_UNCACHED,
+        READ_MNIST_CACHE_POLICY_PRECOMPUTED,
+    }
+    if policy not in valid:
+        expected = ", ".join(repr(item) for item in sorted(valid))
+        raise ValueError(
+            f"inference.read_mnist_cache_policy must be one of {expected} (got {value!r})."
+        )
+    return policy
 
 
 class RunScopedReadMNistCache:

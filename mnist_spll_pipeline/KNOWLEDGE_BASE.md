@@ -49,24 +49,35 @@ The current orchestration entrypoint is:
 mnist_spll_pipeline/run_spll_pipeline.py
 ```
 
-After the architecture-deepening refactor, this entrypoint lazy-loads only the selected stage module via `load_stage_fn(...)`. This avoids importing all stage-specific dependencies when running a single stage. It does **not** yet make the compile stage dependency-free, because `compile_spll.py` still imports shared modules that themselves import PyTorch.
+The dispatcher lazy-loads only the selected stage module through `pipeline_support.load_stage_fn(...)`. Configuration, path, command-line, metadata, and SPLL source/compile helpers are torch-free, so dispatch and compile-only imports do not load PyTorch. Torch-dependent MNIST model and dataset behavior lives behind `mnist_model.py` and the data/runtime modules.
 
 ### Core files
 
 | File | Role | Notes |
 |---|---|---|
-| `run_spll_pipeline.py` | Main stage dispatcher | Uses lazy imports. `STAGES` maps stage names to `(module_name, function_name)`. |
-| `train_mnist.py` | Trains all configured MNIST model variants | Owns train/validation subset selection and checkpoint export. |
-| `compile_spll.py` | Generates and compiles SPLL programs | Uses `compiled_program_path(...)` as the canonical artifact path helper. |
-| `stage_experiments.py` | Samples digit-addition inputs from fixed inference split | Writes raw PNG inputs and `staged_experiments.json`. |
-| `infer_experiments.py` | Inference stage orchestration | Iterates model variants and creates `InferenceRunEngine` instances. |
-| `inference_engine.py` | Deepened inference-run module | Owns full-posterior query, true-candidate query, timing, and raw run schema. |
-| `visualize_results.py` | Metrics, tables, and figures | Large file; contains both metric derivation and plotting. |
-| `diagnose_cutoff_zero_mwe.py` | Timing diagnostic / minimal-working-example harness | Repeatedly runs exact and `cutoff=0.0` generated Python artifacts with fake or real `readMNist` backends; writes timing CSV, summaries, optional profiles, and optional disassembly. |
-| `mnist_spll_pipeline_core.py` | Shared pipeline helpers | Paths, SPLL program generation, compilation wrapper, module loading, inference helpers, JSON helpers. |
-| `mnist_spll_common.py` | Shared config/model/data utilities | Config loading, path resolution, CNN model, MNIST loading, model variant config. |
-| `run_spll_sum_experiments.py` | Legacy wrapper | Kept for compatibility, but should not be the preferred entrypoint. See known caveat below. |
-| `mnist_spll_config.yaml` | Joint config | Drives all stages. Some old-looking keys may be inert; see config caveats. |
+| `run_spll_pipeline.py` | Pipeline I dispatcher | Lazy-loads the requested stage. |
+| `pipeline_support.py` | Cross-pipeline infrastructure | Config inheritance, paths, JSON/YAML, progress, CLI dispatch, and environment metadata; intentionally torch-free. |
+| `mnist_model.py` | Shared MNIST model boundary | CNN, transforms, checkpoints, seeds, device selection, and dataset loading. |
+| `pipeline1_config.py` | Pipeline I configuration and paths | Normalizes thresholds and constructs paths without creating directories. |
+| `pipeline1_models.py` | Pipeline I model variants | Merges and validates model-variant configuration. |
+| `pipeline1_data.py` | Pipeline I MNIST callback/data helpers | Builds `readMNist` and loads staged/model data. |
+| `spll_artifacts.py` | Shared generated-artifact boundary | SPLL text, compile commands, module imports, and generated result extraction. |
+| `train_mnist.py` | Pipeline I model training | Owns subset selection, granular checkpoints, and model manifests. |
+| `compile_spll.py` | Pipeline I compile coordinator | Writes sources and compile manifest. |
+| `stage_experiments.py` | Pipeline I case staging | Writes input PNGs and the staged manifest. |
+| `infer_experiments.py`, `inference_engine.py` | Pipeline I inference | Orchestration plus per-query timing/result contracts. |
+| `pipeline1_analysis.py` | Pipeline I metric derivation | Reads raw inference results and writes/returns derived rows. |
+| `pipeline1_plotting.py` | Pipeline I figures | Contains the live plot constructors. |
+| `visualize_results.py` | Pipeline I visualization coordinator | Connects analysis, tables, and plots. |
+| `pipeline2_config.py`, `pipeline2_data.py`, `pipeline2_artifacts.py` | Pipeline II setup boundaries | Configuration/paths, split/schedule/model setup, and compile/load behavior. |
+| `pipeline2_runtime.py`, `pipeline2_adaptive.py` | Pipeline II training primitives | Differentiable callback/cache/runtime code and deterministic adaptive cutoff search. |
+| `pipeline2_checkpoint_transfer.py` | Pipeline II checkpoint transfer | Selects aggregate exact anchors and runs approximate transfer segments. |
+| `train_spll_generated.py` | Pipeline II training coordinator | Active fixed-budget experiment loop; obsolete asynchronous validation machinery was removed. |
+| `pipeline2_analysis.py`, `pipeline2_plotting.py`, `visualize_spll_training.py` | Pipeline II visualization | Aggregation, plot construction, and orchestration. |
+| `mnist_spll_common.py`, `mnist_spll_pipeline_core.py` | Compatibility facades | Preserve historical imports required by local scripts and the unchanged diagnostic utility; production stages import focused modules directly. |
+| `diagnose_cutoff_zero_mwe.py` | Timing diagnostic | Intentionally unchanged by the readability refactor. |
+
+`run_spll_sum_experiments.py` was removed because it was a broken, superseded wrapper around `run_spll_pipeline.py`.
 
 ## 3. High-Level Data Flow
 
@@ -119,7 +130,7 @@ The project is normally used on Apple Silicon with two environments:
 ### Important environment caveats
 
 1. Use explicit interpreter paths, not a shell alias such as `python -> /opt/homebrew/bin/python@3.11`.
-2. Lazy stage loading means `run_spll_pipeline.py compile` no longer imports every stage file. However, the compile stage still imports shared modules that currently import `torch`, so the x86 compile environment may still need PyTorch installed until shared imports are split further.
+2. Lazy stage loading and the torch-free support/artifact modules keep dispatcher and compile-only imports lightweight. PyTorch is still required by train, stage, infer, and the training-runtime stages.
 3. `stack` must be available on `PATH` for the compile stage.
 4. The compile stage uses `paths.repo_root` from YAML to find the local SPLL/NeST checkout and `pythonLib.py`.
 5. Running `all` in one command is less robust on Apple Silicon because stages prefer different CPU architectures/environments. Prefer explicit stage-by-stage commands.
@@ -146,7 +157,7 @@ source .venv-spll-x86/bin/activate
 
 ## 5. Config Semantics And Caveats
 
-The config is loaded by `mnist_spll_common.load_config(...)`. Loading injects two internal keys:
+The config is loaded by `pipeline_support.load_config(...)`. Loading injects two internal keys:
 
 - `_config_path`: absolute path to the YAML file;
 - `_config_dir`: parent directory of the YAML file.
@@ -204,13 +215,7 @@ Pipeline I tuning is deterministic bounded monotone bisection over cutoff values
 
 ### Cutoff mode caveat
 
-The Python pipeline currently uses only the accumulated global path-mass cutoff. `get_cutoff_modes(config)` always returns:
-
-```python
-["global"]
-```
-
-The YAML may still contain a `cutoff_modes:` key for historical reasons, but it is no longer a real user-facing knob. Do not reintroduce local/global branching unless the experiment design explicitly needs it and all artifact paths, visualization grouping, and documentation are updated.
+The Python pipeline uses only the accumulated global path-mass cutoff, represented internally by `GLOBAL_CUTOFF_MODE = "global"`. The obsolete `cutoff_modes:` YAML key and single-value helper were removed. Do not reintroduce local/global branching unless the experiment design explicitly needs it and all artifact paths, visualization grouping, and documentation are updated.
 
 ### Training config and target-accuracy variants
 
@@ -566,23 +571,22 @@ Visualization layout notes:
 
 Keep these visible. They are useful future patch targets.
 
-1. **Legacy wrapper likely needs update after lazy stage loading.** `run_spll_sum_experiments.py` imports `STAGES` from `run_spll_pipeline.py`, but `STAGES` now contains `(module_name, function_name)` tuples rather than callable functions. Prefer `run_spll_pipeline.py`; if the legacy wrapper must be kept working, update it to use `load_stage_fn(...)` and update this knowledge base in that same patch.
-2. **Shared imports are still too heavy.** `compile_spll.py` lazy-loads as a stage, but imports `mnist_spll_pipeline_core.py` and `mnist_spll_common.py`, which import PyTorch. The compile environment may still need PyTorch until compile-only helpers are separated from neural/data helpers.
-3. **Visualization is still shallow/large.** `visualize_results.py` combines metric derivation, aggregation, plotting style, plot layout, and output writing. Future changes should deepen metrics before adding more plot-specific complexity.
-4. **Raw config dict remains the main cross-stage interface.** A future `ExperimentPlan` object would reduce string-key coupling and make tests cleaner.
-5. **`selected_test_accuracy` naming is misleading.** It means selected validation/model-selection accuracy.
-6. **True-candidate tracing is extra work.** It is intentionally separate data, not part of the original posterior run. Keep `runtime_sec` and `true_candidate_runtime_sec` separate.
-7. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`. After the timing-cache patch, `0.0` should no longer benefit from an exact-warmed process-global readMNist cache.
-8. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope through `run_scoped_no_cross_run_cache`, deliberately disabled through the default `inference.read_mnist_cache_policy: uncached`, or precomputed into a fresh per-measurement lookup through `precomputed_per_measurement`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
-9. **Runtime plots must state the readMNist policy.** Use `uncached` for literal end-to-end generated-SPLL execution. Use `precomputed_per_measurement` for inference-isolated timing. Do not mix the two regimes in one speedup claim without labeling them.
-10. **Do not hide cold-start effects in thesis-facing benchmarks.** Keep `read_mnist_warmup_calls: 0` for normal uncached runtime results. Use positive warmup only for explicit diagnostics that ask whether a one-off startup effect is present.
-11. **Use the cutoff-zero MWE harness before explaining suspicious `0.0` speedups.** Prefer `uniform-list` first, then `uniform-tensor`, then `real`, so generated Python/interpreter effects are separated from PyTorch and image/model effects.
-12. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
-13. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
-14. **Branch-count timing caveat.** Branch counting is currently treated as symmetric enough for the exact-vs-approximate comparison, but thesis-facing runtime text should state when `count_branches: true` was enabled. If clean runtime becomes central, run a non-counting timing sensitivity check rather than assuming instrumentation overhead is exactly equal across modes.
-15. **Pipeline I uses a custom MNIST-pool split.** This is intentional: official MNIST train and test partitions are loaded into one pool and then split into train, validation/model-selection, and inference subsets by the configured ratios and seed. Do not describe Pipeline I as an official MNIST-test benchmark unless the split logic is changed.
-16. **Large-N random sampling is the current mitigation for staged-case luck.** The final run is expected to use many more staged experiments rather than stratified balancing. If residual fairness concerns remain, add slice reporting by arity, true sum, model variant, collapse rate, and exact confidence.
-17. **Operand-order sensitivity is known but not currently patched.** Generated addition expressions are left-associated; approximation may be branch/order sensitive. Large-N random sampling is the current practical mitigation. A future permutation-sensitivity experiment would be the cleanest direct check.
+1. **Raw config dicts remain the main cross-stage interface.** Focused normalization functions reduce string-key coupling, but a typed experiment-plan object could tighten this further if future behavior changes justify it.
+2. **Plot constructors are intentionally isolated, not rewritten.** The large plot modules preserve the accepted figure implementations while coordinators and metric derivation remain separate. Change plot code only with rendered-output regression checks.
+3. **Compatibility facades are not production architecture.** Keep them thin. They exist for historical imports and the untouched diagnostic utility; new production code should import the focused modules directly.
+4. **`selected_test_accuracy` naming is misleading.** It means selected validation/model-selection accuracy.
+5. **True-candidate tracing is extra work.** It is intentionally separate data, not part of the original posterior run. Keep `runtime_sec` and `true_candidate_runtime_sec` separate.
+6. **`0.0` cutoff is not exact.** It is useful as an approximate-code-path overhead baseline, but exact is represented only by `null`. After the timing-cache patch, `0.0` should no longer benefit from an exact-warmed process-global readMNist cache.
+7. **Do not restore process-global readMNist caching.** Repeated neural calls may be cached only inside a single measured query scope through `run_scoped_no_cross_run_cache`, deliberately disabled through the default `inference.read_mnist_cache_policy: uncached`, or precomputed into a fresh per-measurement lookup through `precomputed_per_measurement`. Cross-run caching contaminates exact-vs-cutoff comparisons and can manufacture speedups.
+8. **Runtime plots must state the readMNist policy.** Use `uncached` for literal end-to-end generated-SPLL execution. Use `precomputed_per_measurement` for inference-isolated timing. Do not mix the two regimes in one speedup claim without labeling them.
+9. **Do not hide cold-start effects in thesis-facing benchmarks.** Keep `read_mnist_warmup_calls: 0` for normal uncached runtime results. Use positive warmup only for explicit diagnostics that ask whether a one-off startup effect is present.
+10. **Use the cutoff-zero MWE harness before explaining suspicious `0.0` speedups.** Prefer `uniform-list` first, then `uniform-tensor`, then `real`, so generated Python/interpreter effects are separated from PyTorch and image/model effects.
+11. **Generated SPLL syntax should be treated conservatively.** Do not change parenthesization or operator shape without verifying SPLL parser/compiler behavior.
+12. **Manifests are part of reproducibility.** If a stage changes schema, update the knowledge base and preferably include backward-compatible visualization fallback where cheap.
+13. **Branch-count timing caveat.** Branch counting is currently treated as symmetric enough for the exact-vs-approximate comparison, but thesis-facing runtime text should state when `count_branches: true` was enabled. If clean runtime becomes central, run a non-counting timing sensitivity check rather than assuming instrumentation overhead is exactly equal across modes.
+14. **Pipeline I uses a custom MNIST-pool split.** This is intentional: official MNIST train and test partitions are loaded into one pool and then split into train, validation/model-selection, and inference subsets by the configured ratios and seed. Do not describe Pipeline I as an official MNIST-test benchmark unless the split logic is changed.
+15. **Large-N random sampling is the current mitigation for staged-case luck.** The final run is expected to use many more staged experiments rather than stratified balancing. If residual fairness concerns remain, add slice reporting by arity, true sum, model variant, collapse rate, and exact confidence.
+16. **Operand-order sensitivity is known but not currently patched.** Generated addition expressions are left-associated; approximation may be branch/order sensitive. Large-N random sampling is the current practical mitigation. A future permutation-sensitivity experiment would be the cleanest direct check.
 
 ## 8. Patch Discipline For Future Work
 
@@ -618,6 +622,10 @@ print('all mnist_spll_pipeline/*.py files parse')
 PY
 ```
 
+```bash
+PYTHONPATH=mnist_spll_pipeline python -m unittest discover -s mnist_spll_pipeline/tests -v
+```
+
 When local dependencies are available, prefer stage-level smoke checks over helper-only checks:
 
 ```bash
@@ -646,13 +654,13 @@ Use John Ousterhout-style deep modules: small interface, substantial hidden impl
 - Letting visualization-specific choices change metric semantics silently.
 - Renaming artifact fields casually; saved JSON/CSV files are analysis inputs.
 
-### Current best refactor targets
+### Current best future targets
 
-1. **Experiment plan module.** Convert raw YAML config into a typed `ExperimentPlan` containing paths, thresholds, term counts, model variants, and compile targets.
-2. **Visualization metrics module.** Split metric derivation from plotting so tables can be boundary-tested without matplotlib.
-3. **Compile artifact manager.** Move SPLL source generation, artifact pathing, Stack invocation, and manifest rows behind a small compile API.
-4. **Stage experiment repository.** Represent staged experiments as typed records instead of ad-hoc dicts.
-5. **Training variant planner.** Deepen target-accuracy variant and checkpoint-selection semantics into a testable plan.
+1. **Typed experiment plans.** Replace the remaining raw config-dict flow with validated immutable plans only when a behavior change justifies the migration cost.
+2. **Schema constants or records.** Centralize long CSV/JSON field lists so writers and readers cannot drift while preserving all existing field names.
+3. **Repository-level golden fixtures.** Add small checked-in raw-result fixtures for complete Pipeline I and Pipeline II visualization regression tests; avoid image hashes that depend on a specific Matplotlib/font build.
+4. **Artifact schema versioning.** Introduce explicit schema versions before any future incompatible output change.
+5. **Full environment smoke scripts.** Add opt-in scripts for the real compiler, MNIST data, and generated artifacts without making the fast unit suite depend on those external resources.
 
 ## 10. Testing Strategy Guidelines
 
@@ -767,7 +775,7 @@ loss = mean_i(-log(p_true_i + epsilon))
 
 The redesigned benchmark uses `sum_batch_size: 1`, so one training step is one iteration / one sum case. Pure exact and pure approximate runs train for fixed `max_steps`; there is no validation-driven early stopping.
 
-Pipeline II keeps the old full-posterior validation machinery as optional diagnostic plumbing, but the default redesigned benchmark sets `validation.enabled: false` and does not use held-out validation for checkpointing or plots. The main measured signals are training loss and training true-sum posterior probability `p(true_sum)`.
+Pipeline II uses the fixed-budget training path only. The obsolete asynchronous full-posterior validation/snapshot subsystem was removed because it had no active callers and was not part of the redesigned benchmark. The measured training signals remain loss and true-sum posterior probability `p(true_sum)`; checkpoint transfer is anchored from aggregate exact-training traces.
 
 Pipeline II rotates inference-mode run order by seed/experiment index instead of always running exact first. Run summaries record `mode_order_position`, `mode_order_offset`, and `run_order_index` so thermal/cache/load-order effects can be audited later.
 
@@ -777,14 +785,16 @@ The generated SPLL Python artifact is part of the gradient path. Do not replace 
 
 | File | Role |
 |---|---|
-| `run_spll_training_pipeline.py` | Stage dispatcher for Pipeline II. |
+| `run_spll_training_pipeline.py` | Lazy stage dispatcher for Pipeline II. |
 | `mnist_spll_training_config.yaml` | Default Pipeline II config. |
 | `mnist_spll_training_smoke_config.yaml` | Layered smoke override. |
 | `prepare_spll_training.py` | Creates the balanced split, schedule manifests/previews, and shared initial checkpoints. |
 | `compile_spll_training.py` | Writes SPLL source programs and compiles generated Python artifacts per arity/mode. |
-| `train_spll_generated.py` | Trains through generated SPLL artifacts with differentiable `readMNist`. |
-| `visualize_spll_training.py` | Writes milestone tables, per-arity grouped milestone bar charts, and trace figures. |
-| `spll_training_core.py` | Shared Pipeline II helpers. |
+| `pipeline2_config.py`, `pipeline2_data.py`, `pipeline2_artifacts.py` | Configuration/paths, dataset/schedule, and generated-artifact boundaries. |
+| `pipeline2_runtime.py`, `pipeline2_adaptive.py` | Differentiable runtime primitives and adaptive cutoff search. |
+| `pipeline2_checkpoint_transfer.py` | Aggregate exact checkpoint selection and approximate transfer segments. |
+| `train_spll_generated.py` | Coordinates fixed-budget training through generated SPLL artifacts. |
+| `pipeline2_analysis.py`, `pipeline2_plotting.py`, `visualize_spll_training.py` | Aggregation, figure construction, and visualization orchestration. |
 
 ### 14.3 Stage order and environments
 
@@ -916,7 +926,7 @@ The train stage must not auto-compile missing artifacts. It should tell the user
 
 ### 14.8 Config inheritance
 
-`mnist_spll_common.load_config(...)` supports exactly one `extends` level. Dicts deep-merge and lists replace completely. Nested inheritance is rejected.
+`pipeline_support.load_config(...)` supports exactly one `extends` level. Dicts deep-merge and lists replace completely. Nested inheritance is rejected.
 
 This is used for the Pipeline II smoke config. Whenever the default Pipeline II config changes, the smoke override must be checked and updated in the same patch so it remains a valid fast representative of the default experiment.
 

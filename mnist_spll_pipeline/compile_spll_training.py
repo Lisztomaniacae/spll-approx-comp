@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from mnist_spll_common import load_config, save_config, set_seed, stage_message
-from spll_training_core import compile_training_artifacts, training_paths
+from pipeline2_artifacts import compile_training_artifacts
+from pipeline2_config import training_paths
+from pipeline_support import run_configured_stage_cli, save_config, stage_message
 
 
 def run_compile_stage(config: Dict[str, Any]) -> None:
-    set_seed(int(config.get("seed", 42)))
     paths = training_paths(config)
+    paths.ensure_compile_dirs()
 
     stage_message(1, 2, "Writing resolved Pipeline II config snapshot")
     save_config(config, paths.config_used_path)
@@ -19,12 +20,11 @@ def run_compile_stage(config: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Compile generated SPLL artifacts for Pipeline II training.")
-    parser.add_argument("--config", required=True, help="Path to the Pipeline II YAML config.")
-    args = parser.parse_args()
-    run_compile_stage(load_config(args.config))
+    run_configured_stage_cli(
+        run_compile_stage,
+        description="Compile generated SPLL artifacts for Pipeline II training.",
+        config_help="Path to the Pipeline II YAML config.",
+    )
 
 
 if __name__ == "__main__":

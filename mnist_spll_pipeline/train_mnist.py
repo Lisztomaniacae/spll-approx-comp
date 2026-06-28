@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import argparse
+import copy
 import csv
 import json
 from pathlib import Path
@@ -13,25 +13,23 @@ from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Subset, random_split
 
-from mnist_spll_common import (
+from mnist_model import (
     build_model,
-    checkpoint_payload,
     compute_split_lengths,
-    ensure_dir,
+    load_full_mnist_transformed,
+    resolve_device,
+    set_seed,
+)
+from pipeline1_models import (
     get_model_selection_manifest_path,
     get_model_variants,
     get_models_root,
     get_training_root,
     get_variant_metrics_output_path,
     get_variant_model_output_path,
-    load_config,
-    load_full_mnist_transformed,
-    resolve_device,
-    resolve_path,
-    save_config,
-    set_seed,
     stable_variant_offset,
 )
+from pipeline_support import ensure_dir, resolve_path, run_configured_stage_cli, save_config
 
 
 NUM_MNIST_CLASSES = 10
@@ -55,7 +53,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
         "loss": total_loss / max(total_examples, 1),
         "accuracy": total_correct / max(total_examples, 1),
     }
-
 
 
 def train_one_batch(
@@ -84,7 +81,6 @@ def train_one_batch(
     }
 
 
-
 def choose_checkpoint_nearest_target(history: List[Dict[str, Any]], target_accuracy: float) -> Tuple[int, Dict[str, Any]]:
     if not history:
         raise RuntimeError("Cannot select a checkpoint from an empty training history.")
@@ -98,12 +94,10 @@ def choose_checkpoint_nearest_target(history: List[Dict[str, Any]], target_accur
     return int(best_row["optimizer_step"]), best_row
 
 
-
 def within_target_tolerance(accuracy: float, target_accuracy: float, tolerance: float | None) -> bool:
     if tolerance is None:
         return False
     return abs(float(accuracy) - float(target_accuracy)) <= float(tolerance)
-
 
 
 def resolve_requested_examples(
@@ -131,7 +125,6 @@ def resolve_requested_examples(
     return max(1, min(total_examples, requested))
 
 
-
 def normalize_label_distribution(
         raw_distribution: Mapping[Any, Any],
         *,
@@ -157,7 +150,6 @@ def normalize_label_distribution(
     return {label: weight / total_weight for label, weight in normalized.items()}
 
 
-
 def allocate_label_counts(total_examples: int, distribution: Mapping[int, float]) -> Dict[int, int]:
     raw_targets = {label: float(total_examples) * float(distribution.get(label, 0.0)) for label in range(NUM_MNIST_CLASSES)}
     counts = {label: int(np.floor(raw_targets[label])) for label in range(NUM_MNIST_CLASSES)}
@@ -173,14 +165,12 @@ def allocate_label_counts(total_examples: int, distribution: Mapping[int, float]
     return counts
 
 
-
 def build_label_index_pools(base_subset) -> Dict[int, List[int]]:
     pools: Dict[int, List[int]] = {label: [] for label in range(NUM_MNIST_CLASSES)}
     for local_idx in range(len(base_subset)):
         _, label = base_subset[local_idx]
         pools[int(label)].append(local_idx)
     return pools
-
 
 
 def summarize_selected_counts(indices: Sequence[int], label_pools: Dict[int, List[int]]) -> Dict[int, int]:
@@ -196,7 +186,6 @@ def summarize_selected_counts(indices: Sequence[int], label_pools: Dict[int, Lis
             raise RuntimeError(f"Internal error: local index {local_idx} not found in label pools.")
         counts[label] += 1
     return counts
-
 
 
 def select_variant_subset(
@@ -283,7 +272,6 @@ def select_variant_subset(
     }
 
 
-
 def write_metrics_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         raise ValueError(f"No rows available for metrics export to {path}")
@@ -292,7 +280,6 @@ def write_metrics_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-
 
 
 def train_variant(
@@ -452,40 +439,42 @@ def train_variant(
     selected_epoch = int(selected_row["epoch"])
     selected_batch_in_epoch = int(selected_row["batch_in_epoch"])
     model.load_state_dict(selected_state)
-    checkpoint = checkpoint_payload(
-        model=model,
-        config={**config, "training": {**config["training"], "model": variant["model"]}},
-        best_epoch=selected_epoch,
-        best_test_accuracy=float(selected_row["test_accuracy"]),
-        extra={
-            "model_variant_id": variant["id"],
-            "visualization_group": variant.get("visualization_group", "main"),
-            "target_accuracy": target_accuracy,
-            "selection_granularity": "batch",
-            "validation_interval_batches": validation_interval_batches,
-            "selected_epoch": selected_epoch,
-            "selected_batch_in_epoch": selected_batch_in_epoch,
-            "selected_optimizer_step": selected_step,
-            "selected_test_accuracy": float(selected_row["test_accuracy"]),
-            "selected_accuracy_gap": float(selected_row["accuracy_gap_to_target"]),
-            "best_overall_epoch": best_overall_epoch,
-            "best_overall_optimizer_step": best_overall_step,
-            "best_overall_test_accuracy": best_overall_accuracy,
-            "train_examples": selected_train_examples,
-            "validation_examples": selected_validation_examples,
-            "train_selection_mode": train_selection_meta["mode"],
-            "validation_selection_mode": validation_selection_meta["mode"],
-            "train_label_distribution": train_selection_meta["requested_label_distribution"],
-            "validation_label_distribution": validation_selection_meta["requested_label_distribution"],
-            "train_label_counts": train_selection_meta["selected_label_counts"],
-            "validation_label_counts": validation_selection_meta["selected_label_counts"],
-            "epochs_trained": epochs_trained,
-            "optimizer_steps_trained": optimizer_step,
-            "target_tolerance": target_tolerance,
-            "stopped_early": stopped_early,
-            "stop_reason": stop_reason,
-        },
-    )
+    selection_summary = {
+        "model_variant_id": variant["id"],
+        "visualization_group": variant.get("visualization_group", "main"),
+        "target_accuracy": target_accuracy,
+        "selection_granularity": "batch",
+        "validation_interval_batches": validation_interval_batches,
+        "selected_epoch": selected_epoch,
+        "selected_batch_in_epoch": selected_batch_in_epoch,
+        "selected_optimizer_step": selected_step,
+        "selected_test_accuracy": float(selected_row["test_accuracy"]),
+        "selected_accuracy_gap": float(selected_row["accuracy_gap_to_target"]),
+        "best_overall_epoch": best_overall_epoch,
+        "best_overall_optimizer_step": best_overall_step,
+        "best_overall_test_accuracy": best_overall_accuracy,
+        "train_examples": selected_train_examples,
+        "validation_examples": selected_validation_examples,
+        "train_selection_mode": train_selection_meta["mode"],
+        "validation_selection_mode": validation_selection_meta["mode"],
+        "train_label_distribution": train_selection_meta["requested_label_distribution"],
+        "validation_label_distribution": validation_selection_meta["requested_label_distribution"],
+        "train_label_counts": train_selection_meta["selected_label_counts"],
+        "validation_label_counts": validation_selection_meta["selected_label_counts"],
+        "epochs_trained": epochs_trained,
+        "optimizer_steps_trained": optimizer_step,
+        "target_tolerance": target_tolerance,
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
+    }
+    checkpoint = {
+        "state_dict": model.state_dict(),
+        "model_config": copy.deepcopy(variant["model"]),
+        "best_epoch": selected_epoch,
+        "best_test_accuracy": float(selected_row["test_accuracy"]),
+        "seed": int(config.get("seed", 42)),
+        **copy.deepcopy(selection_summary),
+    }
     torch.save(checkpoint, export_path)
     write_metrics_csv(metrics_path, history)
     save_config(config, used_config_path)
@@ -500,36 +489,11 @@ def train_variant(
 
     return {
         "model_id": variant["id"],
-        "visualization_group": variant.get("visualization_group", "main"),
-        "target_accuracy": target_accuracy,
-        "selected_epoch": selected_epoch,
-        "selected_batch_in_epoch": selected_batch_in_epoch,
-        "selected_optimizer_step": selected_step,
-        "selected_test_accuracy": float(selected_row["test_accuracy"]),
-        "selected_accuracy_gap": float(selected_row["accuracy_gap_to_target"]),
-        "best_overall_epoch": best_overall_epoch,
-        "best_overall_optimizer_step": best_overall_step,
-        "best_overall_test_accuracy": best_overall_accuracy,
-        "epochs_trained": epochs_trained,
-        "optimizer_steps_trained": optimizer_step,
-        "selection_granularity": "batch",
-        "validation_interval_batches": validation_interval_batches,
-        "target_tolerance": target_tolerance,
-        "stopped_early": stopped_early,
-        "stop_reason": stop_reason,
-        "train_examples": selected_train_examples,
-        "validation_examples": selected_validation_examples,
-        "train_selection_mode": train_selection_meta["mode"],
-        "validation_selection_mode": validation_selection_meta["mode"],
-        "train_label_distribution": train_selection_meta["requested_label_distribution"],
-        "validation_label_distribution": validation_selection_meta["requested_label_distribution"],
-        "train_label_counts": train_selection_meta["selected_label_counts"],
-        "validation_label_counts": validation_selection_meta["selected_label_counts"],
+        **{key: value for key, value in selection_summary.items() if key != "model_variant_id"},
         "model_output": str(export_path),
         "metrics_csv": str(metrics_path),
         "model_config": variant["model"],
     }
-
 
 
 def run_training(config: Dict[str, Any]) -> None:
@@ -541,7 +505,7 @@ def run_training(config: Dict[str, Any]) -> None:
     device = resolve_device(training_cfg.get("device", "auto"), bool(training_cfg.get("require_mps", False)))
     print(f"Using device: {device}")
 
-    full_dataset = load_full_mnist_transformed(config, train=True)
+    full_dataset = load_full_mnist_transformed(config)
     total_size = len(full_dataset)
     train_len, test_len, inference_len = compute_split_lengths(
         total_size,
@@ -565,8 +529,8 @@ def run_training(config: Dict[str, Any]) -> None:
     ensure_dir(split_manifest_path.parent)
     ensure_dir(used_config_path.parent)
     ensure_dir(manifest_path.parent)
-    get_models_root(config)
-    get_training_root(config)
+    ensure_dir(get_models_root(config))
+    ensure_dir(get_training_root(config))
 
     split_payload = {
         "train_indices": list(train_subset.indices),
@@ -608,14 +572,12 @@ def run_training(config: Dict[str, Any]) -> None:
     print(f"Saved model-selection manifest to: {manifest_path}")
 
 
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train configurable MNIST model variants for the SPLL pipeline.")
-    parser.add_argument("--config", required=True, help="Path to the shared YAML config.")
-    args = parser.parse_args()
-
-    config = load_config(args.config)
-    run_training(config)
+    run_configured_stage_cli(
+        run_training,
+        description="Train configurable MNIST model variants for the SPLL pipeline.",
+        config_help="Path to the shared YAML config.",
+    )
 
 
 if __name__ == "__main__":
