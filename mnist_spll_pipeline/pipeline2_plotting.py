@@ -71,6 +71,85 @@ def _mode_compact_label(config: Dict[str, Any], mode_name: str) -> str:
     return str(mode_name).replace("_", " ")
 
 
+def _fully_reached_milestone_rows(
+    config: Dict[str, Any],
+    rows: Sequence[Dict[str, Any]],
+    *,
+    mode_name: str,
+    milestone: float,
+    required_fields: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Return one valid reached row per configured seed, or no rows.
+
+    A milestone bar must never summarize only the successful subset of seeds.
+    Returning an empty list when any configured seed is missing, unreached, or
+    lacks a required metric makes incomplete mode/checkpoint pairs disappear
+    from both the main dual-axis figure and the appendix bar figures.
+    """
+
+    configured_seeds = get_seeds(config)
+    configured_seed_set = set(configured_seeds)
+    by_seed: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        if str(row.get("mode_name")) != str(mode_name):
+            continue
+        row_milestone = _safe_float(row.get("milestone"))
+        if row_milestone is None or float(row_milestone) != float(milestone):
+            continue
+        seed = _safe_int(row.get("seed"))
+        if seed is None or seed not in configured_seed_set:
+            continue
+        by_seed[seed] = row
+
+    if set(by_seed) != configured_seed_set:
+        return []
+
+    ordered_rows = [by_seed[seed] for seed in configured_seeds]
+    if any(not bool(row.get("reached")) for row in ordered_rows):
+        return []
+    if any(row.get(field) in {None, ""} for row in ordered_rows for field in required_fields):
+        return []
+    return ordered_rows
+
+
+def _checkpoint_bar_axis_scaling(
+    *,
+    max_step_value: float,
+    max_time_value: float,
+    exact_step_means: Sequence[float],
+    exact_time_means: Sequence[float],
+) -> Tuple[float, float]:
+    """Return (time_to_steps, left_axis_top) for the dual-axis checkpoint bar plot.
+
+    The secondary wall-clock bars are drawn on the left axis after conversion to
+    step units. Therefore the left-axis limit must budget for both the outer
+    step bars and the converted inner wall-clock bars. Otherwise slower
+    approximate runs can hit the plot ceiling even when the step bars fit.
+    """
+
+    exact_pairs = [
+        (float(step), float(time))
+        for step, time in zip(exact_step_means, exact_time_means)
+        if float(time) > 0.0
+    ]
+    if exact_pairs:
+        numerator = sum(step * time for step, time in exact_pairs)
+        denominator = sum(time * time for _, time in exact_pairs)
+        exact_time_to_steps = (numerator / denominator) if denominator > 0.0 else None
+    else:
+        exact_time_to_steps = None
+
+    if exact_time_to_steps and exact_time_to_steps > 0.0:
+        time_to_steps = float(exact_time_to_steps)
+    else:
+        time_to_steps = float(max_step_value) / float(max_time_value)
+
+    converted_time_max = float(max_time_value) * float(time_to_steps)
+    content_top = max(float(max_step_value), converted_time_max)
+    left_top = content_top * 1.10
+    return time_to_steps, left_top
+
+
 def _mix_with_white(color: Any, amount: float) -> Tuple[float, float, float]:
     amount = max(0.0, min(1.0, float(amount)))
     r, g, b = to_rgb(color)
@@ -124,13 +203,37 @@ def _merge_series_dict(
 def _require_checkpoint_transfer_v2_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
-    required_columns = {"max_segment_cases_exact", "actual_end_step", "reached_target_checkpoint"}
+    required_columns = {
+        "target_step",
+        "max_segment_cases_exact",
+        "actual_end_step",
+        "reached_target_checkpoint",
+    }
     missing = [name for name in sorted(required_columns) if name not in rows[0]]
     if missing:
         raise RuntimeError(
             f"Stale checkpoint-transfer trace at {path}: missing {missing}. "
-            "Rerun Pipeline II stage 'checkpoint-transfer' before visualizing; "
-            "old transfer CSVs were generated with the previous fixed-budget semantics."
+            "Rerun Pipeline II stage 'checkpoint-transfer' before visualizing."
+        )
+
+    early_stopped_segments: List[Tuple[int, int, int]] = []
+    for row in rows:
+        segment_index = _safe_int(row.get("segment_index"))
+        target_step = _safe_int(row.get("target_step"))
+        actual_end_step = _safe_int(row.get("actual_end_step"))
+        if target_step is None or actual_end_step is None:
+            continue
+        if actual_end_step != target_step:
+            early_stopped_segments.append((segment_index or -1, actual_end_step, target_step))
+    if early_stopped_segments:
+        preview = ", ".join(
+            f"segment {segment}: {actual}/{target}"
+            for segment, actual, target in early_stopped_segments[:4]
+        )
+        raise RuntimeError(
+            f"Stale early-stopped checkpoint-transfer trace at {path} ({preview}). "
+            "Checkpoint-transfer segments now run through the full exact anchor interval; "
+            "rerun Pipeline II stage 'checkpoint-transfer' before visualizing."
         )
 
 
@@ -138,6 +241,65 @@ def _validated_checkpoint_transfer_rows(path: Path) -> List[Dict[str, Any]]:
     rows = _read_trace_csv(path)
     _require_checkpoint_transfer_v2_rows(path, rows)
     return rows
+
+
+def _series_value_at_step(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    step: float,
+) -> Optional[float]:
+    """Return the displayed series value at ``step``.
+
+    Training traces normally contain the exact integer checkpoint step. Linear
+    interpolation is retained as a safe fallback for sparse traces, so marker
+    placement still follows the visible curve rather than stale pre-smoothed
+    checkpoint metadata.
+    """
+
+    points = sorted(
+        (float(x), float(y))
+        for x, y in zip(xs, ys)
+    )
+    if not points:
+        return None
+
+    target = float(step)
+    for index, (x, y) in enumerate(points):
+        if x == target:
+            return y
+        if x > target:
+            if index == 0:
+                return None
+            left_x, left_y = points[index - 1]
+            if x == left_x:
+                return left_y
+            weight = (target - left_x) / (x - left_x)
+            return left_y + weight * (y - left_y)
+    return None
+
+
+def _project_checkpoint_values_onto_displayed_series(
+    checkpoint_xs: Sequence[float],
+    checkpoint_ys: Sequence[float],
+    displayed_xs: Sequence[float],
+    displayed_ys: Sequence[float],
+) -> Tuple[List[float], List[float]]:
+    """Place checkpoint markers on the currently displayed smoothed curve.
+
+    Checkpoint steps are selected with ``checkpointing.rolling_window_updates``,
+    while the figure can use a different
+    ``visualization.trace_smoothing_window_points``. The stored checkpoint y
+    value therefore cannot be used directly when those windows differ.
+    """
+
+    projected_xs: List[float] = []
+    projected_ys: List[float] = []
+    for raw_x, fallback_y in zip(checkpoint_xs, checkpoint_ys):
+        x = float(raw_x)
+        displayed_y = _series_value_at_step(displayed_xs, displayed_ys, x)
+        projected_xs.append(x)
+        projected_ys.append(float(fallback_y) if displayed_y is None else float(displayed_y))
+    return projected_xs, projected_ys
 
 
 def _pure_training_series_by_seed(
@@ -174,6 +336,13 @@ def _checkpoint_transfer_segment_series_by_seed(
     """
 
     paths = training_paths(config)
+    displayed_exact_by_seed = _pure_training_series_by_seed(
+        config,
+        n_terms,
+        anchor_mode_name,
+        value_key,
+        smooth_window,
+    )
     by_segment: Dict[int, Dict[int, Tuple[List[float], List[float]]]] = {}
     for seed in get_seeds(config):
         this_dir = checkpoint_transfer_run_dir(paths, seed, n_terms, mode_name, anchor_mode_name)
@@ -228,6 +397,15 @@ def _checkpoint_transfer_segment_series_by_seed(
             anchor_point = segment_anchor_values.get(int(segment_index))
             if anchor_point is not None:
                 anchor_x, anchor_y = anchor_point
+                displayed_exact = displayed_exact_by_seed.get(int(seed))
+                if displayed_exact is not None:
+                    displayed_anchor_y = _series_value_at_step(
+                        displayed_exact[0],
+                        displayed_exact[1],
+                        anchor_x,
+                    )
+                    if displayed_anchor_y is not None:
+                        anchor_y = float(displayed_anchor_y)
                 if not rolled_xs or float(anchor_x) < float(rolled_xs[0]):
                     rolled_xs = [anchor_x, *rolled_xs]
                     rolled_ys = [anchor_y, *rolled_ys]
@@ -243,6 +421,9 @@ def _exact_posterior_checkpoint_markers(
     n_terms: int,
     anchor_mode_name: str,
     value_key: str,
+    *,
+    displayed_xs: Sequence[float] = (),
+    displayed_ys: Sequence[float] = (),
 ) -> Tuple[List[float], List[float]]:
     paths = training_paths(config)
     aggregate_path = aggregate_checkpoint_path(paths, n_terms, anchor_mode_name)
@@ -263,6 +444,13 @@ def _exact_posterior_checkpoint_markers(
             continue
         xs.append(float(step))
         ys.append(float(value))
+    if displayed_xs and displayed_ys:
+        return _project_checkpoint_values_onto_displayed_series(
+            xs,
+            ys,
+            displayed_xs,
+            displayed_ys,
+        )
     return xs, ys
 
 
@@ -320,10 +508,17 @@ def _plot_checkpoint_transfer_metric_on_axis(
 
     exact_label = f"Pure {anchor_mode_name}" if show_legend_label else None
     pure_label = f"Pure {mode_name}" if show_legend_label else None
-    ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=1.05, label=exact_label, zorder=3)
-    ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=1.0, label=pure_label, zorder=3)
+    ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=1.45, label=exact_label, zorder=3)
+    ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=1.4, label=pure_label, zorder=3)
 
-    checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(config, n_terms, anchor_mode_name, value_key)
+    checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(
+        config,
+        n_terms,
+        anchor_mode_name,
+        value_key,
+        displayed_xs=exact_xs,
+        displayed_ys=exact_means,
+    )
     if checkpoint_x and checkpoint_y:
         x_marks = [float(x) for x in checkpoint_x]
         y_marks = [factor * float(y) for y in checkpoint_y]
@@ -358,7 +553,7 @@ def _plot_checkpoint_transfer_metric_on_axis(
             x_transfer,
             y_transfer,
             color=colors["transfer"],
-            linewidth=1.0,
+            linewidth=1.4,
             label=(
                 f"{mode_name} from {anchor_mode_name} checkpoints"
                 if show_legend_label and not plotted_transfer_label
@@ -388,10 +583,10 @@ def _plot_checkpoint_transfer_metric_on_axis(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     return [
-        Line2D([0], [0], color=colors["exact"], linewidth=1.05, label=f"Pure {anchor_mode_name}"),
-        Line2D([0], [0], color=colors["pure"], linewidth=1.0, label=f"Pure {mode_name}"),
+        Line2D([0], [0], color=colors["exact"], linewidth=1.45, label=f"Pure {anchor_mode_name}"),
+        Line2D([0], [0], color=colors["pure"], linewidth=1.4, label=f"Pure {mode_name}"),
         Line2D([0], [0], color=colors["checkpoint"], marker="X", markersize=8, linewidth=0, label="Aggregate exact checkpoints"),
-        Line2D([0], [0], color=colors["transfer"], linewidth=1.0, label=f"{mode_name} from {anchor_mode_name} checkpoints"),
+        Line2D([0], [0], color=colors["transfer"], linewidth=1.4, label=f"{mode_name} from {anchor_mode_name} checkpoints"),
     ]
 
 
@@ -531,14 +726,7 @@ def _plot_dual_axis_checkpoint_bars(
     output_path: Path,
 ) -> None:
     term_all_rows = [row for row in rows if int(row["n_terms"]) == int(n_terms)]
-    term_rows = [
-        row
-        for row in term_all_rows
-        if row.get("reached")
-        and row.get("step") not in {None, ""}
-        and row.get("elapsed_seconds") not in {None, ""}
-    ]
-    if not term_rows:
+    if not term_all_rows:
         return
 
     milestones = sorted({float(row["milestone"]) for row in term_all_rows})
@@ -554,12 +742,18 @@ def _plot_dual_axis_checkpoint_bars(
     for mode_idx, mode_name in enumerate(mode_names):
         by_milestone_steps: Dict[float, List[float]] = {}
         by_milestone_time: Dict[float, List[float]] = {}
-        for row in term_rows:
-            if row["mode_name"] != mode_name:
+        for milestone in milestones:
+            complete_rows = _fully_reached_milestone_rows(
+                config,
+                term_all_rows,
+                mode_name=mode_name,
+                milestone=milestone,
+                required_fields=("step", "elapsed_seconds"),
+            )
+            if not complete_rows:
                 continue
-            milestone = float(row["milestone"])
-            by_milestone_steps.setdefault(milestone, []).append(float(row["step"]))
-            by_milestone_time.setdefault(milestone, []).append(float(row["elapsed_seconds"]))
+            by_milestone_steps[milestone] = [float(row["step"]) for row in complete_rows]
+            by_milestone_time[milestone] = [float(row["elapsed_seconds"]) for row in complete_rows]
 
         xs: List[float] = []
         step_means: List[float] = []
@@ -594,18 +788,14 @@ def _plot_dual_axis_checkpoint_bars(
         return
 
     exact_series = next((data for data in series if str(data["mode_name"]) == "exact"), None)
-    if exact_series and exact_series["time_means"] and exact_series["step_means"]:
-        numerator = sum(float(step) * float(time) for step, time in zip(exact_series["step_means"], exact_series["time_means"]))
-        denominator = sum(float(time) ** 2 for time in exact_series["time_means"])
-        exact_time_to_steps = (numerator / denominator) if denominator > 0.0 else None
-    else:
-        exact_time_to_steps = None
+    time_to_steps, left_top = _checkpoint_bar_axis_scaling(
+        max_step_value=max_step_value,
+        max_time_value=max_time_value,
+        exact_step_means=exact_series["step_means"] if exact_series else [],
+        exact_time_means=exact_series["time_means"] if exact_series else [],
+    )
 
-    left_top = max_step_value * 1.10
-    time_to_steps = exact_time_to_steps if exact_time_to_steps and exact_time_to_steps > 0.0 else (left_top / (max_time_value * 1.10))
-    right_top = left_top / time_to_steps
-
-    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 9.2, 0.9 * len(milestones) + 3.4), 5.45))
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 9.2, 0.9 * len(milestones) + 3.4), 6.05))
     ax_right = ax.secondary_yaxis(
         "right",
         functions=(
@@ -753,7 +943,14 @@ def _plot_checkpoint_transfer_metric_trajectory(
     ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=2.0, label=f"Pure {anchor_mode_name}")
     ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=2.0, label=f"Pure {mode_name}")
 
-    checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(config, n_terms, anchor_mode_name, value_key)
+    checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(
+        config,
+        n_terms,
+        anchor_mode_name,
+        value_key,
+        displayed_xs=exact_xs,
+        displayed_ys=exact_means,
+    )
     if checkpoint_x and checkpoint_y:
         x_marks = [float(x) for x in checkpoint_x]
         y_marks = [factor * float(y) for y in checkpoint_y]
@@ -894,8 +1091,7 @@ def _plot_metric_for_terms(
     maybe_log: bool = False,
 ) -> None:
     term_all_rows = [row for row in rows if int(row["n_terms"]) == int(n_terms)]
-    term_rows = [row for row in term_all_rows if row["reached"] and row[metric] not in {None, ""}]
-    if not term_rows:
+    if not term_all_rows:
         return
 
     milestones = sorted({float(row["milestone"]) for row in term_all_rows})
@@ -912,10 +1108,17 @@ def _plot_metric_for_terms(
     draw_error_bars = _show_milestone_error_bars(config)
 
     for mode_idx, mode_name in enumerate(mode_names):
-        mode_rows = [row for row in term_rows if row["mode_name"] == mode_name]
         by_milestone: Dict[float, List[float]] = {}
-        for row in mode_rows:
-            by_milestone.setdefault(float(row["milestone"]), []).append(float(row[metric]))
+        for milestone in milestones:
+            complete_rows = _fully_reached_milestone_rows(
+                config,
+                term_all_rows,
+                mode_name=mode_name,
+                milestone=milestone,
+                required_fields=(metric,),
+            )
+            if complete_rows:
+                by_milestone[milestone] = [float(row[metric]) for row in complete_rows]
 
         xs: List[float] = []
         ys: List[float] = []

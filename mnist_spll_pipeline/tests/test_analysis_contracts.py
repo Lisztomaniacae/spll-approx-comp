@@ -18,6 +18,12 @@ from pipeline1_analysis import (
     top_predictions,
 )
 from pipeline2_analysis import _uncertainty_half_width
+from pipeline2_plotting import (
+    _checkpoint_bar_axis_scaling,
+    _fully_reached_milestone_rows,
+    _project_checkpoint_values_onto_displayed_series,
+    _require_checkpoint_transfer_v2_rows,
+)
 
 
 class AnalysisContractTests(unittest.TestCase):
@@ -102,6 +108,85 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertIsNone(
             _uncertainty_half_width(values, {"visualization": {"uncertainty_interval": "none"}})
         )
+
+    def test_checkpoint_transfer_plot_rejects_early_stopped_segments(self) -> None:
+        fixed_row = {
+            "segment_index": "3",
+            "target_step": "2200",
+            "max_segment_cases_exact": "150",
+            "actual_end_step": "2200",
+            "reached_target_checkpoint": "True",
+        }
+        _require_checkpoint_transfer_v2_rows(Path("fixed.csv"), [fixed_row])
+
+        stale_row = dict(fixed_row, actual_end_step="2150")
+        with self.assertRaisesRegex(RuntimeError, "early-stopped checkpoint-transfer trace"):
+            _require_checkpoint_transfer_v2_rows(Path("stale.csv"), [stale_row])
+
+    def test_milestone_bars_require_every_configured_seed_to_reach_target(self) -> None:
+        config = {"seeds": [11, 22]}
+        rows = [
+            {
+                "seed": 11,
+                "mode_name": "approx_0p1",
+                "milestone": 0.8,
+                "reached": True,
+                "step": 2400,
+                "elapsed_seconds": 140.0,
+            },
+            {
+                "seed": 22,
+                "mode_name": "approx_0p1",
+                "milestone": 0.8,
+                "reached": False,
+                "step": None,
+                "elapsed_seconds": None,
+            },
+        ]
+
+        self.assertEqual(
+            _fully_reached_milestone_rows(
+                config,
+                rows,
+                mode_name="approx_0p1",
+                milestone=0.8,
+                required_fields=("step", "elapsed_seconds"),
+            ),
+            [],
+        )
+
+        rows[1].update(reached=True, step=2500, elapsed_seconds=145.0)
+        complete = _fully_reached_milestone_rows(
+            config,
+            rows,
+            mode_name="approx_0p1",
+            milestone=0.8,
+            required_fields=("step", "elapsed_seconds"),
+        )
+        self.assertEqual([row["seed"] for row in complete], [11, 22])
+
+    def test_checkpoint_markers_follow_the_display_smoothing_window(self) -> None:
+        marker_xs, marker_ys = _project_checkpoint_values_onto_displayed_series(
+            checkpoint_xs=[500.0, 900.0],
+            checkpoint_ys=[0.20, 0.60],
+            displayed_xs=[500.0, 700.0, 900.0],
+            displayed_ys=[0.17, 0.36, 0.55],
+        )
+
+        self.assertEqual(marker_xs, [500.0, 900.0])
+        self.assertEqual(marker_ys, [0.17, 0.55])
+
+    def test_dual_axis_checkpoint_plot_budgets_headroom_for_inner_time_bars(self) -> None:
+        time_to_steps, left_top = _checkpoint_bar_axis_scaling(
+            max_step_value=2100.0,
+            max_time_value=150.0,
+            exact_step_means=[540.0, 690.0, 930.0, 1590.0],
+            exact_time_means=[30.0, 38.0, 52.0, 88.0],
+        )
+
+        self.assertGreater(time_to_steps, 0.0)
+        self.assertGreater(150.0 * time_to_steps, 2100.0)
+        self.assertGreater(left_top, 150.0 * time_to_steps)
 
 
 if __name__ == "__main__":

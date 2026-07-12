@@ -76,7 +76,7 @@ adaptive_top_k:
   max_cutoff: 1.0
 
 visualization:
-  trace_smoothing_window_points: 50
+  trace_smoothing_window_points: 100
   # Across-seed uncertainty shown in milestone error bars and smoothed traces.
   # Options: std, sem, ci95, none. With three seeds, std is the most honest
   # default because it shows run-to-run spread without overclaiming precision.

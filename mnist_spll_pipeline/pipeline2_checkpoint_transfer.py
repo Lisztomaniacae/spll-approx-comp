@@ -709,17 +709,17 @@ def _run_checkpoint_transfer_for_mode(
             started_at = time.perf_counter()
             cases_seen = start_step
             max_segment_cases_exact = end_step - start_step
-            # Early stopping is valid only for real posterior-threshold
-            # anchors.  The synthetic final anchor is a budget endpoint, not a
-            # checkpoint target: if we use its final rolling posterior as a stop
-            # value, easy modes such as cutoff 0.01 can terminate before the
-            # end of the exact training horizon and appear to "not go to the
-            # end" in the plot.
+            # Every transfer segment must consume the same deterministic case
+            # interval as its exact counterpart, all the way through end_step.
+            # The next exact checkpoint's posterior value remains useful as a
+            # diagnostic crossing target, but it must not terminate the segment:
+            # a faster-rising continuation would otherwise end left of the next
+            # checkpoint in the trajectory plot and would no longer be a
+            # fixed-budget checkpoint-to-checkpoint comparison.
             target_posterior_stop_value: Optional[float] = None
             if end_anchor.get("threshold") is not None:
-                # Use the next exact checkpoint's displayed rolling posterior
-                # value, not merely the nominal threshold label, so the stop
-                # rule is aligned with the plotted exact checkpoint marker.
+                # Keep the historical CSV field name for artifact compatibility.
+                # Semantically this is now a reference/crossing value only.
                 target_posterior_stop_value = _optional_float(end_anchor.get("rolling_true_mass"))
                 if target_posterior_stop_value is None:
                     target_posterior_stop_value = _optional_float(end_anchor.get("threshold"))
@@ -764,13 +764,16 @@ def _run_checkpoint_transfer_for_mode(
                 rolling_loss = recent_mean(list(recent_losses))
                 rolling_true_mass = recent_mean(list(recent_masses))
                 rolling_zero_rate = recent_mean(list(recent_zeros))
+                reached_target_this_update = False
                 if (
-                    target_posterior_stop_value is not None
+                    not reached_target_checkpoint
+                    and target_posterior_stop_value is not None
                     and len(recent_masses) >= max(1, rolling_window)
                     and rolling_true_mass is not None
                     and float(rolling_true_mass) >= float(target_posterior_stop_value)
                 ):
                     reached_target_checkpoint = True
+                    reached_target_this_update = True
                 branch_count_mean = batch_stats["branch_count_mean"]
                 branch_count_total = batch_stats["branch_count_total"]
                 train_trace_writer.writerow(
@@ -808,10 +811,8 @@ def _run_checkpoint_transfer_for_mode(
                         "cutoff_search_abs_error": (adaptive_cutoff_state or {}).get("abs_error"),
                     }
                 )
-                if optimizer_update % 25 == 0 or cases_seen >= end_step or reached_target_checkpoint:
+                if optimizer_update % 25 == 0 or cases_seen >= end_step or reached_target_this_update:
                     train_trace_handle.flush()
-                if reached_target_checkpoint:
-                    break
 
             elapsed = time.perf_counter() - started_at
             actual_end_step = cases_seen
