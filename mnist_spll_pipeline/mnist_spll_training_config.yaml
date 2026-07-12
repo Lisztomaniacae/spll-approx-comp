@@ -1,5 +1,5 @@
 seed: 42
-seeds: [42,43,44]
+seeds: [42,43,44, 45, 46]
 show_progress: true
 
 paths:
@@ -55,10 +55,10 @@ schedule:
   preview_size: 20
 
 checkpoint_transfer:
-  # Build green “approx from exact checkpoint to exact checkpoint” trajectories
-  # after normal fixed-budget runs. Exact posterior checkpoints define segment
-  # anchors; each approximate segment uses the same number of sum cases exact
-  # needed to reach the next anchor.
+  # Build green “approx from exact checkpoint” trajectories after normal
+  # fixed-budget runs. Exact posterior checkpoints define segment anchors; each
+  # approximate segment stops when it reaches the next posterior target or when
+  # it has used the same number of sum cases exact needed for that segment.
   enabled: true
   anchor_mode_name: exact
   # Null / omitted means: all non-anchor inference modes.
@@ -90,7 +90,7 @@ visualization:
 experiments:
   - n_terms: 2
     enabled: true
-    max_steps: 1500
+    max_steps: 2500
 
 inference_modes:
   - name: exact

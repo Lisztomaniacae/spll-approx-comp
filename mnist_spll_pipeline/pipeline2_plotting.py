@@ -10,6 +10,15 @@ from matplotlib.colors import to_rgb
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
+from plot_palette import (
+    A4_PAGE_WIDTH_IN,
+    FIGURE_DPI,
+    LIGHT_GREY,
+    MID_GREY,
+    TRAINING_TRACE_COLORS,
+    dual_axis_bar_colors,
+    inference_mode_color,
+)
 from pipeline2_analysis import (
     _add_uncertainty_note,
     _mean,
@@ -35,26 +44,17 @@ from pipeline_support import ensure_dir, load_json
 
 
 def _mode_color_map(config: Dict[str, Any]) -> Dict[str, str]:
-    """Return a stable, colorblind-friendly color per inference mode.
+    """Return a stable thesis palette color per inference mode."""
 
-    The mapping is derived from config order so the same mode keeps the same
-    color in milestone bar charts and trace figures, independent of which
-    milestones were reached in a particular run.
-    """
-
-    palette = [
-        "#4E79A7",
-        "#F28E2B",
-        "#59A14F",
-        "#E15759",
-        "#B07AA1",
-        "#76B7B2",
-        "#EDC948",
-        "#FF9DA7",
-        "#9C755F",
-        "#BAB0AC",
-    ]
-    return {mode_name: palette[idx % len(palette)] for idx, mode_name in enumerate(_mode_order(config))}
+    colors: Dict[str, str] = {}
+    for idx, mode_name in enumerate(_mode_order(config)):
+        mode = _mode_cfg(config, mode_name)
+        colors[mode_name] = inference_mode_color(
+            mode_name=mode_name,
+            cutoff=mode.get("top_k_cutoff"),
+            fallback_index=idx,
+        )
+    return colors
 
 
 def _mode_compact_label(config: Dict[str, Any], mode_name: str) -> str:
@@ -121,6 +121,25 @@ def _merge_series_dict(
     return xs, means, lowers, uppers, counts
 
 
+def _require_checkpoint_transfer_v2_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    required_columns = {"max_segment_cases_exact", "actual_end_step", "reached_target_checkpoint"}
+    missing = [name for name in sorted(required_columns) if name not in rows[0]]
+    if missing:
+        raise RuntimeError(
+            f"Stale checkpoint-transfer trace at {path}: missing {missing}. "
+            "Rerun Pipeline II stage 'checkpoint-transfer' before visualizing; "
+            "old transfer CSVs were generated with the previous fixed-budget semantics."
+        )
+
+
+def _validated_checkpoint_transfer_rows(path: Path) -> List[Dict[str, Any]]:
+    rows = _read_trace_csv(path)
+    _require_checkpoint_transfer_v2_rows(path, rows)
+    return rows
+
+
 def _pure_training_series_by_seed(
     config: Dict[str, Any],
     n_terms: int,
@@ -158,11 +177,25 @@ def _checkpoint_transfer_segment_series_by_seed(
     by_segment: Dict[int, Dict[int, Tuple[List[float], List[float]]]] = {}
     for seed in get_seeds(config):
         this_dir = checkpoint_transfer_run_dir(paths, seed, n_terms, mode_name, anchor_mode_name)
-        # Segment metadata is read by the summary tables.  The plotted green
-        # curve intentionally uses only approximate-training observations, not
-        # the exact anchor value, so each full-window point represents 50
-        # approximate updates after the restart.
-        _segment_rows = _read_trace_csv(this_dir / "checkpoint_transfer_trace.csv")
+        segment_anchor_values: Dict[int, Tuple[float, float]] = {}
+        segment_actual_end_step: Dict[int, int] = {}
+        trace_path = this_dir / "checkpoint_transfer_trace.csv"
+        for row in _validated_checkpoint_transfer_rows(trace_path):
+            segment_index = _safe_int(row.get("segment_index"))
+            anchor_step = _safe_float(row.get("anchor_step"))
+            actual_end_step = _safe_int(row.get("actual_end_step"))
+            if segment_index is None or anchor_step is None:
+                continue
+            if actual_end_step is not None:
+                segment_actual_end_step[int(segment_index)] = int(actual_end_step)
+            if value_key in {"true_mass", "true_mass_recent_mean", "zero_true_mass"}:
+                anchor_value = _safe_float(row.get("anchor_rolling_true_mass_exact"))
+            elif value_key == "loss":
+                anchor_value = _safe_float(row.get("anchor_rolling_loss_exact"))
+            else:
+                anchor_value = None
+            if anchor_value is not None:
+                segment_anchor_values[int(segment_index)] = (float(anchor_step), float(anchor_value))
 
         train_rows = _read_trace_csv(this_dir / "checkpoint_transfer_train_trace.csv")
         per_segment_step: Dict[int, Dict[int, List[float]]] = {}
@@ -171,6 +204,9 @@ def _checkpoint_transfer_segment_series_by_seed(
             step = _safe_int(row.get("step"))
             value = _safe_float(row.get(value_key))
             if segment_index is None or step is None or value is None:
+                continue
+            max_step = segment_actual_end_step.get(int(segment_index))
+            if max_step is not None and int(step) > int(max_step):
                 continue
             per_segment_step.setdefault(int(segment_index), {}).setdefault(int(step), []).append(float(value))
 
@@ -183,9 +219,18 @@ def _checkpoint_transfer_segment_series_by_seed(
             if not xs:
                 continue
             # Smooth only within this segment, never across checkpoint boundaries.
-            # Prefix points shorter than the full window are omitted, so segment
-            # starts cannot create unstable short-window spikes.
+            # Prefix points shorter than the full window are omitted, so every
+            # post-anchor point is based on the same number of approximate
+            # updates.  The exact anchor value is prepended separately so the
+            # continuation visibly starts from the checkpoint it was initialized
+            # from without pretending that the anchor is an approximate update.
             rolled_xs, rolled_ys = _full_window_rolling_series(xs, ys, smooth_window)
+            anchor_point = segment_anchor_values.get(int(segment_index))
+            if anchor_point is not None:
+                anchor_x, anchor_y = anchor_point
+                if not rolled_xs or float(anchor_x) < float(rolled_xs[0]):
+                    rolled_xs = [anchor_x, *rolled_xs]
+                    rolled_ys = [anchor_y, *rolled_ys]
             if not rolled_xs:
                 continue
             by_segment.setdefault(segment_index, {})[int(seed)] = (rolled_xs, rolled_ys)
@@ -258,12 +303,7 @@ def _plot_checkpoint_transfer_metric_on_axis(
         smooth_window=smooth_window,
     )
     clamp = value_key in {"true_mass", "zero_true_mass"}
-    colors = {
-        "exact": "#3776d6",
-        "pure": "#d62728",
-        "transfer": "#2ca02c",
-        "checkpoint": "#7b3294",
-    }
+    colors = TRAINING_TRACE_COLORS
     draw_bands = _show_trace_uncertainty_bands(config, smooth_window)
     factor = 100.0 if as_percent else 1.0
 
@@ -280,8 +320,8 @@ def _plot_checkpoint_transfer_metric_on_axis(
 
     exact_label = f"Pure {anchor_mode_name}" if show_legend_label else None
     pure_label = f"Pure {mode_name}" if show_legend_label else None
-    ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=2.1, label=exact_label, zorder=3)
-    ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=2.0, label=pure_label, zorder=3)
+    ax.plot(x_exact, y_exact, color=colors["exact"], linewidth=1.05, label=exact_label, zorder=3)
+    ax.plot(x_pure, y_pure, color=colors["pure"], linewidth=1.0, label=pure_label, zorder=3)
 
     checkpoint_x, checkpoint_y = _exact_posterior_checkpoint_markers(config, n_terms, anchor_mode_name, value_key)
     if checkpoint_x and checkpoint_y:
@@ -318,7 +358,7 @@ def _plot_checkpoint_transfer_metric_on_axis(
             x_transfer,
             y_transfer,
             color=colors["transfer"],
-            linewidth=2.0,
+            linewidth=1.0,
             label=(
                 f"{mode_name} from {anchor_mode_name} checkpoints"
                 if show_legend_label and not plotted_transfer_label
@@ -348,10 +388,10 @@ def _plot_checkpoint_transfer_metric_on_axis(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     return [
-        Line2D([0], [0], color=colors["exact"], linewidth=2.1, label=f"Pure {anchor_mode_name}"),
-        Line2D([0], [0], color=colors["pure"], linewidth=2.0, label=f"Pure {mode_name}"),
+        Line2D([0], [0], color=colors["exact"], linewidth=1.05, label=f"Pure {anchor_mode_name}"),
+        Line2D([0], [0], color=colors["pure"], linewidth=1.0, label=f"Pure {mode_name}"),
         Line2D([0], [0], color=colors["checkpoint"], marker="X", markersize=8, linewidth=0, label="Aggregate exact checkpoints"),
-        Line2D([0], [0], color=colors["transfer"], linewidth=2.0, label=f"{mode_name} from {anchor_mode_name} checkpoints"),
+        Line2D([0], [0], color=colors["transfer"], linewidth=1.0, label=f"{mode_name} from {anchor_mode_name} checkpoints"),
     ]
 
 
@@ -373,7 +413,7 @@ def _plot_combined_checkpoint_transfer_metric(
     fig, axes = plt.subplots(
         1,
         len(mode_names),
-        figsize=(4.1 * len(mode_names) + 0.9, 4.35),
+        figsize=(max(A4_PAGE_WIDTH_IN, 4.1 * len(mode_names) + 0.9), 4.35),
         sharey=True,
     )
     if not isinstance(axes, (list, tuple)):
@@ -399,22 +439,57 @@ def _plot_combined_checkpoint_transfer_metric(
         ax.set_xlabel("Training iteration")
         if value_key == "loss":
             ax.set_yscale("log")
-            ax.set_ylim(0.4, 10.5)
         elif as_percent:
             ax.set_ylim(0.0, 100.0)
         if idx != 0:
             ax.spines["left"].set_visible(False)
             ax.tick_params(axis="y", length=0)
 
-    colors = {
-        "exact": "#3776d6",
-        "pure": "#d62728",
-        "transfer": "#2ca02c",
-        "checkpoint": "#7b3294",
-    }
+    if value_key == "loss":
+        positive_y_values: List[float] = []
+        for ax in axes:
+            for line in ax.lines:
+                for value in line.get_ydata(orig=False):
+                    try:
+                        y = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if y > 0.0:
+                        positive_y_values.append(y)
+            for collection in ax.collections:
+                offsets = getattr(collection, "get_offsets", lambda: [])()
+                for offset in offsets:
+                    if len(offset) < 2:
+                        continue
+                    try:
+                        y = float(offset[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if y > 0.0:
+                        positive_y_values.append(y)
+                for path in collection.get_paths():
+                    for _x, raw_y in path.vertices:
+                        try:
+                            y = float(raw_y)
+                        except (TypeError, ValueError):
+                            continue
+                        if y > 0.0:
+                            positive_y_values.append(y)
+        if positive_y_values:
+            y_min = min(positive_y_values)
+            y_max = max(positive_y_values)
+            if y_min < y_max:
+                # Multiplicative padding keeps the visual margin meaningful on
+                # the logarithmic loss axis and prevents low-loss checkpoints
+                # or continuation segments from being clipped.
+                log_padding = (y_max / y_min) ** 0.05
+                for ax in axes:
+                    ax.set_ylim(y_min / log_padding, y_max * log_padding)
+
+    colors = TRAINING_TRACE_COLORS
     legend_handles = [
-        Line2D([0], [0], color=colors["exact"], linewidth=2.1, label="Pure exact"),
-        Line2D([0], [0], color=colors["pure"], linewidth=2.0, label="Pure approximate"),
+        Line2D([0], [0], color=colors["exact"], linewidth=1.05, label="Pure exact"),
+        Line2D([0], [0], color=colors["pure"], linewidth=1.0, label="Pure approximate"),
         Line2D(
             [0],
             [0],
@@ -424,18 +499,16 @@ def _plot_combined_checkpoint_transfer_metric(
             linewidth=0,
             label="Exact checkpoints",
         ),
-        Line2D([0], [0], color=colors["transfer"], linewidth=2.0, label="Approx. continuation"),
+        Line2D([0], [0], color=colors["transfer"], linewidth=1.0, label="Approx. continuation"),
     ]
 
     title = f"{n_terms}-term SPLL training — {ylabel}"
-    subtitle = f"Full-window rolling mean, {smooth_window} updates" if smooth_window > 1 else "Raw training trace"
     fig.text(0.5, 0.978, title, ha="center", va="top", fontsize=15)
-    fig.text(0.5, 0.918, subtitle, ha="center", va="top", fontsize=9.5, color="#555555")
     fig.text(0.015, 0.48, ylabel, ha="center", va="center", rotation="vertical", fontsize=11)
     legend = fig.legend(
         handles=legend_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.865),
+        bbox_to_anchor=(0.5, 0.91),
         ncol=4,
         frameon=False,
         fontsize=9,
@@ -443,9 +516,9 @@ def _plot_combined_checkpoint_transfer_metric(
         handletextpad=0.55,
     )
     legend.set_in_layout(False)
-    fig.subplots_adjust(left=0.08, right=0.995, top=0.735, bottom=0.14, wspace=0.08)
+    fig.subplots_adjust(left=0.08, right=0.995, top=0.79, bottom=0.14, wspace=0.08)
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
 
 
@@ -532,7 +605,7 @@ def _plot_dual_axis_checkpoint_bars(
     time_to_steps = exact_time_to_steps if exact_time_to_steps and exact_time_to_steps > 0.0 else (left_top / (max_time_value * 1.10))
     right_top = left_top / time_to_steps
 
-    fig, ax = plt.subplots(figsize=(max(9.2, 0.9 * len(milestones) + 3.4), 5.45))
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 9.2, 0.9 * len(milestones) + 3.4), 5.45))
     ax_right = ax.secondary_yaxis(
         "right",
         functions=(
@@ -544,9 +617,15 @@ def _plot_dual_axis_checkpoint_bars(
     mode_handles: List[Any] = []
     for data in series:
         mode_name = str(data["mode_name"])
-        base_color = colors[mode_name]
-        outer_color = _mix_with_white(base_color, 0.68)
-        inner_color = _darken_color(base_color, 0.10)
+        mode = _mode_cfg(config, mode_name)
+        bar_colors = dual_axis_bar_colors(
+            mode_name=mode_name,
+            cutoff=mode.get("top_k_cutoff"),
+            fallback_index=mode_names.index(mode_name) if mode_name in mode_names else 0,
+        )
+        base_color = bar_colors["base"]
+        outer_color = bar_colors["outer"]
+        inner_color = bar_colors["inner"]
         xs = data["xs"]
         step_means = data["step_means"]
         time_heights = [value * time_to_steps for value in data["time_means"]]
@@ -586,13 +665,13 @@ def _plot_dual_axis_checkpoint_bars(
     ax_right.spines["top"].set_visible(False)
 
     step_metric_handle = Patch(
-        facecolor="#E4E8EE",
-        edgecolor="#7A8797",
+        facecolor=LIGHT_GREY,
+        edgecolor=MID_GREY,
         linewidth=1.0,
         label="Steps: outer bar (left axis)",
     )
     time_metric_handle = Patch(
-        facecolor="#7A8797",
+        facecolor=MID_GREY,
         edgecolor="#44515F",
         linewidth=1.0,
         label="Wall-clock: inner bar (right axis)",
@@ -602,12 +681,10 @@ def _plot_dual_axis_checkpoint_bars(
     mode_legend = fig.legend(
         handles=mode_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.950),
+        bbox_to_anchor=(0.5, 0.94),
         ncol=max(2, min(4, len(mode_handles))),
         frameon=False,
         fontsize=9,
-        title="Inference mode",
-        title_fontsize=9,
         columnspacing=1.25,
         handletextpad=0.55,
     )
@@ -624,9 +701,9 @@ def _plot_dual_axis_checkpoint_bars(
     )
     metric_legend.set_in_layout(False)
 
-    fig.subplots_adjust(left=0.09, right=0.91, top=0.79, bottom=0.14)
+    fig.subplots_adjust(left=0.09, right=0.91, top=0.80, bottom=0.14)
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
 
 
@@ -656,13 +733,8 @@ def _plot_checkpoint_transfer_metric_trajectory(
     if not exact_xs or not pure_xs:
         return
 
-    fig, ax = plt.subplots(figsize=(8.8, 5.2))
-    colors = {
-        "exact": "#3776d6",
-        "pure": "#d62728",
-        "transfer": "#2ca02c",
-        "checkpoint": "#7b3294",
-    }
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 8.8), 5.2))
+    colors = TRAINING_TRACE_COLORS
     draw_bands = _show_trace_uncertainty_bands(config, smooth_window)
 
     factor = 100.0 if as_percent else 1.0
@@ -740,8 +812,7 @@ def _plot_checkpoint_transfer_metric_trajectory(
         if any(abs(u - l) > 0.0 for l, u in zip(l_pure, u_pure)):
             ax.fill_between(x_pure, l_pure, u_pure, color=colors["pure"], alpha=_trace_band_alpha(config), linewidth=0)
 
-    smoothing_suffix = f" (full-window rolling mean, {smooth_window} updates)" if smooth_window > 1 else ""
-    ax.set_title(f"{n_terms}-term SPLL training: {ylabel}{smoothing_suffix}", loc="left")
+    ax.set_title(f"{n_terms}-term SPLL training: {ylabel}", loc="left")
     ax.set_xlabel("Training iteration")
     ax.set_ylabel(ylabel)
     if as_percent:
@@ -753,7 +824,7 @@ def _plot_checkpoint_transfer_metric_trajectory(
     fig.text(
         0.01,
         0.015,
-        "Purple X markers are aggregate exact checkpoints computed from the same full-window rolling curve. Green pieces are separate approximate continuations; first short-window points in each segment are omitted.",
+        "Purple X markers are aggregate exact checkpoints. Green pieces start at exact anchors, then show full-window approximate continuations until the next posterior target is reached or the exact segment budget is exhausted.",
         ha="left",
         va="bottom",
         fontsize=8,
@@ -761,7 +832,7 @@ def _plot_checkpoint_transfer_metric_trajectory(
     _add_uncertainty_note(fig, config, enabled=draw_bands, y=0.034)
     fig.tight_layout(rect=(0, 0.065, 1, 1))
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -835,7 +906,7 @@ def _plot_metric_for_terms(
     bar_width = min(0.82 / mode_count, 0.18)
     group_width = bar_width * mode_count
 
-    fig, ax = plt.subplots(figsize=(max(8.5, 0.75 * len(milestones) + 2.5), 5.0))
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 8.5, 0.75 * len(milestones) + 2.5), 5.0))
     values_for_scale: List[float] = []
     plotted_modes: List[str] = []
     draw_error_bars = _show_milestone_error_bars(config)
@@ -920,7 +991,7 @@ def _plot_metric_for_terms(
     else:
         fig.tight_layout()
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1040,7 +1111,7 @@ def _plot_trace(
     legend_bbox: Optional[Tuple[float, float]] = (1.02, 1.0),
     show_footer: bool = True,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 8.5), 5.0))
     plotted = False
     colors = _mode_color_map(config)
     draw_bands = _show_trace_uncertainty_bands(config, smooth_window)
@@ -1055,15 +1126,22 @@ def _plot_trace(
         )
         if not xs:
             continue
-        ax.plot(xs, ys, label=mode_name, linewidth=1.5, color=colors[mode_name])
         if draw_bands and any(abs(upper - lower) > 0.0 for lower, upper in zip(lowers, uppers)):
-            ax.fill_between(xs, lowers, uppers, color=colors[mode_name], alpha=_trace_band_alpha(config), linewidth=0)
+            ax.fill_between(
+                xs,
+                lowers,
+                uppers,
+                color=colors[mode_name],
+                alpha=max(0.08, _trace_band_alpha(config) * 0.72),
+                linewidth=0,
+                zorder=1,
+            )
+        ax.plot(xs, ys, label=mode_name, linewidth=2.15, color=colors[mode_name], zorder=3)
         plotted = True
     if not plotted:
         plt.close(fig)
         return
-    smoothing_suffix = f" (full-window rolling mean, {smooth_window} points)" if smooth_window > 1 else ""
-    ax.set_title(f"{n_terms}-term SPLL training: {ylabel}{smoothing_suffix}", loc="left")
+    ax.set_title(f"{n_terms}-term SPLL training: {ylabel}", loc="left")
     ax.set_xlabel("Training step")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
@@ -1082,7 +1160,7 @@ def _plot_trace(
     else:
         fig.tight_layout()
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1118,7 +1196,7 @@ def _plot_adaptive_topk_event_trace(
     show_target: bool = False,
     ylim: Optional[Tuple[float, float]] = None,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 8.5), 5.0))
     colors = _mode_color_map(config)
     plotted = False
     for mode_name in _adaptive_mode_names(config):
@@ -1154,7 +1232,7 @@ def _plot_adaptive_topk_event_trace(
     _add_no_smoothing_note(fig)
     fig.tight_layout(rect=(0, 0.045, 1, 1))
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1192,7 +1270,7 @@ def _plot_adaptive_topk_search_iterations(
     show_target: bool = False,
     ylim: Optional[Tuple[float, float]] = None,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 8.5), 5.0))
     colors = _mode_color_map(config)
     plotted = False
     for mode_name in _adaptive_mode_names(config):
@@ -1238,7 +1316,7 @@ def _plot_adaptive_topk_search_iterations(
     _add_no_smoothing_note(fig)
     fig.tight_layout(rect=(0, 0.045, 1, 1))
     ensure_dir(output_path.parent)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 

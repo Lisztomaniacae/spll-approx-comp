@@ -23,6 +23,7 @@ from pipeline2_config import (
     get_seeds,
     initial_checkpoint_path,
     run_dir,
+    stable_int_seed,
     training_paths,
 )
 from pipeline2_data import build_model_from_config, generate_sum_case
@@ -62,6 +63,15 @@ def _threshold_key(value: float) -> str:
 
 def _threshold_label(value: float) -> str:
     return _threshold_key(value).replace(".", "p")
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _checkpointing_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -582,7 +592,11 @@ def _run_checkpoint_transfer_for_mode(
                 "target_step",
                 "target_rolling_true_mass_exact",
                 "target_rolling_loss_exact",
+                "target_posterior_stop_value",
+                "max_segment_cases_exact",
+                "actual_end_step",
                 "segment_cases",
+                "reached_target_checkpoint",
                 "segment_elapsed_seconds",
                 "end_loss_transfer",
                 "end_true_mass_transfer",
@@ -606,7 +620,12 @@ def _run_checkpoint_transfer_for_mode(
                 "batch_size",
                 "case_start_step",
                 "case_end_step",
+                "segment_start_step",
+                "segment_target_step",
+                "segment_budget_cases",
                 "segment_local_cases",
+                "target_posterior_stop_value",
+                "reached_target_checkpoint",
                 "segment_elapsed_seconds",
                 "loss",
                 "true_mass",
@@ -689,6 +708,22 @@ def _run_checkpoint_transfer_for_mode(
             recent_zeros: Deque[float] = deque(maxlen=max(1, rolling_window))
             started_at = time.perf_counter()
             cases_seen = start_step
+            max_segment_cases_exact = end_step - start_step
+            # Early stopping is valid only for real posterior-threshold
+            # anchors.  The synthetic final anchor is a budget endpoint, not a
+            # checkpoint target: if we use its final rolling posterior as a stop
+            # value, easy modes such as cutoff 0.01 can terminate before the
+            # end of the exact training horizon and appear to "not go to the
+            # end" in the plot.
+            target_posterior_stop_value: Optional[float] = None
+            if end_anchor.get("threshold") is not None:
+                # Use the next exact checkpoint's displayed rolling posterior
+                # value, not merely the nominal threshold label, so the stop
+                # rule is aligned with the plotted exact checkpoint marker.
+                target_posterior_stop_value = _optional_float(end_anchor.get("rolling_true_mass"))
+                if target_posterior_stop_value is None:
+                    target_posterior_stop_value = _optional_float(end_anchor.get("threshold"))
+            reached_target_checkpoint = False
             optimizer_update = 0
             last_loss: Optional[float] = None
             last_true_mass: Optional[float] = None
@@ -726,6 +761,16 @@ def _run_checkpoint_transfer_for_mode(
                 recent_losses.append(last_loss)
                 recent_masses.append(last_true_mass)
                 recent_zeros.append(float(last_zero_rate or 0.0))
+                rolling_loss = recent_mean(list(recent_losses))
+                rolling_true_mass = recent_mean(list(recent_masses))
+                rolling_zero_rate = recent_mean(list(recent_zeros))
+                if (
+                    target_posterior_stop_value is not None
+                    and len(recent_masses) >= max(1, rolling_window)
+                    and rolling_true_mass is not None
+                    and float(rolling_true_mass) >= float(target_posterior_stop_value)
+                ):
+                    reached_target_checkpoint = True
                 branch_count_mean = batch_stats["branch_count_mean"]
                 branch_count_total = batch_stats["branch_count_total"]
                 train_trace_writer.writerow(
@@ -740,14 +785,19 @@ def _run_checkpoint_transfer_for_mode(
                         "batch_size": batch_stats["batch_size"],
                         "case_start_step": case_start_step,
                         "case_end_step": case_end_step,
+                        "segment_start_step": start_step,
+                        "segment_target_step": end_step,
+                        "segment_budget_cases": max_segment_cases_exact,
                         "segment_local_cases": cases_seen - start_step,
+                        "target_posterior_stop_value": target_posterior_stop_value,
+                        "reached_target_checkpoint": reached_target_checkpoint,
                         "segment_elapsed_seconds": elapsed,
                         "loss": last_loss,
                         "true_mass": last_true_mass,
                         "zero_true_mass": last_zero_rate,
-                        "loss_recent_mean": recent_mean(list(recent_losses)),
-                        "true_mass_recent_mean": recent_mean(list(recent_masses)),
-                        "zero_true_mass_recent_rate": recent_mean(list(recent_zeros)),
+                        "loss_recent_mean": rolling_loss,
+                        "true_mass_recent_mean": rolling_true_mass,
+                        "zero_true_mass_recent_rate": rolling_zero_rate,
                         "branch_count": branch_count_mean,
                         "branch_count_mean": branch_count_mean,
                         "branch_count_total": branch_count_total,
@@ -758,10 +808,13 @@ def _run_checkpoint_transfer_for_mode(
                         "cutoff_search_abs_error": (adaptive_cutoff_state or {}).get("abs_error"),
                     }
                 )
-                if optimizer_update % 25 == 0 or cases_seen >= end_step:
+                if optimizer_update % 25 == 0 or cases_seen >= end_step or reached_target_checkpoint:
                     train_trace_handle.flush()
+                if reached_target_checkpoint:
+                    break
 
             elapsed = time.perf_counter() - started_at
+            actual_end_step = cases_seen
             rolling_loss = recent_mean(list(recent_losses))
             rolling_true_mass = recent_mean(list(recent_masses))
             checkpoint_path = checkpoint_transfer_checkpoint_path(target_dir, segment_index)
@@ -769,7 +822,7 @@ def _run_checkpoint_transfer_for_mode(
                 checkpoint_path,
                 model=model,
                 optimizer=optimizer,
-                step=end_step,
+                step=actual_end_step,
                 elapsed_seconds=elapsed,
                 digit_accuracy_value=float(rolling_true_mass if rolling_true_mass is not None else (last_true_mass or 0.0)),
                 config=config,
@@ -793,7 +846,11 @@ def _run_checkpoint_transfer_for_mode(
                 "target_step": end_step,
                 "target_rolling_true_mass_exact": end_anchor.get("rolling_true_mass"),
                 "target_rolling_loss_exact": end_anchor.get("rolling_loss"),
-                "segment_cases": end_step - start_step,
+                "target_posterior_stop_value": target_posterior_stop_value,
+                "max_segment_cases_exact": max_segment_cases_exact,
+                "actual_end_step": actual_end_step,
+                "segment_cases": actual_end_step - start_step,
+                "reached_target_checkpoint": reached_target_checkpoint,
                 "segment_elapsed_seconds": elapsed,
                 "end_loss_transfer": last_loss,
                 "end_true_mass_transfer": last_true_mass,
@@ -809,7 +866,8 @@ def _run_checkpoint_transfer_for_mode(
             cache.clear()
             active_cache = None
             cleanup_torch()
-            progress.update(postfix=f"to step {end_step}, p={float(rolling_true_mass or 0.0):.3f}")
+            status_label = "reached" if reached_target_checkpoint else "budget"
+            progress.update(postfix=f"{status_label} step {actual_end_step}/{end_step}, p={float(rolling_true_mass or 0.0):.3f}")
 
         progress.finish(postfix="done")
         write_json(

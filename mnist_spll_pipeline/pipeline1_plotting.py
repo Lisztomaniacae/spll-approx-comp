@@ -12,6 +12,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
+from plot_palette import (
+    A4_PAGE_WIDTH_IN,
+    ACCURACY_DIVERGING,
+    FIGURE_DPI,
+    MODEL_ACCURACY_COLORS,
+    SPEEDUP_DIVERGING,
+    TRADEOFF_COLORS,
+    BLUE,
+)
 from pipeline1_analysis import (
     compact_model_name,
     metric_matrix,
@@ -204,7 +213,7 @@ def plot_heatmap_metric(
     ncols = min(2, max(1, n_panels))
     nrows = int(math.ceil(n_panels / ncols))
 
-    fig = plt.figure(figsize=(5.8 * ncols + 0.9, 4.3 * nrows), constrained_layout=True)
+    fig = plt.figure(figsize=(max(A4_PAGE_WIDTH_IN, 5.8 * ncols + 0.9), 4.3 * nrows), constrained_layout=True)
     gs = fig.add_gridspec(nrows=nrows, ncols=ncols + 1, width_ratios=([1] * ncols) + [0.06])
     axes = []
     for row_idx in range(nrows):
@@ -238,7 +247,7 @@ def plot_heatmap_metric(
         cbar.ax.tick_params(labelsize=9)
 
     fig.suptitle(spec.title, fontsize=15)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
 
 
@@ -249,7 +258,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Raw MNIST sum accuracy by model, term count, and cutoff",
             colorbar_label="Accuracy",
             filename="heatmap_accuracy_by_model.png",
-            cmap_name="viridis",
+            cmap_name="cividis",
             higher_is_better=True,
             fixed_range=(0.0, 1.0),
             fmt=".2f",
@@ -259,7 +268,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Surviving output-pool fraction by model, term count, and cutoff",
             colorbar_label="Output-pool fraction",
             filename="heatmap_output_pool_by_model.png",
-            cmap_name="viridis",
+            cmap_name="cividis",
             higher_is_better=True,
             fixed_range=(0.0, 1.0),
             fmt=".2f",
@@ -269,7 +278,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Mean total branch count by model, term count, and cutoff",
             colorbar_label="Branch count",
             filename="heatmap_branch_count_by_model.png",
-            cmap_name="viridis_r",
+            cmap_name="cividis_r",
             higher_is_better=False,
             fmt=".0f",
         ),
@@ -278,7 +287,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Posterior collapse rate by model, term count, and cutoff",
             colorbar_label="Collapse rate",
             filename="heatmap_collapse_rate_by_model.png",
-            cmap_name="viridis_r",
+            cmap_name="cividis_r",
             higher_is_better=False,
             fixed_range=(0.0, 1.0),
             fmt=".2f",
@@ -288,7 +297,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Speedup vs exact baseline by model, term count, and cutoff",
             colorbar_label="Speedup vs exact (log scale)",
             filename="heatmap_speedup_by_model.png",
-            cmap_name="viridis",
+            cmap_name="cividis",
             higher_is_better=True,
             use_log_norm=True,
             fmt=".2f",
@@ -298,7 +307,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Mean normalized probability assigned to the true sum",
             colorbar_label="P(true sum | candidates)",
             filename="heatmap_true_candidate_probability_by_model.png",
-            cmap_name="viridis",
+            cmap_name="cividis",
             higher_is_better=True,
             fixed_range=(0.0, 1.0),
             fmt=".2f",
@@ -308,7 +317,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="True-sum survival rate by model, term count, and cutoff",
             colorbar_label="Survival rate",
             filename="heatmap_true_candidate_survival_by_model.png",
-            cmap_name="viridis",
+            cmap_name="cividis",
             higher_is_better=True,
             fixed_range=(0.0, 1.0),
             fmt=".2f",
@@ -318,7 +327,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="Mean branch count for the true-sum query",
             colorbar_label="True-sum branch count",
             filename="heatmap_true_candidate_branch_count_by_model.png",
-            cmap_name="viridis_r",
+            cmap_name="cividis_r",
             higher_is_better=False,
             fmt=".0f",
         ),
@@ -327,7 +336,7 @@ def heatmap_specs() -> List[HeatmapSpec]:
             title="True-sum-only speedup vs exact baseline",
             colorbar_label="True-sum speedup vs exact (log scale)",
             filename="heatmap_true_candidate_speedup_by_model.png",
-            cmap_name="viridis",
+            cmap_name="cividis",
             higher_is_better=True,
             use_log_norm=True,
             fmt=".2f",
@@ -337,12 +346,11 @@ def heatmap_specs() -> List[HeatmapSpec]:
 
 def build_model_styles(summary_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     model_ids = ordered_model_ids(summary_rows)
-    cmap = plt.get_cmap("tab10")
     styles: Dict[str, Dict[str, Any]] = {}
     for idx, model_id in enumerate(model_ids):
         rows = [row for row in summary_rows if str(row["model_id"]) == model_id]
         styles[model_id] = {
-            "color": cmap(idx % 10),
+            "color": MODEL_ACCURACY_COLORS[idx % len(MODEL_ACCURACY_COLORS)],
             "marker": MODEL_MARKERS[idx % len(MODEL_MARKERS)],
             "label": model_label(rows),
         }
@@ -643,8 +651,8 @@ def adaptive_marker_handles(threshold_labels: Sequence[str]) -> List[Line2D]:
             [0],
             [0],
             marker="*",
-            color="#555555",
-            markerfacecolor="#555555",
+            color=TRADEOFF_COLORS["mass_marker"],
+            markerfacecolor=TRADEOFF_COLORS["mass_marker"],
             markeredgecolor="white",
             linewidth=0,
             markersize=12,
@@ -658,7 +666,7 @@ def exact_reference_handle(label: str = "exact runtime") -> Line2D:
     return Line2D(
         [0],
         [0],
-        color="#666666",
+        color=TRADEOFF_COLORS["baseline"],
         linestyle="--",
         linewidth=1.2,
         alpha=0.78,
@@ -847,18 +855,18 @@ def plot_pareto_tradeoff(
     if not all_x_values:
         return
 
-    speedup_color = "#1f77b4"
-    accuracy_color = "#d62728"
-    combined_color = "#7f3fbf"
-    baseline_color = "#6f6f6f"
-    positive_zone_color = "#2ca02c"
+    speedup_color = TRADEOFF_COLORS["speedup"]
+    accuracy_color = TRADEOFF_COLORS["accuracy"]
+    combined_color = TRADEOFF_COLORS["score"]
+    baseline_color = TRADEOFF_COLORS["baseline"]
+    positive_zone_color = TRADEOFF_COLORS["positive_zone"]
 
     nrows = len(model_ids)
     ncols = len(term_counts)
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(5.2 * ncols, 3.55 * nrows),
+        figsize=(max(A4_PAGE_WIDTH_IN, 5.2 * ncols), 3.55 * nrows),
         squeeze=False,
         constrained_layout=False,
         sharex=False,
@@ -984,7 +992,7 @@ def plot_pareto_tradeoff(
         Line2D([0], [0], color=accuracy_color, marker="o", markerfacecolor=accuracy_color, markeredgecolor="white", linewidth=2.0, markersize=6, label="Accuracy"),
         Line2D([0], [0], color=combined_color, linestyle="--", linewidth=1.8, label="Mean score"),
         Line2D([0], [0], color=baseline_color, linestyle="--", linewidth=1.0, label="Exact baseline"),
-        Line2D([0], [0], marker="*", color="#555555", markerfacecolor="#555555", markeredgecolor="white", linewidth=0, markersize=12, label="mass 0.8"),
+        Line2D([0], [0], marker="*", color=TRADEOFF_COLORS["mass_marker"], markerfacecolor=TRADEOFF_COLORS["mass_marker"], markeredgecolor="white", linewidth=0, markersize=12, label="mass 0.8"),
     ]
 
     fig.subplots_adjust(left=0.10, right=0.90, top=0.83, bottom=0.10, wspace=0.16, hspace=0.18)
@@ -1010,7 +1018,7 @@ def plot_pareto_tradeoff(
         y_center = 0.5 * (bbox.y0 + bbox.y1)
         fig.text(0.060, y_center, label, ha="right", va="center", fontsize=11, color="#333333")
 
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.10)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
 
 
@@ -1048,7 +1056,7 @@ def plot_true_candidate_metric_vs_cutoff(
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(5.9 * ncols, 4.5 * nrows),
+        figsize=(max(A4_PAGE_WIDTH_IN, 5.9 * ncols), 4.5 * nrows),
         squeeze=False,
         constrained_layout=False,
     )
@@ -1103,7 +1111,7 @@ def plot_true_candidate_metric_vs_cutoff(
         legend_step=0.080,
         max_columns=7,
     )
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
 
 
@@ -1135,7 +1143,7 @@ def plot_runtime_vs_cutoff(
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(6.3 * ncols, 4.65 * nrows),
+        figsize=(max(A4_PAGE_WIDTH_IN, 6.3 * ncols), 4.65 * nrows),
         squeeze=False,
         constrained_layout=False,
     )
@@ -1199,7 +1207,7 @@ def plot_runtime_vs_cutoff(
         handletextpad=0.55,
         columnspacing=1.15,
     )
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
 
 
@@ -1239,7 +1247,7 @@ def plot_accuracy_delta_vs_cutoff(
     fig, axes_grid = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(6.3 * ncols, 4.75 * nrows),
+        figsize=(max(A4_PAGE_WIDTH_IN, 6.3 * ncols), 4.75 * nrows),
         squeeze=False,
         constrained_layout=False,
     )
@@ -1247,7 +1255,7 @@ def plot_accuracy_delta_vs_cutoff(
 
     for ax, n_terms in zip(axes, term_counts):
         endpoints: List[Dict[str, Any]] = []
-        ax.axhline(0.0, color="#888888", linestyle="--", linewidth=1.0, alpha=0.85)
+        ax.axhline(0.0, color=TRADEOFF_COLORS["baseline"], linestyle="--", linewidth=1.0, alpha=0.85)
         for model_id in model_ids:
             rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
             row_by_label = {str(row["threshold_label"]): row for row in rows}
@@ -1295,8 +1303,8 @@ def plot_accuracy_delta_vs_cutoff(
     handles = model_line_handles(model_ids, model_styles)
     handles.extend([
         exact_reference_handle("Exact baseline"),
-        Line2D([0], [0], marker="*", color="#555555", markerfacecolor="#555555", markeredgecolor="white", linewidth=0, markersize=11, label="mass 0.8"),
-        Line2D([0], [0], color="#555555", linewidth=5.0, alpha=0.12, label="95% CI"),
+        Line2D([0], [0], marker="*", color=TRADEOFF_COLORS["mass_marker"], markerfacecolor=TRADEOFF_COLORS["mass_marker"], markeredgecolor="white", linewidth=0, markersize=11, label="mass 0.8"),
+        Line2D([0], [0], color=TRADEOFF_COLORS["ci_band"], linewidth=5.0, alpha=0.12, label="95% CI"),
     ])
 
     fig.subplots_adjust(top=0.78, left=0.07, right=0.955, bottom=0.10, hspace=0.32, wspace=0.24)
@@ -1313,7 +1321,7 @@ def plot_accuracy_delta_vs_cutoff(
         handletextpad=0.55,
         columnspacing=1.15,
     )
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
 
 
@@ -1396,8 +1404,8 @@ def plot_overhead_exact_vs_zero(
     x = np.arange(len(means), dtype=float)
     heights = np.array([value for _, value in means], dtype=float)
 
-    fig, ax = plt.subplots(figsize=(7.8, 4.8), constrained_layout=True)
-    bars = ax.bar(x, heights, width=0.62, color="#4c78a8", edgecolor="white", linewidth=0.9)
+    fig, ax = plt.subplots(figsize=(A4_PAGE_WIDTH_IN, 4.8), constrained_layout=True)
+    bars = ax.bar(x, heights, width=0.62, color=BLUE, edgecolor="white", linewidth=0.9)
     ax.axhline(0.0, color="#666666", linewidth=1.0)
     ax.set_xticks(x)
     ax.set_xticklabels([str(term) for term, _ in means])
@@ -1418,7 +1426,7 @@ def plot_overhead_exact_vs_zero(
         else:
             ax.text(x_pos, value - 0.03 * span, f"{value:.1f}%", ha="center", va="top", fontsize=9, color="#333333")
 
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
     return overhead_rows
 
@@ -1445,7 +1453,7 @@ def plot_target_vs_achieved(summary_rows: List[Dict[str, Any]], output_path: Pat
     achieved = np.array([100.0 * float(row.get("selected_test_accuracy", 0.0)) for row in model_rows])
     styles = build_model_styles(summary_rows)
 
-    fig, ax = plt.subplots(figsize=(8.4, 4.9), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 8.4), 4.9), constrained_layout=True)
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
     target_x = x - 0.11
@@ -1475,7 +1483,7 @@ def plot_target_vs_achieved(summary_rows: List[Dict[str, Any]], output_path: Pat
         columnspacing=1.3,
         handletextpad=0.5,
     )
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
 
     return [
@@ -1504,7 +1512,7 @@ def plot_adaptive_topk_search_iterations(
     if not search_rows:
         return
     nrows, ncols = term_panel_grid(term_counts)
-    fig, axes_grid = plt.subplots(nrows, ncols, figsize=(5.4 * ncols, 4.2 * nrows), squeeze=False)
+    fig, axes_grid = plt.subplots(nrows, ncols, figsize=(max(A4_PAGE_WIDTH_IN, 5.4 * ncols), 4.2 * nrows), squeeze=False)
     axes = list(axes_grid.flatten())
     model_styles = build_model_styles(summary_rows)
     threshold_styles = cutoff_marker_styles(sorted({str(row["threshold_label"]) for row in search_rows}))
@@ -1578,7 +1586,7 @@ def plot_adaptive_topk_search_iterations(
         fontsize=8,
     )
     fig.tight_layout(rect=(0, 0.14 if legend_handles else 0.035, 1, 0.96))
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1651,7 +1659,7 @@ def plot_tradeoff_matrix_by_terms(
         speedup_vmax += 0.1
     speedup_norm = mcolors.TwoSlopeNorm(vmin=speedup_vmin, vcenter=1.0, vmax=speedup_vmax)
     speedup_cmap = mcolors.LinearSegmentedColormap.from_list(
-        "speedup_diverging", ["#c65a5a", "#f4eed7", "#2a9d66"], N=256
+        "speedup_diverging", SPEEDUP_DIVERGING, N=256
     )
 
     acc_vmin = min(accuracy_values) if accuracy_values else -1.0
@@ -1659,13 +1667,13 @@ def plot_tradeoff_matrix_by_terms(
     acc_bound = max(abs(acc_vmin), abs(acc_vmax), 1.0)
     acc_norm = mcolors.TwoSlopeNorm(vmin=-acc_bound, vcenter=0.0, vmax=acc_bound)
     acc_cmap = mcolors.LinearSegmentedColormap.from_list(
-        "accuracy_diverging", ["#c83f49", "#f4eed7", "#53a66f"], N=256
+        "accuracy_diverging", ACCURACY_DIVERGING, N=256
     )
 
     fig, axes_grid = plt.subplots(
         nrows=2,
         ncols=len(term_counts),
-        figsize=(4.3 * max(1, len(term_counts)), 3.4 + 0.62 * len(model_ids)),
+        figsize=(max(A4_PAGE_WIDTH_IN, 4.3 * max(1, len(term_counts))), 3.4 + 0.62 * len(model_ids)),
         squeeze=False,
         constrained_layout=False,
     )
@@ -1722,7 +1730,7 @@ def plot_tradeoff_matrix_by_terms(
     if accuracy_img is not None:
         cbar_acc = fig.colorbar(accuracy_img, ax=axes_grid[1, :].tolist(), fraction=0.022, pad=0.012)
         cbar_acc.ax.tick_params(labelsize=9)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.10)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
 
 
