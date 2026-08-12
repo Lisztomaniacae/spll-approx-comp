@@ -136,7 +136,7 @@ Important artifacts:
 | `inference_manifest.json` | `infer` | Inference run metadata. |
 | `inference_runs.json` | `infer` | Raw posterior/runtime/branch-count records. |
 | `visualization/tables/*.csv` | `visualize` | Derived result tables. |
-| `visualization/figures/**/*.png` | `visualize` | Main and appendix figures. The standard centerpiece remains `main_text/runtime_accuracy_tradeoff_by_terms.png`; biased counterparts are isolated in `main_text/runtime_accuracy_tradeoff_biased_models_by_terms.png`. |
+| `visualization/figures/**/*.png` | `visualize` | Main and appendix figures. The standard runtime centerpiece remains `main_text/runtime_accuracy_tradeoff_by_terms.png`; `main_text/mnist_lookup_accuracy_tradeoff_by_terms.png` reports mean generated `readMNist` calls against retained accuracy; biased runtime counterparts are isolated in `main_text/runtime_accuracy_tradeoff_biased_models_by_terms.png`. |
 
 Treat `inference_runs.json` as the main empirical artifact. Visualization should derive results from it rather than rerunning inference.
 
@@ -340,6 +340,13 @@ Allowed cache values:
 | `precomputed_per_measurement` | Inference-isolation policy. Before each timed full-posterior or true-candidate query, compute neural probabilities for that query's image paths into a fresh lookup table, then time only the generated-SPLL query. Precompute time is logged separately and never shared between exact and cutoff runs. |
 
 `read_mnist_warmup_calls` defaults to `0` and should stay `0` for thesis-facing runtime benchmarks. A positive value is only a diagnostic option for intentionally excluding one-off cold-start effects; it runs untimed base `readMNist` calls before a model variant starts measured inference, without installing any inference cache.
+
+Every measured full-posterior and true-candidate query records two separate counters:
+
+- `read_mnist_lookup_calls`: generated `readMNist` invocations. This is the compiler/inference lookup count used by `mnist_lookup_accuracy_tradeoff_by_terms.png`.
+- `read_mnist_model_evaluations`: underlying MNIST-model evaluations. For `uncached` and run-scoped caching this is the cache-miss count; for `precomputed_per_measurement` it is the number of precomputed unique images.
+
+Do not interpret lookup reduction as neural-compute reduction under `precomputed_per_measurement`: approximation can reduce generated lookup accesses while the policy still evaluates every unique input image before the timed query.
 
 Aliases such as `run_scoped`, `cached`, `precomputed`, `none`, or `off` are accepted, but prefer the canonical values above in committed configs.
 

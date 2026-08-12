@@ -18,6 +18,7 @@ from pipeline2_plotting import (
     _plot_checkpoint_transfer_metric_trajectory,
     _plot_combined_checkpoint_transfer_metric,
     _plot_dual_axis_checkpoint_bars,
+    _plot_dual_axis_checkpoint_lookup_bars,
     _plot_metric_for_terms,
     _plot_trace,
 )
@@ -52,6 +53,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "digit_accuracy",
         "sum_posterior_accuracy",
         "validation_metric",
+        "cumulative_read_mnist_lookup_calls",
     ]
     run_summary_fields = [
         "seed",
@@ -103,6 +105,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "digit_accuracy_mean",
         "digit_accuracy_std",
         "digit_accuracy_uncertainty_half_width",
+        "cumulative_read_mnist_lookup_calls_mean",
+        "cumulative_read_mnist_lookup_calls_std",
+        "cumulative_read_mnist_lookup_calls_uncertainty_half_width",
     ]
     _write_csv(paths.tables_root / "milestone_summary.csv", rows, milestone_fields)
     write_json(paths.tables_root / "milestone_summary.json", rows)
@@ -201,6 +206,13 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             run_summaries=run_summaries,
             n_terms=n_terms,
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_progress_dual_axis.png",
+        )
+        _plot_dual_axis_checkpoint_lookup_bars(
+            config=config,
+            rows=rows,
+            run_summaries=run_summaries,
+            n_terms=n_terms,
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_lookup_progress_dual_axis.png",
         )
         _plot_metric_for_terms(
             config=config,

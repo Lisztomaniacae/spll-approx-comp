@@ -47,7 +47,7 @@ import End2EndTesting
 import TestCaseParser (parseProgram)
 import SPLL.Prelude
 import qualified SPLL.CodeGenPyTorch
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isSuffixOf)
 
 
 -- Generalizing over different compilation stages, we can fit all "this typing is what the compiler would find" cases.
@@ -865,6 +865,47 @@ prop_TopKPythonConstantValueMatchesConfig = ioProperty $ do
     [line] -> counterexample ("Assignment line: " ++ line)
                 (show thresh `isInfixOf` line)
     other  -> counterexample ("Expected exactly one assignment line, got: " ++ show other) False
+
+-- A composite left probability in enumerable inference is used by both the
+-- top-k predicate and the final product.  It must therefore be let-bound once;
+-- otherwise generated approximate code evaluates the complete left subtree
+-- twice for every surviving branch.  Two-term expressions do not expose this
+-- because their left probability is already a simple leaf binding, so this
+-- regression uses a nested three-die sum.
+prop_TopKCompositeLeftProbabilityIsShared :: Property
+prop_TopKCompositeLeftProbabilityIsShared = ioProperty $ do
+  let nestedDice = Program
+        [ ("main", injF "plusI" [injF "plusI" [var "dice", var "dice"], var "dice"])
+        , ("dice", dice 6)
+        ] [] []
+      conf = defaultCompilerConfig { topKThreshold = Just 0.0 }
+      preAnnotated = annotateEnumsProg nestedDice
+      forwardChained = annotateProg preAnnotated
+      Right typedProg = addTypeInfo forwardChained
+      annotated = (annotateAlgsProg . annotateConditionalProg) typedProg
+      irEnv = envToIRUnoptimized conf annotated
+      Just (mainProb, _) = probFun (lookupIREnv "main" irEnv)
+      bindings = collectPLeftBindings mainProb
+      sharedComposite (name, value, body) =
+        isComposite value && countIRVarUses name body >= 2
+  return $ counterexample
+    ("Expected a shared composite _pLeft binding in:\n" ++ show mainProb)
+    (any sharedComposite bindings)
+  where
+    collectPLeftBindings :: IRExpr -> [(String, IRExpr, IRExpr)]
+    collectPLeftBindings expr@(IRLetIn name value body) =
+      [(name, value, body) | "_pLeft" `isSuffixOf` name]
+      ++ concatMap collectPLeftBindings (getIRSubExprs expr)
+    collectPLeftBindings expr = concatMap collectPLeftBindings (getIRSubExprs expr)
+
+    isComposite :: IRExpr -> Bool
+    isComposite (IRConst _) = False
+    isComposite (IRVar _) = False
+    isComposite _ = True
+
+    countIRVarUses :: String -> IRExpr -> Int
+    countIRVarUses name (IRVar other) = if name == other then 1 else 0
+    countIRVarUses name expr = sum (map (countIRVarUses name) (getIRSubExprs expr))
 
 -- The interpreter must resolve IRVar "TOP_K_CUTOFF" via the constant in IREnv:
 -- irDensityTopK with threshold=0.001 on testDice should agree with irDensity

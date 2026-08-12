@@ -148,6 +148,7 @@ def _collect_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "digit_accuracy": info.get("digit_accuracy"),
                             "sum_posterior_accuracy": info.get("sum_posterior_accuracy", info.get("digit_accuracy")),
                             "validation_metric": info.get("validation_metric", "sum_posterior_accuracy"),
+                            "cumulative_read_mnist_lookup_calls": info.get("cumulative_read_mnist_lookup_calls"),
                         }
                     )
     return rows
@@ -189,9 +190,15 @@ def _collect_milestone_aggregates(config: Dict[str, Any], rows: List[Dict[str, A
         step_values = [float(row["step"]) for row in reached_rows if row.get("step") not in {None, ""}]
         time_values = [float(row["elapsed_seconds"]) for row in reached_rows if row.get("elapsed_seconds") not in {None, ""}]
         accuracy_values = [float(row["digit_accuracy"]) for row in reached_rows if row.get("digit_accuracy") not in {None, ""}]
+        lookup_values = [
+            float(row["cumulative_read_mnist_lookup_calls"])
+            for row in reached_rows
+            if row.get("cumulative_read_mnist_lookup_calls") not in {None, ""}
+        ]
         step_summary = _metric_summary(step_values, config)
         time_summary = _metric_summary(time_values, config)
         accuracy_summary = _metric_summary(accuracy_values, config)
+        lookup_summary = _metric_summary(lookup_values, config)
         aggregate_rows.append(
             {
                 "n_terms": n_terms,
@@ -217,6 +224,9 @@ def _collect_milestone_aggregates(config: Dict[str, Any], rows: List[Dict[str, A
                 "digit_accuracy_mean": accuracy_summary["mean"],
                 "digit_accuracy_std": accuracy_summary["std"],
                 "digit_accuracy_uncertainty_half_width": accuracy_summary["uncertainty_half_width"],
+                "cumulative_read_mnist_lookup_calls_mean": lookup_summary["mean"],
+                "cumulative_read_mnist_lookup_calls_std": lookup_summary["std"],
+                "cumulative_read_mnist_lookup_calls_uncertainty_half_width": lookup_summary["uncertainty_half_width"],
             }
         )
     return aggregate_rows

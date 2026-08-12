@@ -167,6 +167,9 @@ def _train_one_run(
                 "branch_count",
                 "branch_count_mean",
                 "branch_count_total",
+                "read_mnist_lookup_mean",
+                "read_mnist_lookup_total",
+                "read_mnist_lookup_cumulative",
                 "grad_norm",
                 "top_k_cutoff_runtime",
                 "posterior_mass_target",
@@ -217,6 +220,7 @@ def _train_one_run(
                 "threshold": float(threshold),
                 "metric": "true_sum_posterior_recent_mean",
                 "checkpoint_path": None,
+                "cumulative_read_mnist_lookup_calls": None,
             }
             for threshold in checkpoint_thresholds
         }
@@ -230,6 +234,7 @@ def _train_one_run(
                 "digit_accuracy": None,
                 "sum_posterior_accuracy": None,
                 "validation_metric": "true_sum_posterior_recent_mean",
+                "cumulative_read_mnist_lookup_calls": None,
             }
             for key in posterior_checkpoints_state
         }
@@ -307,6 +312,7 @@ def _train_one_run(
         )
         cases_seen = 0
         optimizer_update = 0
+        cumulative_read_mnist_lookup_calls = 0
         last_loss: Optional[float] = None
         last_true_mass: Optional[float] = None
         last_zero_rate: Optional[float] = None
@@ -349,6 +355,9 @@ def _train_one_run(
             rolling_zero_rate = recent_mean(list(recent_zeros))
             branch_count_mean = batch_stats["branch_count_mean"]
             branch_count_total = batch_stats["branch_count_total"]
+            read_mnist_lookup_mean = batch_stats["read_mnist_lookup_mean"]
+            read_mnist_lookup_total = int(batch_stats["read_mnist_lookup_total"] or 0)
+            cumulative_read_mnist_lookup_calls += read_mnist_lookup_total
             train_writer.writerow(
                 {
                     "step": cases_seen,
@@ -366,6 +375,9 @@ def _train_one_run(
                     "branch_count": branch_count_mean,
                     "branch_count_mean": branch_count_mean,
                     "branch_count_total": branch_count_total,
+                    "read_mnist_lookup_mean": read_mnist_lookup_mean,
+                    "read_mnist_lookup_total": read_mnist_lookup_total,
+                    "read_mnist_lookup_cumulative": cumulative_read_mnist_lookup_calls,
                     "grad_norm": last_grad_norm,
                     "top_k_cutoff_runtime": get_runtime_top_k_cutoff(module, mode),
                     "posterior_mass_target": mode.get("posterior_mass_target"),
@@ -390,6 +402,7 @@ def _train_one_run(
                             "threshold": float(threshold),
                             "metric": "true_sum_posterior_recent_mean",
                             "checkpoint_path": str(checkpoint_path),
+                            "cumulative_read_mnist_lookup_calls": int(cumulative_read_mnist_lookup_calls),
                         }
                         milestones_state[key] = {
                             "reached": True,
@@ -398,6 +411,7 @@ def _train_one_run(
                             "digit_accuracy": float(rolling_true_mass),
                             "sum_posterior_accuracy": float(rolling_true_mass),
                             "validation_metric": "true_sum_posterior_recent_mean",
+                            "cumulative_read_mnist_lookup_calls": int(cumulative_read_mnist_lookup_calls),
                         }
                         save_training_checkpoint(
                             checkpoint_path,
@@ -480,6 +494,7 @@ def _train_one_run(
                 "final_digit_accuracy": None,
                 "final_sum_posterior_accuracy": None,
                 "validation_metric": "not_used",
+                "final_cumulative_read_mnist_lookup_calls": int(cumulative_read_mnist_lookup_calls),
                 "milestones": milestones_state,
             },
         )

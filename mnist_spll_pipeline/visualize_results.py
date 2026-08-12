@@ -21,6 +21,7 @@ from pipeline1_plotting import (
     plot_accuracy_delta_vs_cutoff,
     plot_adaptive_topk_search_iterations,
     plot_heatmap_metric,
+    plot_mnist_lookup_accuracy_tradeoff,
     plot_overhead_exact_vs_zero,
     plot_pareto_tradeoff,
     plot_runtime_vs_cutoff,
@@ -125,6 +126,12 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         term_counts=term_counts,
         threshold_order=threshold_order,
         output_path=main_dir / "runtime_accuracy_tradeoff_by_terms.png",
+    )
+    plot_mnist_lookup_accuracy_tradeoff(
+        summary_rows=standard_rows,
+        term_counts=term_counts,
+        threshold_order=threshold_order,
+        output_path=main_dir / "mnist_lookup_accuracy_tradeoff_by_terms.png",
     )
     if biased_tradeoff_rows:
         plot_pareto_tradeoff(

@@ -162,6 +162,49 @@ def median_or_nan(values: Sequence[float]) -> float:
     return median(values) if values else float("nan")
 
 
+def read_mnist_count_from_run(
+        run: Dict[str, Any],
+        *,
+        true_candidate: bool,
+        model_evaluations: bool,
+) -> float:
+    """Read a scalar MNIST-call count with backward-compatible fallbacks.
+
+    New inference runs expose flat scalar fields. Existing result bundles from
+    the current pipeline already contain the same information inside the nested
+    ``*_read_mnist_stats`` dictionaries, so visualization can be regenerated
+    without rerunning inference.
+    """
+
+    prefix = "true_candidate_" if true_candidate else ""
+    explicit_key = prefix + (
+        "read_mnist_model_evaluations" if model_evaluations else "read_mnist_lookup_calls"
+    )
+    explicit = run.get(explicit_key)
+    if explicit is not None:
+        try:
+            return float(explicit)
+        except (TypeError, ValueError):
+            pass
+
+    stats_key = "true_candidate_read_mnist_stats" if true_candidate else "posterior_read_mnist_stats"
+    stats = run.get(stats_key)
+    if not isinstance(stats, dict):
+        return float("nan")
+
+    if not model_evaluations:
+        value = stats.get("calls")
+    elif str(stats.get("policy", run.get("read_mnist_cache_policy", ""))) == "precomputed_per_measurement":
+        value = stats.get("precompute_calls")
+    else:
+        value = stats.get("cache_misses", stats.get("calls"))
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def summarize_groups(
         rows: List[Dict[str, Any]],
         group_keys: Sequence[str],
@@ -178,12 +221,22 @@ def summarize_groups(
         true_candidate_runtimes = finite_float_values(items, "true_candidate_runtime_sec")
         true_candidate_branch_counts = finite_float_values(items, "true_candidate_branch_count")
         precompute_runtimes = finite_float_values(items, "read_mnist_precompute_runtime_sec")
+        read_mnist_lookup_calls = finite_float_values(items, "read_mnist_lookup_calls")
+        read_mnist_model_evaluations = finite_float_values(items, "read_mnist_model_evaluations")
         runtime_top_k_cutoffs = finite_float_values(items, "runtime_top_k_cutoff")
         surviving_masses = finite_float_values(items, "mean_surviving_posterior_mass")
         adaptive_search_runtimes = finite_float_values(items, "adaptive_cutoff_search_runtime_sec")
         true_candidate_precompute_runtimes = finite_float_values(
             items,
             "true_candidate_read_mnist_precompute_runtime_sec",
+        )
+        true_candidate_read_mnist_lookup_calls = finite_float_values(
+            items,
+            "true_candidate_read_mnist_lookup_calls",
+        )
+        true_candidate_read_mnist_model_evaluations = finite_float_values(
+            items,
+            "true_candidate_read_mnist_model_evaluations",
         )
         result: Dict[str, Any] = {key: first[key] for key in group_keys}
         result.update(
@@ -206,6 +259,10 @@ def summarize_groups(
                 "runtime_q75_sec": quantile(runtimes, 0.75),
                 "mean_read_mnist_precompute_runtime_sec": mean_or_nan(precompute_runtimes),
                 "median_read_mnist_precompute_runtime_sec": median_or_nan(precompute_runtimes),
+                "mean_read_mnist_lookup_calls": mean_or_nan(read_mnist_lookup_calls),
+                "median_read_mnist_lookup_calls": median_or_nan(read_mnist_lookup_calls),
+                "mean_read_mnist_model_evaluations": mean_or_nan(read_mnist_model_evaluations),
+                "median_read_mnist_model_evaluations": median_or_nan(read_mnist_model_evaluations),
                 "mean_confidence": mean(float(item["confidence"]) for item in items),
                 "mean_output_pool": mean(float(item["output_pool"]) for item in items),
                 "mean_output_pool_fraction": mean(float(item["output_pool_fraction"]) for item in items),
@@ -224,6 +281,18 @@ def summarize_groups(
                 ),
                 "median_true_candidate_read_mnist_precompute_runtime_sec": median_or_nan(
                     true_candidate_precompute_runtimes
+                ),
+                "mean_true_candidate_read_mnist_lookup_calls": mean_or_nan(
+                    true_candidate_read_mnist_lookup_calls
+                ),
+                "median_true_candidate_read_mnist_lookup_calls": median_or_nan(
+                    true_candidate_read_mnist_lookup_calls
+                ),
+                "mean_true_candidate_read_mnist_model_evaluations": mean_or_nan(
+                    true_candidate_read_mnist_model_evaluations
+                ),
+                "median_true_candidate_read_mnist_model_evaluations": median_or_nan(
+                    true_candidate_read_mnist_model_evaluations
                 ),
                 "mean_true_candidate_probability_raw": mean(
                     float(item["true_candidate_probability_raw"]) for item in items
@@ -278,6 +347,13 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
             row["true_candidate_normalized_probability_delta_vs_exact"] = float("nan")
             row["true_candidate_branch_count_delta_vs_exact"] = float("nan")
             row["true_candidate_survival_rate_delta_vs_exact"] = float("nan")
+            row["read_mnist_lookup_ratio_vs_exact"] = float("nan")
+            row["read_mnist_lookup_reduction_vs_exact"] = float("nan")
+            row["read_mnist_lookup_speedup_vs_exact"] = float("nan")
+            row["read_mnist_model_evaluation_ratio_vs_exact"] = float("nan")
+            row["read_mnist_model_evaluation_reduction_vs_exact"] = float("nan")
+            row["true_candidate_read_mnist_lookup_ratio_vs_exact"] = float("nan")
+            row["true_candidate_read_mnist_lookup_reduction_vs_exact"] = float("nan")
             continue
 
         baseline_runtime = float(baseline["median_runtime_sec"])
@@ -316,6 +392,66 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
         row["true_candidate_survival_rate_delta_vs_exact"] = float(
             row["true_candidate_survival_rate"]
         ) - float(baseline["true_candidate_survival_rate"])
+
+        current_lookups = float(row.get("mean_read_mnist_lookup_calls", float("nan")))
+        baseline_lookups = float(baseline.get("mean_read_mnist_lookup_calls", float("nan")))
+        lookup_ratio = (
+            float(current_lookups / baseline_lookups)
+            if math.isfinite(current_lookups) and math.isfinite(baseline_lookups) and baseline_lookups > 0
+            else float("nan")
+        )
+        row["read_mnist_lookup_ratio_vs_exact"] = lookup_ratio
+        row["read_mnist_lookup_reduction_vs_exact"] = (
+            float(1.0 - lookup_ratio) if math.isfinite(lookup_ratio) else float("nan")
+        )
+        row["read_mnist_lookup_speedup_vs_exact"] = (
+            float(baseline_lookups / current_lookups)
+            if math.isfinite(current_lookups)
+            and math.isfinite(baseline_lookups)
+            and baseline_lookups > 0
+            and current_lookups > 0
+            else float("nan")
+        )
+
+        current_model_evaluations = float(
+            row.get("mean_read_mnist_model_evaluations", float("nan"))
+        )
+        baseline_model_evaluations = float(
+            baseline.get("mean_read_mnist_model_evaluations", float("nan"))
+        )
+        model_evaluation_ratio = (
+            float(current_model_evaluations / baseline_model_evaluations)
+            if math.isfinite(current_model_evaluations)
+            and math.isfinite(baseline_model_evaluations)
+            and baseline_model_evaluations > 0
+            else float("nan")
+        )
+        row["read_mnist_model_evaluation_ratio_vs_exact"] = model_evaluation_ratio
+        row["read_mnist_model_evaluation_reduction_vs_exact"] = (
+            float(1.0 - model_evaluation_ratio)
+            if math.isfinite(model_evaluation_ratio)
+            else float("nan")
+        )
+
+        current_true_lookups = float(
+            row.get("mean_true_candidate_read_mnist_lookup_calls", float("nan"))
+        )
+        baseline_true_lookups = float(
+            baseline.get("mean_true_candidate_read_mnist_lookup_calls", float("nan"))
+        )
+        true_lookup_ratio = (
+            float(current_true_lookups / baseline_true_lookups)
+            if math.isfinite(current_true_lookups)
+            and math.isfinite(baseline_true_lookups)
+            and baseline_true_lookups > 0
+            else float("nan")
+        )
+        row["true_candidate_read_mnist_lookup_ratio_vs_exact"] = true_lookup_ratio
+        row["true_candidate_read_mnist_lookup_reduction_vs_exact"] = (
+            float(1.0 - true_lookup_ratio)
+            if math.isfinite(true_lookup_ratio)
+            else float("nan")
+        )
 
 
 def add_paired_accuracy_delta_intervals(
@@ -456,6 +592,26 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
         )
         total_branch_count = int(sum(branch_counts))
         true_candidate_runtime_sec = float(run.get("true_candidate_runtime_sec", float("nan")))
+        read_mnist_lookup_calls = read_mnist_count_from_run(
+            run,
+            true_candidate=False,
+            model_evaluations=False,
+        )
+        read_mnist_model_evaluations = read_mnist_count_from_run(
+            run,
+            true_candidate=False,
+            model_evaluations=True,
+        )
+        true_candidate_read_mnist_lookup_calls = read_mnist_count_from_run(
+            run,
+            true_candidate=True,
+            model_evaluations=False,
+        )
+        true_candidate_read_mnist_model_evaluations = read_mnist_count_from_run(
+            run,
+            true_candidate=True,
+            model_evaluations=True,
+        )
 
         detailed_rows.append(
             {
@@ -481,6 +637,9 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "prediction_valid": int(predicted_sum is not None),
                 "posterior_invalid": int(zero_mass),
                 "runtime_sec": float(run["runtime_sec"]),
+                "read_mnist_cache_policy": str(run.get("read_mnist_cache_policy", "unknown")),
+                "read_mnist_lookup_calls": read_mnist_lookup_calls,
+                "read_mnist_model_evaluations": read_mnist_model_evaluations,
                 "read_mnist_precompute_runtime_sec": float(
                     run.get("read_mnist_precompute_runtime_sec", 0.0)
                 ),
@@ -499,6 +658,10 @@ def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Di
                 "true_candidate_normalized_probability": true_candidate_normalized_probability,
                 "true_candidate_branch_count": true_candidate_branch_count,
                 "true_candidate_runtime_sec": true_candidate_runtime_sec,
+                "true_candidate_read_mnist_lookup_calls": true_candidate_read_mnist_lookup_calls,
+                "true_candidate_read_mnist_model_evaluations": (
+                    true_candidate_read_mnist_model_evaluations
+                ),
                 "true_candidate_read_mnist_precompute_runtime_sec": float(
                     run.get("true_candidate_read_mnist_precompute_runtime_sec", 0.0)
                 ),

@@ -926,7 +926,14 @@ toIRInference meta False (InjF TypeInfo {tags=extras, rType=rt} name [left, righ
       toIRInference meta False left (IRVar x2)
 
     let possible = IRIsPossible enumListR invExpr
-    let accLeft = IROp OpMult (accProb meta) pLeft
+
+    -- The left probability is needed both for the top-k test and for the final
+    -- product.  Bind the complete expression once before using it.  Without
+    -- this binding, a composite left expression (for example, a nested sum)
+    -- is evaluated twice on every surviving branch in approximate mode.
+    pLeftVar <- mkVariable "pLeft"
+    let pLeftRef = IRVar pLeftVar
+    let accLeft = IROp OpMult (accProb meta) pLeftRef
     let cutoffOk = case topKThreshold (compilerConfig meta) of
           Nothing -> IRConst (VBool True)
           Just _  -> IROp OpGreaterThan accLeft (IRVar "TOP_K_CUTOFF")
@@ -937,7 +944,7 @@ toIRInference meta False (InjF TypeInfo {tags=extras, rType=rt} name [left, righ
     ((pRight, _, _), pRightBinds) <- lift $ runWriterT $
       toIRInference (meta { accProb = accLeft }) False right invExpr
 
-    let withLeft = generateLetInExpr pLeftBinds
+    let withLeft body = generateLetInExpr pLeftBinds (IRLetIn pLeftVar pLeft body)
     let withRight = generateLetInExpr pRightBinds
     let zero = IRConst (VFloat 0)
 
@@ -945,7 +952,7 @@ toIRInference meta False (InjF TypeInfo {tags=extras, rType=rt} name [left, righ
     -- This ordering prevents both invalid-inverse left calls and pruned right calls.
     let returnExpr = IRIf possible
           (withLeft $ IRIf cutoffOk
-            (withRight $ IROp OpMult pLeft pRight)
+            (withRight $ IROp OpMult pLeftRef pRight)
             zero)
           zero
 

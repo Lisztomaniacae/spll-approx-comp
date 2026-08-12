@@ -1,5 +1,5 @@
 seed: 42
-seeds: [42,43,44, 45, 46]
+seeds: [42, 43, 44, 45, 46]
 show_progress: true
 
 paths:
@@ -107,7 +107,7 @@ inference_modes:
     top_k_cutoff: 0.1
 
 compile:
-  count_branches: true
+  count_branches: false
   force_recompile: true
   timeout_sec: 3600
   stack_arch: x86_64

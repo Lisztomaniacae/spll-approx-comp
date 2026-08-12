@@ -155,9 +155,11 @@ class PrecomputedReadMNIST:
         self.probabilities_by_index = {
             int(index): probability for index, probability in probabilities_by_index.items()
         }
+        self.call_count = 0
 
     def __call__(self, global_index: int) -> torch.Tensor:
         index = int(global_index)
+        self.call_count += 1
         try:
             return self.probabilities_by_index[index]
         except KeyError as exc:
@@ -334,16 +336,13 @@ def train_sum_batch(
         for case in cases
         for index in case["global_indices"]
     ]
-    setattr(
-        module,
-        "readMNist",
-        make_precomputed_read_mnist(
-            model=model,
-            tensor_cache=cache,
-            device=device,
-            global_indices=all_indices,
-        ),
+    batch_read_mnist = make_precomputed_read_mnist(
+        model=model,
+        tensor_cache=cache,
+        device=device,
+        global_indices=all_indices,
     )
+    setattr(module, "readMNist", batch_read_mnist)
 
     zero_anchor = zero_anchor_from_model(model)
     probabilities = []
@@ -382,6 +381,7 @@ def train_sum_batch(
     loss_values = [tensor_to_float(value) for value in per_case_losses]
     zero_flags = [int(value <= 0.0) for value in probability_values]
     numeric_branch_counts = [int(value) for value in branch_counts if value is not None]
+    read_mnist_lookup_total = int(getattr(batch_read_mnist, "call_count", 0))
     return {
         "batch_size": len(cases),
         "loss": float(sum(loss_values) / len(loss_values)),
@@ -395,6 +395,8 @@ def train_sum_batch(
         "branch_count_total": (
             int(sum(numeric_branch_counts)) if numeric_branch_counts else None
         ),
+        "read_mnist_lookup_mean": (read_mnist_lookup_total / len(cases)) if cases else None,
+        "read_mnist_lookup_total": read_mnist_lookup_total,
         "grad_norm": gradient_norm,
         "case_loss_values": loss_values,
         "case_true_mass_values": probability_values,

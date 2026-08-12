@@ -16,6 +16,7 @@ from inference_engine import (
     RunScopedReadMNistCache,
     UncachedReadMNistCounter,
     normalize_read_mnist_cache_policy,
+    read_mnist_model_evaluations,
 )
 from pipeline1_config import get_thresholds
 from pipeline1_models import get_model_variants
@@ -171,6 +172,7 @@ class SpllContractTests(unittest.TestCase):
         self.assertEqual(calls, ["a", "b"])
         precomputed("a")
         self.assertEqual(precomputed.stats()["cache_hits"], 1)
+        self.assertEqual(read_mnist_model_evaluations(precomputed.stats()), 2)
         with self.assertRaises(KeyError):
             precomputed("c")
 

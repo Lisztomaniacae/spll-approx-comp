@@ -68,6 +68,21 @@ class AnalysisContractTests(unittest.TestCase):
                 "runtime_sec": 2.0,
                 "posterior_raw": exact_posterior,
                 "true_candidate_probability_raw": 1.0,
+                "read_mnist_cache_policy": "uncached",
+                "posterior_read_mnist_stats": {
+                    "policy": "uncached",
+                    "calls": 100,
+                    "cache_hits": 0,
+                    "cache_misses": 100,
+                    "unique_images": 2,
+                },
+                "true_candidate_read_mnist_stats": {
+                    "policy": "uncached",
+                    "calls": 2,
+                    "cache_hits": 0,
+                    "cache_misses": 2,
+                    "unique_images": 2,
+                },
             },
             {
                 **common,
@@ -76,6 +91,21 @@ class AnalysisContractTests(unittest.TestCase):
                 "runtime_sec": 1.0,
                 "posterior_raw": approx_posterior,
                 "true_candidate_probability_raw": 0.0,
+                "read_mnist_cache_policy": "uncached",
+                "posterior_read_mnist_stats": {
+                    "policy": "uncached",
+                    "calls": 40,
+                    "cache_hits": 0,
+                    "cache_misses": 40,
+                    "unique_images": 2,
+                },
+                "true_candidate_read_mnist_stats": {
+                    "policy": "uncached",
+                    "calls": 1,
+                    "cache_hits": 0,
+                    "cache_misses": 1,
+                    "unique_images": 1,
+                },
             },
         ]
         detailed = prepare_detailed_rows(runs, top_n=3)
@@ -93,6 +123,11 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertEqual(rows["cutoff_0p1"]["accuracy"], 0.0)
         self.assertEqual(rows["cutoff_0p1"]["speedup_vs_exact"], 2.0)
         self.assertEqual(rows["cutoff_0p1"]["accuracy_delta_vs_exact"], -1.0)
+        self.assertEqual(rows["exact"]["mean_read_mnist_lookup_calls"], 100.0)
+        self.assertEqual(rows["cutoff_0p1"]["mean_read_mnist_lookup_calls"], 40.0)
+        self.assertAlmostEqual(rows["cutoff_0p1"]["read_mnist_lookup_ratio_vs_exact"], 0.4)
+        self.assertAlmostEqual(rows["cutoff_0p1"]["read_mnist_lookup_reduction_vs_exact"], 0.6)
+        self.assertAlmostEqual(rows["cutoff_0p1"]["read_mnist_lookup_speedup_vs_exact"], 2.5)
 
     def test_pipeline2_uncertainty_modes(self) -> None:
         values = [1.0, 2.0, 3.0]

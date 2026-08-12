@@ -165,6 +165,20 @@ class PrecomputedReadMNistLookup:
         }
 
 
+def read_mnist_model_evaluations(stats: Dict[str, Any]) -> int:
+    """Return the number of underlying MNIST-model evaluations for one scope.
+
+    ``calls`` always counts generated ``readMNist`` invocations.  Under the
+    precomputed policy those invocations are lookup-table accesses, so the
+    actual model work is represented by ``precompute_calls`` instead.  Under
+    the uncached and run-scoped policies, cache misses are the model calls.
+    """
+
+    if str(stats.get("policy", "")) == READ_MNIST_CACHE_POLICY_PRECOMPUTED:
+        return int(stats.get("precompute_calls", 0))
+    return int(stats.get("cache_misses", stats.get("calls", 0)))
+
+
 def warm_up_read_mnist(
     read_mnist: Callable[[str], Sequence[float]],
     experiments: Sequence[Dict[str, Any]],
@@ -680,6 +694,16 @@ class InferenceRunEngine:
             "read_mnist_cache_policy": self.read_mnist_cache_policy,
             "posterior_read_mnist_stats": posterior_read_mnist_stats,
             "true_candidate_read_mnist_stats": true_candidate_read_mnist_stats,
+            "read_mnist_lookup_calls": int(posterior_read_mnist_stats.get("calls", 0)),
+            "read_mnist_model_evaluations": read_mnist_model_evaluations(
+                posterior_read_mnist_stats
+            ),
+            "true_candidate_read_mnist_lookup_calls": int(
+                true_candidate_read_mnist_stats.get("calls", 0)
+            ),
+            "true_candidate_read_mnist_model_evaluations": read_mnist_model_evaluations(
+                true_candidate_read_mnist_stats
+            ),
             "read_mnist_precompute_runtime_sec": float(
                 posterior_read_mnist_stats.get("precompute_runtime_sec", 0.0)
             ),

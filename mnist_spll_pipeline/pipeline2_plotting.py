@@ -115,39 +115,51 @@ def _fully_reached_milestone_rows(
 def _checkpoint_bar_axis_scaling(
     *,
     max_step_value: float,
-    max_time_value: float,
+    max_secondary_value: Optional[float] = None,
     exact_step_means: Sequence[float],
-    exact_time_means: Sequence[float],
+    exact_secondary_means: Optional[Sequence[float]] = None,
+    max_time_value: Optional[float] = None,
+    exact_time_means: Optional[Sequence[float]] = None,
 ) -> Tuple[float, float]:
-    """Return (time_to_steps, left_axis_top) for the dual-axis checkpoint bar plot.
+    """Return (secondary_to_steps, left_axis_top) for the dual-axis checkpoint bar plot.
 
-    The secondary wall-clock bars are drawn on the left axis after conversion to
-    step units. Therefore the left-axis limit must budget for both the outer
-    step bars and the converted inner wall-clock bars. Otherwise slower
-    approximate runs can hit the plot ceiling even when the step bars fit.
+    The secondary bars are drawn on the left axis after conversion to step
+    units. Therefore the left-axis limit must budget for both the outer step
+    bars and the converted inner secondary-metric bars. Otherwise approximate
+    runs can hit the plot ceiling even when the step bars fit.
     """
 
+    if max_secondary_value is None:
+        max_secondary_value = max_time_value
+    if exact_secondary_means is None:
+        exact_secondary_means = exact_time_means
+    if max_secondary_value is None or exact_secondary_means is None:
+        raise TypeError(
+            "_checkpoint_bar_axis_scaling requires either secondary-metric arguments "
+            "or the backward-compatible time arguments."
+        )
+
     exact_pairs = [
-        (float(step), float(time))
-        for step, time in zip(exact_step_means, exact_time_means)
-        if float(time) > 0.0
+        (float(step), float(value))
+        for step, value in zip(exact_step_means, exact_secondary_means)
+        if float(value) > 0.0
     ]
     if exact_pairs:
-        numerator = sum(step * time for step, time in exact_pairs)
-        denominator = sum(time * time for _, time in exact_pairs)
-        exact_time_to_steps = (numerator / denominator) if denominator > 0.0 else None
+        numerator = sum(step * value for step, value in exact_pairs)
+        denominator = sum(value * value for _, value in exact_pairs)
+        exact_secondary_to_steps = (numerator / denominator) if denominator > 0.0 else None
     else:
-        exact_time_to_steps = None
+        exact_secondary_to_steps = None
 
-    if exact_time_to_steps and exact_time_to_steps > 0.0:
-        time_to_steps = float(exact_time_to_steps)
+    if exact_secondary_to_steps and exact_secondary_to_steps > 0.0:
+        secondary_to_steps = float(exact_secondary_to_steps)
     else:
-        time_to_steps = float(max_step_value) / float(max_time_value)
+        secondary_to_steps = float(max_step_value) / float(max_secondary_value)
 
-    converted_time_max = float(max_time_value) * float(time_to_steps)
-    content_top = max(float(max_step_value), converted_time_max)
+    converted_secondary_max = float(max_secondary_value) * float(secondary_to_steps)
+    content_top = max(float(max_step_value), converted_secondary_max)
     left_top = content_top * 1.10
-    return time_to_steps, left_top
+    return secondary_to_steps, left_top
 
 
 def _mix_with_white(color: Any, amount: float) -> Tuple[float, float, float]:
@@ -742,18 +754,61 @@ def _plot_dual_axis_checkpoint_bars(
     for mode_idx, mode_name in enumerate(mode_names):
         by_milestone_steps: Dict[float, List[float]] = {}
         by_milestone_time: Dict[float, List[float]] = {}
-        for milestone in milestones:
-            complete_rows = _fully_reached_milestone_rows(
+        for milestone_idx, milestone in enumerate(milestones):
+            current_rows = _fully_reached_milestone_rows(
                 config,
                 term_all_rows,
                 mode_name=mode_name,
                 milestone=milestone,
                 required_fields=("step", "elapsed_seconds"),
             )
-            if not complete_rows:
+            if not current_rows:
                 continue
-            by_milestone_steps[milestone] = [float(row["step"]) for row in complete_rows]
-            by_milestone_time[milestone] = [float(row["elapsed_seconds"]) for row in complete_rows]
+
+            current_by_seed = {
+                int(row["seed"]): row
+                for row in current_rows
+            }
+            if milestone_idx == 0:
+                previous_by_seed: Dict[int, Dict[str, Any]] = {}
+            else:
+                previous_milestone = milestones[milestone_idx - 1]
+                previous_rows = _fully_reached_milestone_rows(
+                    config,
+                    term_all_rows,
+                    mode_name=mode_name,
+                    milestone=previous_milestone,
+                    required_fields=("step", "elapsed_seconds"),
+                )
+                if not previous_rows:
+                    continue
+                previous_by_seed = {
+                    int(row["seed"]): row
+                    for row in previous_rows
+                }
+
+            step_values: List[float] = []
+            time_values: List[float] = []
+            for seed in get_seeds(config):
+                current_row = current_by_seed[int(seed)]
+                previous_row = previous_by_seed.get(int(seed))
+                previous_step = float(previous_row["step"]) if previous_row is not None else 0.0
+                previous_time = float(previous_row["elapsed_seconds"]) if previous_row is not None else 0.0
+                step_delta = float(current_row["step"]) - previous_step
+                time_delta = float(current_row["elapsed_seconds"]) - previous_time
+                if step_delta < 0.0 or time_delta < 0.0:
+                    previous_label = 0.0 if milestone_idx == 0 else milestones[milestone_idx - 1]
+                    raise RuntimeError(
+                        "Checkpoint measurements must be cumulative and nondecreasing before "
+                        "interval conversion: "
+                        f"mode={mode_name}, seed={seed}, interval={previous_label:g}-{milestone:g}, "
+                        f"step_delta={step_delta:g}, time_delta={time_delta:g}."
+                    )
+                step_values.append(step_delta)
+                time_values.append(time_delta)
+
+            by_milestone_steps[milestone] = step_values
+            by_milestone_time[milestone] = time_values
 
         xs: List[float] = []
         step_means: List[float] = []
@@ -790,9 +845,9 @@ def _plot_dual_axis_checkpoint_bars(
     exact_series = next((data for data in series if str(data["mode_name"]) == "exact"), None)
     time_to_steps, left_top = _checkpoint_bar_axis_scaling(
         max_step_value=max_step_value,
-        max_time_value=max_time_value,
+        max_secondary_value=max_time_value,
         exact_step_means=exact_series["step_means"] if exact_series else [],
-        exact_time_means=exact_series["time_means"] if exact_series else [],
+        exact_secondary_means=exact_series["time_means"] if exact_series else [],
     )
 
     fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 9.2, 0.9 * len(milestones) + 3.4), 6.05))
@@ -844,11 +899,17 @@ def _plot_dual_axis_checkpoint_bars(
         )
 
     ax.set_ylim(0.0, left_top)
-    ax.set_xlabel("Training true-sum posterior checkpoint")
-    ax.set_ylabel("Steps to checkpoint")
-    ax_right.set_ylabel("Wall-clock time (s)")
+    ax.set_xlabel("Training true-sum posterior interval")
+    ax.set_ylabel("Steps in interval")
+    ax_right.set_ylabel("Wall-clock time in interval (s)")
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([_format_milestone_label(value) for value in milestones])
+    interval_starts = [0.0, *milestones[:-1]]
+    ax.set_xticklabels(
+        [
+            f"{_format_milestone_label(start)}–{_format_milestone_label(end)}"
+            for start, end in zip(interval_starts, milestones)
+        ]
+    )
     ax.grid(True, axis="y", alpha=0.18, zorder=0)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -867,7 +928,7 @@ def _plot_dual_axis_checkpoint_bars(
         label="Wall-clock: inner bar (right axis)",
     )
 
-    fig.text(0.5, 0.978, f"{n_terms}-term SPLL training — Posterior checkpoints", ha="center", va="top", fontsize=15)
+    fig.text(0.5, 0.978, f"{n_terms}-term SPLL training — Posterior checkpoint intervals", ha="center", va="top", fontsize=15)
     mode_legend = fig.legend(
         handles=mode_handles,
         loc="upper center",
@@ -881,6 +942,232 @@ def _plot_dual_axis_checkpoint_bars(
     mode_legend.set_in_layout(False)
     metric_legend = fig.legend(
         handles=[step_metric_handle, time_metric_handle],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.875),
+        ncol=2,
+        frameon=False,
+        fontsize=8.7,
+        columnspacing=1.8,
+        handletextpad=0.7,
+    )
+    metric_legend.set_in_layout(False)
+
+    fig.subplots_adjust(left=0.09, right=0.91, top=0.80, bottom=0.14)
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
+
+
+def _plot_dual_axis_checkpoint_lookup_bars(
+    *,
+    config: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    run_summaries: List[Dict[str, Any]],
+    n_terms: int,
+    output_path: Path,
+) -> None:
+    term_all_rows = [row for row in rows if int(row["n_terms"]) == int(n_terms)]
+    if not term_all_rows:
+        return
+
+    milestones = sorted({float(row["milestone"]) for row in term_all_rows})
+    mode_names = _mode_order(config)
+    x_positions = list(range(len(milestones)))
+    mode_count = max(1, len(mode_names))
+    bar_width = min(0.8 / mode_count, 0.16)
+    group_width = bar_width * mode_count
+    series: List[Dict[str, Any]] = []
+    max_step_value = 0.0
+    max_lookup_value = 0.0
+    for mode_idx, mode_name in enumerate(mode_names):
+        by_milestone_steps: Dict[float, List[float]] = {}
+        by_milestone_lookups: Dict[float, List[float]] = {}
+        for milestone_idx, milestone in enumerate(milestones):
+            current_rows = _fully_reached_milestone_rows(
+                config,
+                term_all_rows,
+                mode_name=mode_name,
+                milestone=milestone,
+                required_fields=("step", "cumulative_read_mnist_lookup_calls"),
+            )
+            if not current_rows:
+                continue
+
+            current_by_seed = {int(row["seed"]): row for row in current_rows}
+            if milestone_idx == 0:
+                previous_by_seed: Dict[int, Dict[str, Any]] = {}
+            else:
+                previous_milestone = milestones[milestone_idx - 1]
+                previous_rows = _fully_reached_milestone_rows(
+                    config,
+                    term_all_rows,
+                    mode_name=mode_name,
+                    milestone=previous_milestone,
+                    required_fields=("step", "cumulative_read_mnist_lookup_calls"),
+                )
+                if not previous_rows:
+                    continue
+                previous_by_seed = {int(row["seed"]): row for row in previous_rows}
+
+            step_values: List[float] = []
+            lookup_values: List[float] = []
+            for seed in get_seeds(config):
+                current_row = current_by_seed[int(seed)]
+                previous_row = previous_by_seed.get(int(seed))
+                previous_step = float(previous_row["step"]) if previous_row is not None else 0.0
+                previous_lookup = (
+                    float(previous_row["cumulative_read_mnist_lookup_calls"])
+                    if previous_row is not None
+                    else 0.0
+                )
+                step_delta = float(current_row["step"]) - previous_step
+                lookup_delta = float(current_row["cumulative_read_mnist_lookup_calls"]) - previous_lookup
+                if step_delta < 0.0 or lookup_delta < 0.0:
+                    previous_label = 0.0 if milestone_idx == 0 else milestones[milestone_idx - 1]
+                    raise RuntimeError(
+                        "Checkpoint measurements must be cumulative and nondecreasing before "
+                        "interval conversion: "
+                        f"mode={mode_name}, seed={seed}, interval={previous_label:g}-{milestone:g}, "
+                        f"step_delta={step_delta:g}, lookup_delta={lookup_delta:g}."
+                    )
+                step_values.append(step_delta)
+                lookup_values.append(lookup_delta)
+
+            by_milestone_steps[milestone] = step_values
+            by_milestone_lookups[milestone] = lookup_values
+
+        xs: List[float] = []
+        step_means: List[float] = []
+        lookup_means: List[float] = []
+        offset = -group_width / 2.0 + bar_width / 2.0 + mode_idx * bar_width
+        for milestone_idx, milestone in enumerate(milestones):
+            step_values = by_milestone_steps.get(milestone)
+            lookup_values = by_milestone_lookups.get(milestone)
+            if not step_values or not lookup_values:
+                continue
+            step_mean = _mean(step_values)
+            lookup_mean = _mean(lookup_values)
+            if step_mean is None or lookup_mean is None:
+                continue
+            xs.append(float(x_positions[milestone_idx]) + offset)
+            step_means.append(float(step_mean))
+            lookup_means.append(float(lookup_mean))
+            max_step_value = max(max_step_value, float(step_mean))
+            max_lookup_value = max(max_lookup_value, float(lookup_mean))
+
+        if xs:
+            series.append(
+                {
+                    "mode_name": mode_name,
+                    "xs": xs,
+                    "step_means": step_means,
+                    "lookup_means": lookup_means,
+                }
+            )
+
+    if not series or max_step_value <= 0.0 or max_lookup_value <= 0.0:
+        return
+
+    exact_series = next((data for data in series if str(data["mode_name"]) == "exact"), None)
+    lookup_to_steps, left_top = _checkpoint_bar_axis_scaling(
+        max_step_value=max_step_value,
+        max_secondary_value=max_lookup_value,
+        exact_step_means=exact_series["step_means"] if exact_series else [],
+        exact_secondary_means=exact_series["lookup_means"] if exact_series else [],
+    )
+
+    fig, ax = plt.subplots(figsize=(max(A4_PAGE_WIDTH_IN, 9.2, 0.9 * len(milestones) + 3.4), 6.05))
+    ax_right = ax.secondary_yaxis(
+        "right",
+        functions=(
+            lambda step_units: step_units / lookup_to_steps,
+            lambda lookups: lookups * lookup_to_steps,
+        ),
+    )
+
+    mode_handles: List[Any] = []
+    for data in series:
+        mode_name = str(data["mode_name"])
+        mode = _mode_cfg(config, mode_name)
+        bar_colors = dual_axis_bar_colors(
+            mode_name=mode_name,
+            cutoff=mode.get("top_k_cutoff"),
+            fallback_index=mode_names.index(mode_name) if mode_name in mode_names else 0,
+        )
+        base_color = bar_colors["base"]
+        outer_color = bar_colors["outer"]
+        inner_color = bar_colors["inner"]
+        xs = data["xs"]
+        step_means = data["step_means"]
+        lookup_heights = [value * lookup_to_steps for value in data["lookup_means"]]
+
+        ax.bar(
+            xs,
+            step_means,
+            width=bar_width,
+            color=outer_color,
+            edgecolor=base_color,
+            linewidth=1.0,
+            zorder=2,
+        )
+        ax.bar(
+            xs,
+            lookup_heights,
+            width=bar_width * 0.56,
+            color=inner_color,
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.97,
+            zorder=3,
+        )
+        mode_handles.append(
+            Patch(facecolor=inner_color, edgecolor="none", label=_mode_compact_label(config, mode_name))
+        )
+
+    ax.set_ylim(0.0, left_top)
+    ax.set_xlabel("Training true-sum posterior interval")
+    ax.set_ylabel("Steps in interval")
+    ax_right.set_ylabel("Generated readMNist calls in interval")
+    ax.set_xticks(x_positions)
+    interval_starts = [0.0, *milestones[:-1]]
+    ax.set_xticklabels(
+        [
+            f"{_format_milestone_label(start)}–{_format_milestone_label(end)}"
+            for start, end in zip(interval_starts, milestones)
+        ]
+    )
+    ax.grid(True, axis="y", alpha=0.18, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax_right.spines["top"].set_visible(False)
+
+    step_metric_handle = Patch(
+        facecolor=LIGHT_GREY,
+        edgecolor=MID_GREY,
+        linewidth=1.0,
+        label="Steps: outer bar (left axis)",
+    )
+    lookup_metric_handle = Patch(
+        facecolor=MID_GREY,
+        edgecolor="#44515F",
+        linewidth=1.0,
+        label="Lookup count: inner bar (right axis)",
+    )
+
+    fig.text(0.5, 0.978, f"{n_terms}-term SPLL training — Posterior checkpoint intervals (lookups)", ha="center", va="top", fontsize=15)
+    mode_legend = fig.legend(
+        handles=mode_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.94),
+        ncol=max(2, min(4, len(mode_handles))),
+        frameon=False,
+        fontsize=9,
+        columnspacing=1.25,
+        handletextpad=0.55,
+    )
+    mode_legend.set_in_layout(False)
+    metric_legend = fig.legend(
+        handles=[step_metric_handle, lookup_metric_handle],
         loc="upper center",
         bbox_to_anchor=(0.5, 0.875),
         ncol=2,
