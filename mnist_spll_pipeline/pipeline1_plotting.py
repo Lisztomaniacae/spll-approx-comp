@@ -836,421 +836,355 @@ def plot_pareto_tradeoff(
         *,
         title: str = "Runtime–accuracy tradeoff relative to exact inference",
 ) -> None:
+    """Plot runtime and retained accuracy with base-model accuracy collapsed into line style.
+
+    One panel is shown per term count. Speedup and retained accuracy are
+    distinguished only by color. The three base-model accuracy settings are
+    distinguished by line style, with the middle model emphasized. The outer
+    model trajectories also bound a light-to-dark gradient band used only as a
+    readability aid; the legend therefore documents the actual semantic
+    encodings (metric color and base-model line style), not the gradient.
+    """
     if not summary_rows:
         return
 
-    approx_thresholds = positive_cutoff_thresholds(summary_rows, threshold_order)
     model_ids = ordered_model_ids(summary_rows)
-    if not approx_thresholds or not model_ids or not term_counts:
-        return
-
-    tick_values = fixed_cutoff_tick_values(approx_thresholds)
-    include_zero = any(abs(value) < 1e-12 for value in tick_values)
-    all_x_values = [
-        value
-        for row in summary_rows
-        if str(row.get("threshold_label")) in approx_thresholds
-        and (value := cutoff_x_value_for_row(row)) is not None
+    term_counts = sorted({int(value) for value in term_counts})
+    approx_thresholds = [
+        str(label)
+        for label in non_exact_threshold_labels(threshold_order)
+        if any(str(row.get("threshold_label")) == str(label) for row in summary_rows)
     ]
-    if not all_x_values:
+    if not model_ids or not term_counts or not approx_thresholds:
         return
 
+    model_styles = build_model_styles(summary_rows)
     speedup_color = TRADEOFF_COLORS["speedup"]
     accuracy_color = TRADEOFF_COLORS["accuracy"]
-    combined_color = TRADEOFF_COLORS["score"]
     baseline_color = TRADEOFF_COLORS["baseline"]
     positive_zone_color = TRADEOFF_COLORS["positive_zone"]
 
-    nrows = len(model_ids)
-    ncols = len(term_counts)
-    fig, axes_grid = plt.subplots(
-        nrows=nrows,
-        ncols=ncols,
-        figsize=(max(A4_PAGE_WIDTH_IN, 5.2 * ncols), 3.55 * nrows),
-        squeeze=False,
-        constrained_layout=False,
-        sharex=False,
-        sharey=True,
-    )
+    # Preserve the familiar blue/orange metric colors. The gradient endpoints
+    # are only a readability aid between the lowest/highest base-model traces.
+    speedup_band_low = "#9ecae1"
+    speedup_band_high = "#08519c"
+    accuracy_band_low = "#fdae6b"
+    accuracy_band_high = "#a63603"
 
-    right_axes: List[Any] = []
-    model_styles = build_model_styles(summary_rows)
-    row_labels = [model_styles[mid]["label"] for mid in model_ids]
+    # Lowest, middle, highest base-model accuracy. With the experiment's
+    # 50/70/90% models this becomes dashed / solid / dotted respectively.
+    line_style_cycle = ["--", "-", ":"]
+    model_line_styles = {
+        str(model_id): line_style_cycle[min(idx, len(line_style_cycle) - 1)]
+        for idx, model_id in enumerate(model_ids)
+    }
 
-    for row_idx, model_id in enumerate(model_ids):
-        for col_idx, n_terms in enumerate(term_counts):
-            ax = axes_grid[row_idx, col_idx]
-            ax_right = ax.twinx()
-            right_axes.append(ax_right)
+    # Display fixed cutoffs at evenly spaced anchors, while adaptive mass-0.8
+    # points retain their searched numeric cutoff through log interpolation.
+    fixed_cutoffs = [0.0, 0.01, 0.05, 0.1, 0.25]
+    fixed_positions = [0.0, 1.0, 2.0, 3.0, 4.0]
 
-            ax.axhspan(1.0, 1.5, color=positive_zone_color, alpha=0.035, zorder=0)
-            ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.85, zorder=1)
+    def cutoff_display_x(value: float) -> float:
+        value = float(value)
+        if value <= 0.0:
+            return 0.0
+        if value <= 0.01:
+            return value / 0.01
+        if value >= 0.25:
+            return 4.0
+        positive = [0.01, 0.05, 0.1, 0.25]
+        for idx in range(len(positive) - 1):
+            lo = positive[idx]
+            hi = positive[idx + 1]
+            if lo <= value <= hi:
+                log_lo = math.log10(lo)
+                log_hi = math.log10(hi)
+                fraction = (math.log10(value) - log_lo) / (log_hi - log_lo)
+                return float(idx + 1) + float(fraction)
+        return 4.0
 
+    def gradient_fill_between(
+            ax: Any,
+            x_values: np.ndarray,
+            lower_values: np.ndarray,
+            upper_values: np.ndarray,
+            color_low: str,
+            color_high: str,
+            *,
+            alpha: float,
+            steps: int = 28,
+            zorder: float = 1.0,
+    ) -> None:
+        color0 = np.asarray(mcolors.to_rgb(color_low), dtype=float)
+        color1 = np.asarray(mcolors.to_rgb(color_high), dtype=float)
+        for step in range(steps):
+            t0 = float(step) / float(steps)
+            t1 = float(step + 1) / float(steps)
+            band0 = lower_values + t0 * (upper_values - lower_values)
+            band1 = lower_values + t1 * (upper_values - lower_values)
+            midpoint = 0.5 * (t0 + t1)
+            color = color0 * (1.0 - midpoint) + color1 * midpoint
+            ax.fill_between(
+                x_values,
+                band0,
+                band1,
+                color=color,
+                alpha=alpha,
+                linewidth=0.0,
+                zorder=zorder,
+            )
+
+    panel_series: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for model_id in model_ids:
+        for n_terms in term_counts:
             rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
             row_by_label = {str(row["threshold_label"]): row for row in rows}
             exact_row = row_by_label.get("exact")
-
-            speedup_points: List[Dict[str, Any]] = []
-            accuracy_points: List[Dict[str, Any]] = []
-            combined_points: List[Dict[str, Any]] = []
-
             exact_accuracy = finite_float_or_none(exact_row.get("accuracy")) if exact_row is not None else None
-            if exact_accuracy is not None and exact_accuracy > 0.0:
-                for order_idx, label in enumerate(approx_thresholds):
-                    row = row_by_label.get(label)
-                    if row is None:
-                        continue
-                    x_value = cutoff_x_value_for_row(row)
-                    speedup_value = speedup_vs_exact_from_row(row)
-                    accuracy_value = finite_float_or_none(row.get("accuracy"))
-                    if x_value is None or speedup_value is None or accuracy_value is None:
-                        continue
-                    accuracy_retained_pct = 100.0 * float(accuracy_value / exact_accuracy)
-                    common = {
-                        "label": label,
+            if exact_accuracy is None or exact_accuracy <= 0.0:
+                continue
+
+            points: List[Dict[str, Any]] = []
+            for order_idx, label in enumerate(approx_thresholds):
+                row = row_by_label.get(str(label))
+                if row is None:
+                    continue
+                cutoff_value = cutoff_x_value_for_row(row)
+                speedup_value = speedup_vs_exact_from_row(row)
+                accuracy_value = finite_float_or_none(row.get("accuracy"))
+                if cutoff_value is None or speedup_value is None or accuracy_value is None:
+                    continue
+                points.append(
+                    {
+                        "threshold_label": str(label),
+                        "cutoff": float(cutoff_value),
+                        "display_x": cutoff_display_x(float(cutoff_value)),
                         "order_idx": int(order_idx),
-                        "x": float(x_value),
+                        "speedup": float(speedup_value),
+                        "accuracy_retained": 100.0 * float(accuracy_value / exact_accuracy),
                         "adaptive": is_adaptive_threshold_row(row),
                     }
-                    speedup_points.append({**common, "y": float(speedup_value)})
-                    accuracy_points.append({**common, "y": float(accuracy_retained_pct)})
-                    combined_points.append(
-                        {**common, "y": float(0.5 * (float(speedup_value) + accuracy_retained_pct / 100.0))}
-                    )
+                )
 
-            speedup_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
-            accuracy_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
-            combined_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
+            points.sort(key=lambda item: (float(item["cutoff"]), int(item["order_idx"])))
+            if points:
+                panel_series[(str(model_id), int(n_terms))] = {
+                    "points": points,
+                    "line_style": model_line_styles[str(model_id)],
+                    "label": str(model_styles[str(model_id)]["label"]),
+                }
 
-            plot_cutoff_metric_series(
-                ax,
-                speedup_points,
-                color=speedup_color,
-                linewidth=2.0,
-                alpha=0.96,
+    if not panel_series:
+        return
+
+    ncols = len(term_counts)
+    fig, axes = plt.subplots(
+        nrows=1,
+        ncols=ncols,
+        figsize=(max(A4_PAGE_WIDTH_IN, 4.85 * ncols), 5.2),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=False,
+    )
+    axes_row = axes[0]
+
+    for panel_idx, n_terms in enumerate(term_counts):
+        ax = axes_row[panel_idx]
+        ax_right = ax.twinx()
+
+        ax.axhspan(1.0, 1.5, color=positive_zone_color, alpha=0.055, zorder=0)
+        ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.90, zorder=1)
+        ax_right.axhline(100.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.90, zorder=1)
+
+        available_models = [
+            str(model_id)
+            for model_id in model_ids
+            if (str(model_id), int(n_terms)) in panel_series
+        ]
+
+        # Gradient band between the lowest/highest base-model traces. Adaptive
+        # cutoffs differ by model, so interpolate each boundary trajectory onto
+        # the union of their displayed x coordinates before filling.
+        if len(available_models) >= 2:
+            low_points = panel_series[(available_models[0], int(n_terms))]["points"]
+            high_points = panel_series[(available_models[-1], int(n_terms))]["points"]
+            low_x = np.asarray([float(point["display_x"]) for point in low_points], dtype=float)
+            high_x = np.asarray([float(point["display_x"]) for point in high_points], dtype=float)
+            band_x = np.asarray(sorted(set(low_x.tolist() + high_x.tolist())), dtype=float)
+
+            low_speed = np.interp(
+                band_x,
+                low_x,
+                np.asarray([float(point["speedup"]) for point in low_points], dtype=float),
             )
-            plot_cutoff_metric_series(
+            high_speed = np.interp(
+                band_x,
+                high_x,
+                np.asarray([float(point["speedup"]) for point in high_points], dtype=float),
+            )
+            gradient_fill_between(
+                ax,
+                band_x,
+                low_speed,
+                high_speed,
+                speedup_band_low,
+                speedup_band_high,
+                alpha=0.18,
+                zorder=1.2,
+            )
+
+            low_accuracy = np.interp(
+                band_x,
+                low_x,
+                np.asarray([float(point["accuracy_retained"]) for point in low_points], dtype=float),
+            )
+            high_accuracy = np.interp(
+                band_x,
+                high_x,
+                np.asarray([float(point["accuracy_retained"]) for point in high_points], dtype=float),
+            )
+            gradient_fill_between(
                 ax_right,
-                accuracy_points,
+                band_x,
+                low_accuracy,
+                high_accuracy,
+                accuracy_band_low,
+                accuracy_band_high,
+                alpha=0.14,
+                zorder=1.2,
+            )
+
+        for model_idx, model_id in enumerate(available_models):
+            series = panel_series[(model_id, int(n_terms))]
+            points = series["points"]
+            line_style = str(series["line_style"])
+            is_middle_model = model_idx == len(available_models) // 2
+
+            x_values = np.asarray([float(point["display_x"]) for point in points], dtype=float)
+            speed_values = np.asarray([float(point["speedup"]) for point in points], dtype=float)
+            accuracy_values = np.asarray([float(point["accuracy_retained"]) for point in points], dtype=float)
+
+            ax.plot(
+                x_values,
+                speed_values,
+                color=speedup_color,
+                linestyle=line_style,
+                linewidth=3.0 if is_middle_model else 1.9,
+                marker="o",
+                markersize=4.8 if is_middle_model else 4.1,
+                zorder=3 if is_middle_model else 2.2,
+            )
+            ax_right.plot(
+                x_values,
+                accuracy_values,
                 color=accuracy_color,
-                linewidth=2.0,
-                alpha=0.96,
+                linestyle=line_style,
+                linewidth=2.7 if is_middle_model else 1.9,
+                marker="o",
+                markersize=4.2 if is_middle_model else 3.7,
+                zorder=3 if is_middle_model else 2.2,
             )
-            combined_line_start = len(ax.lines)
-            plot_cutoff_metric_series(
-                ax,
-                combined_points,
-                color=combined_color,
-                linewidth=1.7,
-                alpha=0.95,
-            )
-            # Restyle only the newly added combined-score line; keep its markers unchanged.
-            if len(ax.lines) > combined_line_start:
-                ax.lines[-1].set_linestyle("--")
 
-            configure_numeric_cutoff_axis(
-                ax,
-                tick_values=tick_values,
-                point_values=all_x_values,
-                include_zero=include_zero,
-            )
-            ax.set_ylim(0.0, 1.5)
-            ax_right.set_ylim(0.0, 150.0)
-            ax.grid(axis="y", alpha=0.32)
-            ax.grid(axis="x", alpha=0.12)
+            adaptive_points = [point for point in points if bool(point.get("adaptive", False))]
+            for point in adaptive_points:
+                # 25% larger than the previous adaptive-star styling.
+                star_size = 140.0
+                ax.scatter(
+                    [float(point["display_x"])],
+                    [float(point["speedup"])],
+                    marker="*",
+                    s=star_size,
+                    color=speedup_color,
+                    edgecolors="white",
+                    linewidths=0.8,
+                    zorder=5,
+                )
+                ax_right.scatter(
+                    [float(point["display_x"])],
+                    [float(point["accuracy_retained"])],
+                    marker="*",
+                    s=star_size,
+                    color=accuracy_color,
+                    edgecolors="white",
+                    linewidths=0.8,
+                    zorder=5,
+                )
 
+        ax.set_title(f"{int(n_terms)} terms", fontsize=15, pad=10)
+        ax.set_xlim(-0.15, 4.35)
+        ax.set_xticks(fixed_positions)
+        ax.set_xticklabels(["0.0", "1e-2", "5e-2", "0.1", "0.25"])
+        ax.set_xlabel("Cutoff")
+        ax.set_ylim(0.5, 1.5)
+        ax_right.set_ylim(0.0, 200.0)
+        ax.grid(axis="y", alpha=0.24)
+        ax.grid(axis="x", alpha=0.10)
+        ax.set_axisbelow(True)
+
+        if panel_idx == 0:
+            ax.set_ylabel("Speedup", color=speedup_color, fontsize=12)
+            ax.tick_params(axis="y", colors=speedup_color)
             ax.spines["left"].set_color(speedup_color)
             ax.spines["left"].set_linewidth(1.0)
-            ax.tick_params(axis="y", colors=speedup_color)
+            ax.set_yticks([0.5, 1.0, 1.5])
+            ax.set_yticklabels(["0.5", "1.0", "1.5"], color=speedup_color)
+        else:
+            ax.tick_params(axis="y", labelleft=False)
 
-            ax_right.spines["right"].set_color(accuracy_color)
-            ax_right.spines["right"].set_linewidth(1.0)
+        if panel_idx == ncols - 1:
+            ax_right.set_ylabel("Accuracy retained", color=accuracy_color, fontsize=12, rotation=-90, labelpad=20)
             ax_right.tick_params(axis="y", colors=accuracy_color)
-
-            if row_idx == 0:
-                ax.set_title(f"{int(n_terms)} terms", pad=10)
-            if row_idx < nrows - 1:
-                ax.tick_params(axis="x", labelbottom=False)
-            else:
-                ax.set_xlabel("Cutoff")
-
-            if col_idx != 0:
-                ax.tick_params(axis="y", labelleft=False)
-            else:
-                ax.set_yticks([0.0, 0.5, 1.0, 1.5])
-                ax.set_yticklabels(["0", "0.5", "1.0", "1.5"], color=speedup_color)
-
-            if col_idx != ncols - 1:
-                ax_right.tick_params(axis="y", labelright=False, right=False)
-                ax_right.spines["right"].set_visible(False)
-            else:
-                ax_right.set_yticks([0.0, 50.0, 100.0, 150.0])
-                ax_right.set_yticklabels(["0%", "50%", "100%", "150%"], color=accuracy_color)
-
-    legend_handles = [
-        Line2D([0], [0], color=speedup_color, marker="o", markerfacecolor=speedup_color, markeredgecolor="white", linewidth=2.0, markersize=6, label="Speedup"),
-        Line2D([0], [0], color=accuracy_color, marker="o", markerfacecolor=accuracy_color, markeredgecolor="white", linewidth=2.0, markersize=6, label="Accuracy"),
-        Line2D([0], [0], color=combined_color, linestyle="--", linewidth=1.8, label="Mean score"),
-        Line2D([0], [0], color=baseline_color, linestyle="--", linewidth=1.0, label="Exact baseline"),
-        Line2D([0], [0], marker="*", color=TRADEOFF_COLORS["mass_marker"], markerfacecolor=TRADEOFF_COLORS["mass_marker"], markeredgecolor="white", linewidth=0, markersize=12, label="mass 0.8"),
-    ]
-
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.83, bottom=0.10, wspace=0.16, hspace=0.18)
-    fig.suptitle(title, fontsize=16, y=0.955)
-    fig.legend(
-        handles=legend_handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.905),
-        ncol=5,
-        fontsize=8.5,
-        frameon=True,
-        borderpad=0.6,
-        handlelength=2.2,
-        handletextpad=0.6,
-        columnspacing=1.2,
-    )
-
-    fig.text(0.028, 0.515, "Speedup", rotation=90, ha="center", va="center", fontsize=12, color=speedup_color)
-    fig.text(0.972, 0.515, "Accuracy retained", rotation=-90, ha="center", va="center", fontsize=12, color=accuracy_color)
-
-    for row_idx, label in enumerate(row_labels):
-        bbox = axes_grid[row_idx, 0].get_position(fig)
-        y_center = 0.5 * (bbox.y0 + bbox.y1)
-        fig.text(0.060, y_center, label, ha="right", va="center", fontsize=11, color="#333333")
-
-    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.10)
-    plt.close(fig)
-
-
-def plot_mnist_lookup_accuracy_tradeoff(
-        summary_rows: List[Dict[str, Any]],
-        term_counts: Sequence[int],
-        threshold_order: Sequence[str],
-        output_path: Path,
-        *,
-        title: str = "Mean MNIST lookups and accuracy by approximation setting",
-) -> None:
-    """Plot normalized readMNist calls against retained sum accuracy.
-
-    The lookup metric is the mean number of generated ``readMNist``
-    invocations required to enumerate the full posterior, normalized by the
-    exact-inference lookup count for the same model/term-count setting.
-    Under ``precomputed_per_measurement`` these invocations are table lookups,
-    so this figure remains distinct from underlying neural-model evaluations.
-    """
-
-    if not summary_rows:
-        return
-
-    approx_thresholds = [
-        label
-        for label in non_exact_threshold_labels(threshold_order)
-        if any(str(row.get("threshold_label")) == label for row in summary_rows)
-    ]
-    model_ids = ordered_model_ids(summary_rows)
-    if not approx_thresholds or not model_ids or not term_counts:
-        return
-
-    tick_values = fixed_cutoff_tick_values(approx_thresholds)
-    include_zero = any(abs(value) < 1e-12 for value in tick_values)
-    all_x_values = [
-        value
-        for row in summary_rows
-        if str(row.get("threshold_label")) in approx_thresholds
-        and (value := cutoff_x_value_for_row(row)) is not None
-    ]
-    if not all_x_values:
-        return
-
-    lookup_color = TRADEOFF_COLORS["speedup"]
-    accuracy_color = TRADEOFF_COLORS["accuracy"]
-    combined_color = TRADEOFF_COLORS["score"]
-    baseline_color = TRADEOFF_COLORS["baseline"]
-    positive_zone_color = TRADEOFF_COLORS["positive_zone"]
-
-    nrows = len(model_ids)
-    ncols = len(term_counts)
-    fig, axes_grid = plt.subplots(
-        nrows=nrows,
-        ncols=ncols,
-        figsize=(max(A4_PAGE_WIDTH_IN, 5.2 * ncols), 3.55 * nrows),
-        squeeze=False,
-        constrained_layout=False,
-        sharex=False,
-        sharey=True,
-    )
-
-    model_styles = build_model_styles(summary_rows)
-    row_labels = [model_styles[mid]["label"] for mid in model_ids]
-
-    for row_idx, model_id in enumerate(model_ids):
-        for col_idx, n_terms in enumerate(term_counts):
-            ax = axes_grid[row_idx, col_idx]
-            ax_right = ax.twinx()
-
-            # With an inverted lookup-ratio axis, the visually "upper" region
-            # corresponds to ratios below the exact baseline of 1.0.
-            ax.axhspan(0.0, 1.0, color=positive_zone_color, alpha=0.035, zorder=0)
-            ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.85, zorder=1)
-
-            rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
-            row_by_label = {str(row["threshold_label"]): row for row in rows}
-            exact_row = row_by_label.get("exact")
-
-            exact_lookups = (
-                finite_float_or_none(exact_row.get("mean_read_mnist_lookup_calls"))
-                if exact_row is not None
-                else None
-            )
-            exact_accuracy = finite_float_or_none(exact_row.get("accuracy")) if exact_row else None
-
-            lookup_points: List[Dict[str, Any]] = []
-            accuracy_points: List[Dict[str, Any]] = []
-            combined_points: List[Dict[str, Any]] = []
-
-            if (
-                exact_lookups is not None
-                and exact_lookups > 0.0
-                and exact_accuracy is not None
-                and exact_accuracy > 0.0
-            ):
-                for order_idx, label in enumerate(approx_thresholds):
-                    row = row_by_label.get(label)
-                    if row is None:
-                        continue
-                    x_value = cutoff_x_value_for_row(row)
-                    lookup_value = finite_float_or_none(row.get("mean_read_mnist_lookup_calls"))
-                    accuracy_value = finite_float_or_none(row.get("accuracy"))
-                    if x_value is None or lookup_value is None or accuracy_value is None:
-                        continue
-
-                    lookup_ratio = float(lookup_value / exact_lookups)
-                    accuracy_retained = float(100.0 * accuracy_value / exact_accuracy)
-                    mean_score = 0.5 * ((2.0 - lookup_ratio) + accuracy_retained / 100.0)
-                    # Plot the mean score on the inverted lookup-ratio axis by
-                    # mapping its exact baseline back to 1.0 and improved scores
-                    # toward the visually upper region.
-                    mean_score_plot = 2.0 - mean_score
-
-                    common = {
-                        "label": label,
-                        "order_idx": int(order_idx),
-                        "x": float(x_value),
-                        "adaptive": is_adaptive_threshold_row(row),
-                    }
-                    lookup_points.append({**common, "y": lookup_ratio})
-                    accuracy_points.append({**common, "y": accuracy_retained})
-                    combined_points.append({**common, "y": mean_score_plot})
-
-            lookup_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
-            accuracy_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
-            combined_points.sort(key=lambda item: (float(item["x"]), int(item["order_idx"])))
-
-            plot_cutoff_metric_series(
-                ax,
-                lookup_points,
-                color=lookup_color,
-                linewidth=2.0,
-                alpha=0.96,
-            )
-            plot_cutoff_metric_series(
-                ax_right,
-                accuracy_points,
-                color=accuracy_color,
-                linewidth=2.0,
-                alpha=0.96,
-            )
-            combined_line_start = len(ax.lines)
-            plot_cutoff_metric_series(
-                ax,
-                combined_points,
-                color=combined_color,
-                linewidth=1.7,
-                alpha=0.95,
-            )
-            if len(ax.lines) > combined_line_start:
-                ax.lines[-1].set_linestyle("--")
-
-            ax_right.axhline(
-                100.0,
-                color=accuracy_color,
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.62,
-                zorder=1,
-            )
-
-            configure_numeric_cutoff_axis(
-                ax,
-                tick_values=tick_values,
-                point_values=all_x_values,
-                include_zero=include_zero,
-            )
-
-            ax.set_ylim(2.0, 0.0)
-            ax_right.set_ylim(0.0, 200.0)
-            ax.grid(axis="y", alpha=0.32)
-            ax.grid(axis="x", alpha=0.12)
-
-            ax.spines["left"].set_color(lookup_color)
-            ax.spines["left"].set_linewidth(1.0)
-            ax.tick_params(axis="y", colors=lookup_color)
-
             ax_right.spines["right"].set_visible(True)
             ax_right.spines["right"].set_color(accuracy_color)
             ax_right.spines["right"].set_linewidth(1.0)
-            ax_right.tick_params(axis="y", colors=accuracy_color)
+            ax_right.set_yticks([0.0, 50.0, 100.0, 150.0, 200.0])
+            ax_right.set_yticklabels(["0%", "50%", "100%", "150%", "200%"], color=accuracy_color)
+        else:
+            ax_right.tick_params(axis="y", labelright=False, right=False)
+            ax_right.spines["right"].set_visible(False)
 
-            if row_idx == 0:
-                ax.set_title(f"{int(n_terms)} terms", pad=10)
-            if row_idx < nrows - 1:
-                ax.tick_params(axis="x", labelbottom=False)
-            else:
-                ax.set_xlabel("Cutoff")
-
-            if col_idx != 0:
-                ax.tick_params(axis="y", labelleft=False)
-            else:
-                ax.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0])
-                ax.set_yticklabels(["0", "0.5", "1.0", "1.5", "2.0"], color=lookup_color)
-
-            if col_idx != ncols - 1:
-                ax_right.tick_params(axis="y", labelright=False, right=False)
-                ax_right.spines["right"].set_visible(False)
-            else:
-                ax_right.set_yticks([0.0, 50.0, 100.0, 150.0, 200.0])
-                ax_right.set_yticklabels(["0%", "50%", "100%", "150%", "200%"], color=accuracy_color)
-
-    legend_handles = [
+    metric_handles = [
         Line2D(
             [0],
             [0],
-            color=lookup_color,
+            color=speedup_color,
+            linewidth=2.6,
             marker="o",
-            markerfacecolor=lookup_color,
-            markeredgecolor="white",
-            linewidth=2.0,
-            markersize=6,
-            label="Normalized MNIST lookups",
+            markersize=4.8,
+            label="Speedup",
         ),
         Line2D(
             [0],
             [0],
             color=accuracy_color,
+            linewidth=2.4,
             marker="o",
-            markerfacecolor=accuracy_color,
-            markeredgecolor="white",
-            linewidth=2.0,
-            markersize=6,
+            markersize=4.2,
             label="Accuracy retained",
         ),
+    ]
+    model_handles = [
         Line2D(
             [0],
             [0],
-            color=combined_color,
-            linestyle="--",
-            linewidth=1.8,
-            label="Mean score",
+            color="#444444",
+            linewidth=2.2,
+            linestyle=model_line_styles[str(model_id)],
+            label=str(model_styles[str(model_id)]["label"]),
+        )
+        for model_id in model_ids
+    ]
+    reference_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="#555555",
+            marker="*",
+            markerfacecolor="#555555",
+            markeredgecolor="white",
+            linewidth=0.0,
+            markersize=12.0,
+            label="mass 0.8",
         ),
         Line2D(
             [0],
@@ -1260,61 +1194,398 @@ def plot_mnist_lookup_accuracy_tradeoff(
             linewidth=1.0,
             label="Exact baseline",
         ),
+    ]
+
+    fig.suptitle(title, fontsize=18, y=0.98)
+    fig.legend(
+        handles=metric_handles + model_handles + reference_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.93),
+        ncol=len(metric_handles) + len(model_handles) + len(reference_handles),
+        fontsize=9.2,
+        frameon=True,
+        fancybox=False,
+        framealpha=1.0,
+        edgecolor="#c0c0c0",
+        borderpad=0.45,
+        handlelength=2.0,
+        handletextpad=0.45,
+        columnspacing=1.0,
+    )
+    fig.subplots_adjust(left=0.07, right=0.93, bottom=0.15, top=0.76, wspace=0.16)
+
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
+
+
+def plot_mnist_lookup_accuracy_tradeoff(
+        summary_rows: List[Dict[str, Any]],
+        term_counts: Sequence[int],
+        threshold_order: Sequence[str],
+        output_path: Path,
+        *,
+        title: str = "MNIST lookup–accuracy tradeoff relative to exact inference",
+) -> None:
+    """Plot exact-normalized MNIST lookup cost against retained accuracy.
+
+    The three standard base-model accuracy levels are collapsed into each term
+    panel.  Metric identity is encoded by color (blue lookup ratio, orange
+    retained accuracy), while base-model accuracy is encoded consistently by
+    line style (50% dashed, 70% solid, 90% dotted).  The translucent gradients
+    between the 50% and 90% fixed-cutoff trajectories are only a readability
+    aid; the actual model identity remains the line style.
+
+    Adaptive ``mass 0.8`` points are positioned at their searched numerical
+    cutoff and are connected into their corresponding model trajectory.  They
+    are excluded from the gradient band because the searched cutoff can differ
+    across base models.
+    """
+    if not summary_rows:
+        return
+
+    model_ids = ordered_model_ids(summary_rows)
+    if not model_ids or not term_counts:
+        return
+
+    # This thesis-facing plot is intentionally specialized to the three
+    # standard base-model accuracy levels used by Pipeline I.
+    model_by_pct: Dict[int, str] = {}
+    for model_id in model_ids:
+        label = str(build_model_styles(summary_rows)[model_id]["label"])
+        for pct in (50, 70, 90):
+            if label.startswith(f"{pct}%"):
+                model_by_pct[pct] = model_id
+                break
+    if any(pct not in model_by_pct for pct in (50, 70, 90)):
+        return
+
+    approx_thresholds = [
+        label
+        for label in non_exact_threshold_labels(threshold_order)
+        if any(str(row.get("threshold_label")) == label for row in summary_rows)
+    ]
+    if not approx_thresholds:
+        return
+
+    # Fixed cutoff anchors are shown with equal visual spacing, matching the
+    # accepted runtime–accuracy template.  Adaptive cutoffs are interpolated
+    # between those anchors using their actual searched numerical value.
+    fixed_values = fixed_cutoff_tick_values(approx_thresholds)
+    if not fixed_values:
+        return
+    if not any(abs(value) < 1e-12 for value in fixed_values):
+        fixed_values = [0.0, *fixed_values]
+    fixed_values = sorted({round(float(value), 12) for value in fixed_values})
+    fixed_positions = {value: float(index) for index, value in enumerate(fixed_values)}
+    positive_fixed = [value for value in fixed_values if value > 0.0]
+
+    def plot_x(cutoff_value: float) -> float:
+        value = max(0.0, float(cutoff_value))
+        rounded = round(value, 12)
+        if rounded in fixed_positions:
+            return fixed_positions[rounded]
+        if not positive_fixed:
+            return 0.0
+        first = positive_fixed[0]
+        if value <= first:
+            first_pos = fixed_positions[first]
+            return first_pos * (value / first)
+        last = positive_fixed[-1]
+        if value >= last:
+            return fixed_positions[last]
+        for left, right in zip(positive_fixed[:-1], positive_fixed[1:]):
+            if left <= value <= right:
+                left_pos = fixed_positions[left]
+                right_pos = fixed_positions[right]
+                log_left = math.log10(left)
+                log_right = math.log10(right)
+                log_value = math.log10(value)
+                fraction = (log_value - log_left) / (log_right - log_left)
+                return left_pos + fraction * (right_pos - left_pos)
+        return fixed_positions[last]
+
+    lookup_color = TRADEOFF_COLORS["speedup"]
+    accuracy_color = TRADEOFF_COLORS["accuracy"]
+    baseline_color = TRADEOFF_COLORS["baseline"]
+    positive_zone_color = TRADEOFF_COLORS["positive_zone"]
+
+    # Same visual family as the accepted runtime–accuracy template.
+    lookup_band_low = "#9ecae1"
+    lookup_band_high = "#08519c"
+    accuracy_band_low = "#fdae6b"
+    accuracy_band_high = "#a63603"
+    model_linestyles = {50: "--", 70: "-", 90: ":"}
+    model_linewidths = {50: 1.9, 70: 3.0, 90: 1.9}
+    model_markersizes = {50: 4.1, 70: 4.8, 90: 4.1}
+    adaptive_sizes = {50: 115.0, 70: 140.0, 90: 115.0}
+
+    def gradient_band(
+            ax: Any,
+            x_values: Sequence[float],
+            start_values: Sequence[float],
+            end_values: Sequence[float],
+            start_color: str,
+            end_color: str,
+            *,
+            alpha: float,
+            steps: int = 28,
+    ) -> None:
+        x_array = np.asarray(x_values, dtype=float)
+        start_array = np.asarray(start_values, dtype=float)
+        end_array = np.asarray(end_values, dtype=float)
+        if x_array.size < 2 or start_array.size != x_array.size or end_array.size != x_array.size:
+            return
+        color_start = np.asarray(mcolors.to_rgb(start_color), dtype=float)
+        color_end = np.asarray(mcolors.to_rgb(end_color), dtype=float)
+        for step in range(steps):
+            t0 = step / steps
+            t1 = (step + 1) / steps
+            lower = start_array + t0 * (end_array - start_array)
+            upper = start_array + t1 * (end_array - start_array)
+            midpoint = 0.5 * (t0 + t1)
+            color = (1.0 - midpoint) * color_start + midpoint * color_end
+            ax.fill_between(
+                x_array,
+                lower,
+                upper,
+                color=color,
+                alpha=alpha,
+                linewidth=0.0,
+                zorder=1,
+            )
+
+    def series_for(model_id: str, n_terms: int) -> List[Dict[str, Any]]:
+        rows = sorted_group_rows(get_rows(summary_rows, model_id, n_terms), threshold_order)
+        row_by_label = {str(row["threshold_label"]): row for row in rows}
+        exact_row = row_by_label.get("exact")
+        if exact_row is None:
+            return []
+        exact_lookups = finite_float_or_none(exact_row.get("mean_read_mnist_lookup_calls"))
+        exact_accuracy = finite_float_or_none(exact_row.get("accuracy"))
+        if exact_lookups is None or exact_lookups <= 0.0 or exact_accuracy is None or exact_accuracy <= 0.0:
+            return []
+
+        points: List[Dict[str, Any]] = []
+        for order_idx, label in enumerate(approx_thresholds):
+            row = row_by_label.get(label)
+            if row is None:
+                continue
+            cutoff_value = cutoff_x_value_for_row(row)
+            lookup_value = finite_float_or_none(row.get("mean_read_mnist_lookup_calls"))
+            accuracy_value = finite_float_or_none(row.get("accuracy"))
+            if cutoff_value is None or lookup_value is None or accuracy_value is None:
+                continue
+            points.append(
+                {
+                    "label": str(label),
+                    "cutoff": float(cutoff_value),
+                    "x": plot_x(float(cutoff_value)),
+                    "lookup_ratio": float(lookup_value / exact_lookups),
+                    "accuracy_retained": float(100.0 * accuracy_value / exact_accuracy),
+                    "adaptive": is_adaptive_threshold_row(row),
+                    "order_idx": int(order_idx),
+                }
+            )
+        points.sort(key=lambda item: (float(item["cutoff"]), int(item["order_idx"])))
+        return points
+
+    fig, axes = plt.subplots(
+        1,
+        len(term_counts),
+        figsize=(max(A4_PAGE_WIDTH_IN, 4.9 * len(term_counts)), 5.2),
+        squeeze=False,
+        constrained_layout=False,
+        sharey=True,
+    )
+    panel_axes = list(axes[0])
+    fig.subplots_adjust(left=0.07, right=0.93, bottom=0.15, top=0.76, wspace=0.16)
+    fig.suptitle(title, fontsize=18, y=0.98)
+
+    right_axes: List[Any] = []
+    for panel_idx, (ax, n_terms) in enumerate(zip(panel_axes, term_counts)):
+        ax_right = ax.twinx()
+        right_axes.append(ax_right)
+
+        # Lookup ratio is inverted so fewer lookups appear upward.  The upper
+        # half therefore represents an improvement over the exact ratio of 1.
+        ax.axhspan(0.0, 1.0, color=positive_zone_color, alpha=0.055, zorder=0)
+        ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.9, zorder=1)
+        ax_right.axhline(100.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.9, zorder=1)
+
+        panel_series = {
+            pct: series_for(model_by_pct[pct], int(n_terms))
+            for pct in (50, 70, 90)
+        }
+
+        # Readability gradient uses fixed cutoffs only.  Adaptive mass points
+        # have model-specific searched cutoffs and therefore should not define
+        # a common envelope.
+        fixed_band_rows: Dict[int, Dict[float, Dict[str, Any]]] = {}
+        for pct in (50, 90):
+            fixed_band_rows[pct] = {
+                round(float(point["cutoff"]), 12): point
+                for point in panel_series[pct]
+                if not bool(point["adaptive"])
+            }
+        common_fixed = sorted(set(fixed_band_rows[50]) & set(fixed_band_rows[90]))
+        if len(common_fixed) >= 2:
+            band_x = [plot_x(value) for value in common_fixed]
+            gradient_band(
+                ax,
+                band_x,
+                [fixed_band_rows[50][value]["lookup_ratio"] for value in common_fixed],
+                [fixed_band_rows[90][value]["lookup_ratio"] for value in common_fixed],
+                lookup_band_low,
+                lookup_band_high,
+                alpha=0.18,
+            )
+            gradient_band(
+                ax_right,
+                band_x,
+                [fixed_band_rows[50][value]["accuracy_retained"] for value in common_fixed],
+                [fixed_band_rows[90][value]["accuracy_retained"] for value in common_fixed],
+                accuracy_band_low,
+                accuracy_band_high,
+                alpha=0.14,
+            )
+
+        for pct in (50, 70, 90):
+            points = panel_series[pct]
+            if not points:
+                continue
+            x_values = [float(point["x"]) for point in points]
+            lookup_values = [float(point["lookup_ratio"]) for point in points]
+            accuracy_values = [float(point["accuracy_retained"]) for point in points]
+            linestyle = model_linestyles[pct]
+            linewidth = model_linewidths[pct]
+            marker_size = model_markersizes[pct]
+
+            ax.plot(
+                x_values,
+                lookup_values,
+                color=lookup_color,
+                linewidth=linewidth,
+                linestyle=linestyle,
+                marker="o",
+                markersize=marker_size,
+                zorder=3 if pct == 70 else 2.2,
+            )
+            ax_right.plot(
+                x_values,
+                accuracy_values,
+                color=accuracy_color,
+                linewidth=2.7 if pct == 70 else 1.9,
+                linestyle=linestyle,
+                marker="o",
+                markersize=4.2 if pct == 70 else 3.7,
+                zorder=3 if pct == 70 else 2.2,
+            )
+
+            adaptive_points = [point for point in points if bool(point["adaptive"])]
+            if adaptive_points:
+                ax.scatter(
+                    [float(point["x"]) for point in adaptive_points],
+                    [float(point["lookup_ratio"]) for point in adaptive_points],
+                    marker="*",
+                    s=adaptive_sizes[pct],
+                    color=lookup_color,
+                    edgecolors="white",
+                    linewidths=0.8,
+                    zorder=5,
+                )
+                ax_right.scatter(
+                    [float(point["x"]) for point in adaptive_points],
+                    [float(point["accuracy_retained"]) for point in adaptive_points],
+                    marker="*",
+                    s=adaptive_sizes[pct],
+                    color=accuracy_color,
+                    edgecolors="white",
+                    linewidths=0.8,
+                    zorder=5,
+                )
+
+        ax.set_title(f"{int(n_terms)} terms", fontsize=15, pad=10)
+        ax.set_xlim(-0.15, float(len(fixed_values) - 1) + 0.35)
+        ax.set_xticks([fixed_positions[value] for value in fixed_values])
+        ax.set_xticklabels([format_cutoff_axis_value(value) for value in fixed_values])
+        ax.set_ylim(2.0, 0.0)
+        ax_right.set_ylim(0.0, 200.0)
+        ax.grid(axis="y", alpha=0.24)
+        ax.grid(axis="x", alpha=0.10)
+        ax.set_axisbelow(True)
+        ax.set_xlabel("Cutoff", fontsize=12)
+
+        if panel_idx == 0:
+            ax.set_ylabel("MNIST lookup ratio", color=lookup_color, fontsize=12)
+            ax.tick_params(axis="y", colors=lookup_color)
+            ax.spines["left"].set_color(lookup_color)
+            ax.spines["left"].set_linewidth(1.0)
+            ax.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0])
+            ax.set_yticklabels(["0", "0.5", "1.0", "1.5", "2.0"], color=lookup_color)
+        else:
+            ax.tick_params(axis="y", labelleft=False)
+
+        if panel_idx == len(term_counts) - 1:
+            ax_right.set_ylabel("Accuracy retained", color=accuracy_color, fontsize=12, rotation=-90, labelpad=20)
+            ax_right.tick_params(axis="y", colors=accuracy_color)
+            ax_right.spines["right"].set_visible(True)
+            ax_right.spines["right"].set_color(accuracy_color)
+            ax_right.spines["right"].set_linewidth(1.0)
+            ax_right.set_yticks([0.0, 50.0, 100.0, 150.0, 200.0])
+            ax_right.set_yticklabels(["0%", "50%", "100%", "150%", "200%"], color=accuracy_color)
+        else:
+            ax_right.tick_params(axis="y", labelright=False, right=False)
+            ax_right.spines["right"].set_visible(False)
+
+    legend_handles = [
         Line2D(
             [0],
             [0],
+            color=lookup_color,
+            linewidth=2.6,
+            marker="o",
+            markersize=4.8,
+            label="MNIST lookups",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color=accuracy_color,
+            linewidth=2.4,
+            marker="o",
+            markersize=4.2,
+            label="Accuracy retained",
+        ),
+        Line2D([0], [0], color="#444444", linewidth=2.2, linestyle=model_linestyles[50], label="50%"),
+        Line2D([0], [0], color="#444444", linewidth=2.2, linestyle=model_linestyles[70], label="70%"),
+        Line2D([0], [0], color="#444444", linewidth=2.2, linestyle=model_linestyles[90], label="90%"),
+        Line2D(
+            [0],
+            [0],
+            color="#555555",
+            linewidth=0.0,
             marker="*",
-            color=TRADEOFF_COLORS["mass_marker"],
-            markerfacecolor=TRADEOFF_COLORS["mass_marker"],
-            markeredgecolor="white",
-            linewidth=0,
-            markersize=12,
+            markersize=15,
             label="mass 0.8",
         ),
+        Line2D([0], [0], color=baseline_color, linewidth=1.0, linestyle="--", label="Exact baseline"),
     ]
-
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.83, bottom=0.10, wspace=0.16, hspace=0.18)
-    fig.suptitle(title, fontsize=16, y=0.955)
     fig.legend(
         handles=legend_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.905),
-        ncol=5,
-        fontsize=8.5,
+        bbox_to_anchor=(0.5, 0.93),
+        ncol=7,
         frameon=True,
-        borderpad=0.6,
-        handlelength=2.2,
-        handletextpad=0.6,
-        columnspacing=1.2,
+        fancybox=False,
+        edgecolor="#c0c0c0",
+        framealpha=1.0,
+        borderpad=0.45,
+        handlelength=2.0,
+        columnspacing=1.0,
+        handletextpad=0.45,
     )
 
-    fig.text(
-        0.028,
-        0.515,
-        "Mean generated readMNist calls / exact",
-        rotation=90,
-        ha="center",
-        va="center",
-        fontsize=12,
-        color=lookup_color,
-    )
-    fig.text(
-        0.972,
-        0.515,
-        "Accuracy retained",
-        rotation=-90,
-        ha="center",
-        va="center",
-        fontsize=12,
-        color=accuracy_color,
-    )
-
-    for row_idx, label in enumerate(row_labels):
-        bbox = axes_grid[row_idx, 0].get_position(fig)
-        y_center = 0.5 * (bbox.y0 + bbox.y1)
-        fig.text(0.060, y_center, label, ha="right", va="center", fontsize=11, color="#333333")
-
-    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.10)
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
 
 
@@ -1536,8 +1807,9 @@ def plot_accuracy_delta_vs_cutoff(
             value = finite_float_or_none(row.get(key))
             if value is not None:
                 all_bounds.append(100.0 * float(value))
-    max_abs_delta = max(5.0, max((abs(value) for value in all_bounds), default=5.0))
-    ylim = (-1.15 * max_abs_delta, 1.15 * max_abs_delta)
+    min_delta = min(all_bounds, default=-5.0)
+    y_lower = min(-5.0, 1.10 * min_delta if min_delta < 0.0 else -5.0)
+    ylim = (y_lower, 5.0)
 
     nrows, ncols = term_panel_grid(term_counts)
     fig, axes_grid = plt.subplots(
