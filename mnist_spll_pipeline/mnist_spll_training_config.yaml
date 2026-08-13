@@ -1,10 +1,10 @@
 seed: 42
-seeds: [42, 43, 44, 45, 46]
+seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 show_progress: true
 
 paths:
   data_root: ./data
-  output_root: ./outputs/spll_training
+  output_root: ./outputs/spll_training_direct_uncached
   repo_root: ../haskell-dppl-main
 
 data:
@@ -15,9 +15,6 @@ data:
   normalize:
     mean: 0.1307
     std: 0.3081
-  image_cache_device: device   # device | cpu
-  image_cache_strategy: none    # none | lru
-  image_cache_max_items: 4096
 
 model:
   input_channels: 1
@@ -26,7 +23,11 @@ model:
   kernel_size: 3
   pool_kernel: 2
   fc_hidden: 128
-  dropout: 0.25
+  # Direct generated readMNist calls may revisit the same image many times
+  # inside one symbolic inference. Dropout must therefore be disabled so
+  # readMNist remains a deterministic function of image + current parameters
+  # and pruning does not change the RNG stream seen by the classifier.
+  dropout: 0.0
 
 optimizer:
   learning_rate: 0.001
@@ -38,7 +39,7 @@ training:
   # Number of SPLL sum cases accumulated into one optimizer update.
   # The redesigned benchmark uses batch=1 so one training step is one iteration.
   sum_batch_size: 1
-  max_steps: 10000     # fixed training iterations / sum cases; no early stopping
+  max_steps: 4000     # fixed training iterations / sum cases; no early stopping
   loss_epsilon: 1.0e-12
 
 checkpointing:
@@ -48,7 +49,7 @@ checkpointing:
   enabled: true
   metric: true_sum_posterior
   posterior_thresholds: [0.2, 0.4, 0.6, 0.8]
-  rolling_window_updates: 50
+  rolling_window_updates: 100
   rolling_window_policy: full
 
 schedule:
@@ -65,16 +66,6 @@ checkpoint_transfer:
   mode_names: null
   include_final_checkpoint: true
 
-adaptive_top_k:
-  # Adaptive approximate modes tune the generated artifact's mutable TOP_K_CUTOFF
-  # so the full posterior keeps about this much unnormalised mass.
-  posterior_mass_target: 0.8
-  probe_cases: 20
-  max_iterations: 14
-  tolerance: 0.02
-  min_cutoff: 0.0
-  max_cutoff: 1.0
-
 visualization:
   trace_smoothing_window_points: 100
   # Across-seed uncertainty shown in milestone error bars and smoothed traces.
@@ -90,15 +81,11 @@ visualization:
 experiments:
   - n_terms: 2
     enabled: true
-    max_steps: 2500
+    max_steps: 4000
 
 inference_modes:
   - name: exact
     top_k_cutoff: null
-  # - name: approx_mass_0p8
-  #   top_k_cutoff: auto
-  #   adaptive_top_k: true
-  #   posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
   - name: approx_0p05

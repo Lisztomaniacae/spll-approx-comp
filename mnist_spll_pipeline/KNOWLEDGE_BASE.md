@@ -70,7 +70,7 @@ The dispatcher lazy-loads only the selected stage module through `pipeline_suppo
 | `pipeline1_plotting.py` | Pipeline I figures | Contains the live plot constructors. |
 | `visualize_results.py` | Pipeline I visualization coordinator | Connects analysis, tables, and plots. |
 | `pipeline2_config.py`, `pipeline2_data.py`, `pipeline2_artifacts.py` | Pipeline II setup boundaries | Configuration/paths, split/schedule/model setup, and compile/load behavior. |
-| `pipeline2_runtime.py`, `pipeline2_adaptive.py` | Pipeline II training primitives | Differentiable callback/cache/runtime code and deterministic adaptive cutoff search. |
+| `pipeline2_runtime.py` | Pipeline II training primitives | Differentiable direct-uncached callback/runtime code and model-evaluation accounting. |
 | `pipeline2_checkpoint_transfer.py` | Pipeline II checkpoint transfer | Selects aggregate exact anchors and runs approximate transfer segments. |
 | `train_spll_generated.py` | Pipeline II training coordinator | Active fixed-budget experiment loop; obsolete asynchronous validation machinery was removed. |
 | `pipeline2_analysis.py`, `pipeline2_plotting.py`, `visualize_spll_training.py` | Pipeline II visualization | Aggregation, plot construction, and orchestration. |
@@ -756,7 +756,7 @@ Avoid creating GitHub issues or PRs unless the user explicitly asks. If asked fo
 | Approximate | SPLL compilation/inference with numeric pruning threshold passed via `-k`. |
 | `0.0` cutoff | Approximate code path with zero cutoff; useful for overhead comparison, not identical to exact. |
 | Global cutoff | Current accumulated global path-mass pruning mode; fixed pipeline policy. |
-| Adaptive top-k / posterior-mass mode | Pipeline I threshold spec or Pipeline II inference mode that mutates generated `TOP_K_CUTOFF` to target a configured surviving posterior mass, defaulting to `0.8`. |
+| Adaptive top-k / posterior-mass mode | Pipeline I threshold spec that mutates generated `TOP_K_CUTOFF` to target a configured surviving posterior mass, defaulting to `0.8`. |
 | Runtime top-k cutoff | The selected mutable `TOP_K_CUTOFF` value used by an adaptive mode for the current model snapshot. |
 | Candidate sum | One possible output sum from `0` to `9 * n_terms`. |
 | Full posterior | Querying every candidate sum for one staged experiment. |
@@ -786,7 +786,7 @@ Pipeline II uses the fixed-budget training path only. The obsolete asynchronous 
 
 Pipeline II rotates inference-mode run order by seed/experiment index instead of always running exact first. Run summaries record `mode_order_position`, `mode_order_offset`, and `run_order_index` so thermal/cache/load-order effects can be audited later.
 
-The generated SPLL Python artifact is part of the gradient path. Do not replace it with a hand-written torch-native semantic equivalent for Pipeline II experiments. Batched training keeps the generated artifact as the source of truth: it precomputes differentiable MNIST softmax rows for all unique image indices in the batch, installs a temporary `readMNist(index)` lookup backed by those tensors, and still calls the generated SPLL `main.forward(...)` once per scalar sum case. The lookup tensors must remain attached to the current autograd graph.
+The generated SPLL Python artifact is part of the gradient path. Do not replace it with a hand-written torch-native semantic equivalent for Pipeline II experiments. Every generated `readMNist(index)` call executes the MNIST CNN directly and remains attached to the current autograd graph; no per-batch neural-probability precomputation or application-level lookup/cache is allowed in the Pipeline II benchmark path.
 
 ### 14.2 Pipeline II files
 
@@ -798,7 +798,7 @@ The generated SPLL Python artifact is part of the gradient path. Do not replace 
 | `prepare_spll_training.py` | Creates the balanced split, schedule manifests/previews, and shared initial checkpoints. |
 | `compile_spll_training.py` | Writes SPLL source programs and compiles generated Python artifacts per arity/mode. |
 | `pipeline2_config.py`, `pipeline2_data.py`, `pipeline2_artifacts.py` | Configuration/paths, dataset/schedule, and generated-artifact boundaries. |
-| `pipeline2_runtime.py`, `pipeline2_adaptive.py` | Differentiable runtime primitives and adaptive cutoff search. |
+| `pipeline2_runtime.py` | Differentiable direct-uncached `readMNist` runtime primitives. |
 | `pipeline2_checkpoint_transfer.py` | Aggregate exact checkpoint selection and approximate transfer segments. |
 | `train_spll_generated.py` | Coordinates fixed-budget training through generated SPLL artifacts. |
 | `pipeline2_analysis.py`, `pipeline2_plotting.py`, `visualize_spll_training.py` | Aggregation, figure construction, and visualization orchestration. |
@@ -836,22 +836,12 @@ Within one sum case, repeated digits must use distinct MNIST image indices. Acro
 
 ### 14.5 Exact and approximate modes
 
-Current Pipeline II modes include both fixed-cutoff and adaptive-posterior-mass approximation:
+Pipeline II intentionally supports only exact inference and fixed numeric cutoffs:
 
 ```yaml
-adaptive_top_k:
-  posterior_mass_target: 0.8
-  probe_cases: 20
-  max_iterations: 14
-  tolerance: 0.02
-
 inference_modes:
   - name: exact
     top_k_cutoff: null
-  - name: approx_mass_0p8
-    top_k_cutoff: auto
-    adaptive_top_k: true
-    posterior_mass_target: 0.8
   - name: approx_0p01
     top_k_cutoff: 0.01
   - name: approx_0p05
@@ -860,17 +850,19 @@ inference_modes:
     top_k_cutoff: 0.1
 ```
 
-`exact` means true exact compilation without `-k`. Fixed numeric modes compile and run with that numeric threshold. Adaptive modes compile through the approximate code path using `-k 0.0` as the seed artifact, then mutate the generated module-level `TOP_K_CUTOFF` at runtime. The target is the mean unnormalised posterior mass that survives pruning when the validator enumerates all candidate sums.
+`exact` means true exact compilation without `-k`. Each numeric approximate mode is separately compiled and run with that fixed threshold. Adaptive posterior-mass cutoff selection has been removed from Pipeline II and remains a Pipeline I feature. Pipeline II config validation rejects adaptive cutoff fields so a thesis run cannot silently reintroduce that experimental axis.
 
-Adaptive cutoff search is deterministic bounded monotone bisection, not simulated annealing. This was chosen because increasing `TOP_K_CUTOFF` should only prune more branch mass, so a one-dimensional bounded search is faster, reproducible, and easier to defend experimentally. In the redesigned benchmark, the search uses deterministic train-pool probe cases from the current model snapshot, stores the selected runtime cutoff in traces/summaries, and refreshes the trainer cutoff at preflight and final bookkeeping.
+Every generated `readMNist(index)` call in Pipeline II executes a fresh model evaluation. `DirectReadMNIST` obtains the MNIST sample from the dataset, moves it to the training device, runs the CNN, and returns the attached softmax row. It does not cache image tensors, precompute per-batch digit probabilities, memoize outputs, or share model results between generated calls. The trace records both generated `readMnist` call count and underlying model-evaluation count and requires them to match exactly. This is what allows a pruned branch to save the neural computation that the generated program actually skips.
 
-Branch counting is enabled by default as sanity metadata. The loss uses only the probability component of the generated return value.
+The default Pipeline II model sets dropout to `0.0`. Generated inference can revisit the same image multiple times while enumerating latent digit assignments; active training dropout would otherwise make those repeated calls return different digit distributions and would make pruning change how much classifier RNG is consumed. Disabling dropout keeps `readMNist` deterministic for fixed model parameters and input within a symbolic query, isolating the inference-mode difference. Pipeline II validation rejects nonzero dropout for this benchmark path.
+
+Branch counting is optional sanity metadata. The loss uses only the probability component of the generated return value.
 
 A fully pruned true-sum path may return a literal Python `0.0` from the generated artifact instead of a tensor. Pipeline II treats this as a legitimate zero-mass pruning event, converts it to a model-connected zero tensor for `-log(epsilon)` training, logs `zero_true_mass=1`, and produces a zero-gradient optimizer step. Nonzero scalar probabilities are still invalid because they would indicate a detached generated-artifact path.
 
 ### 14.6 Posterior checkpoints, traces, and fixed-budget stopping
 
-Pipeline II trains from sum labels only. The default benchmark no longer uses task-level validation accuracy milestones. Instead, after all pure exact seeds finish, the pipeline computes aggregate exact checkpoints by averaging the exact training `p(true_sum)` trace across seeds, applying a strict full-window rolling mean over `checkpointing.rolling_window_updates` (default 50), and finding crossings of `checkpointing.posterior_thresholds`. The first 50-point rolling value is emitted only after 50 updates; shorter prefix windows are not used. These aggregate checkpoints are the source of truth for checkpoint-transfer segments.
+Pipeline II trains from sum labels only. The default benchmark no longer uses task-level validation accuracy milestones. Instead, after all pure exact seeds finish, the pipeline computes aggregate exact checkpoints by averaging the exact training `p(true_sum)` trace across seeds, applying a strict full-window rolling mean over `checkpointing.rolling_window_updates` (default 100), and finding crossings of `checkpointing.posterior_thresholds`. The first 100-point rolling value is emitted only after 100 updates; shorter prefix windows are not used. These aggregate checkpoints are the source of truth for checkpoint-transfer segments.
 
 Training stops only at the configured fixed `max_steps`. Loss and true-sum posterior are logged in `train_trace.csv` and are the primary comparison metrics. Pure exact runs also save step checkpoints under `checkpoints/steps/` so aggregate checkpoint starts can be loaded exactly for each seed. Per-run `posterior_checkpoints.json` and `milestones.json` remain as compatibility/diagnostic outputs, but checkpoint-transfer uses `aggregate_checkpoints/terms_*_exact_posterior_checkpoints.json`.
 
@@ -884,7 +876,7 @@ This reruns only the green checkpoint-to-checkpoint approximate continuations. I
 
 Important run artifacts:
 
-- `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, gradient norm, and adaptive-cutoff metadata when applicable;
+- `train_trace.csv`: one row per optimizer update. `step` is the cumulative number of sum cases seen. The row contains batch-mean loss, batch-mean true-sum mass, batch zero-mass rate, `branch_count_mean`, `branch_count_total`, batch size, optimizer update number, gradient norm, plus generated `readMNist` call counts and actual MNIST model-evaluation counts;
 - `aggregate_checkpoints/terms_*_exact_posterior_checkpoints.json`: aggregate exact rolling checkpoints and per-seed exact step checkpoint paths;
 - `posterior_checkpoints.json`: per-run training true-sum posterior threshold crossings kept as diagnostic/compatibility metadata;
 - `milestones.json`: backward-compatible alias for the same posterior threshold crossings;
@@ -897,11 +889,11 @@ Important run artifacts:
 Visualization behavior:
 
 - `visualize_spll_training.py` writes both `milestone_summary.*` and `run_summary.*`. The run summary makes censored, failed, and missing runs explicit, including final sum-posterior accuracy, reached-highest-milestone status, mean step time, zero-true-mass rate, and mean branch count.
-- `visualize_spll_training.py` also writes `milestone_aggregate_summary.*`, which stores per-`(n_terms, mode, milestone)` reached-seed counts, means, sample standard deviations, configured uncertainty half-widths, and min/max values for steps and wall-clock time. It additionally writes `adaptive_topk_events.*` and `adaptive_topk_search_trace.*` when adaptive modes are present.
+- `visualize_spll_training.py` also writes `milestone_aggregate_summary.*`, which stores per-`(n_terms, mode, milestone)` reached-seed counts, means, sample standard deviations, configured uncertainty half-widths, and min/max values for steps, wall-clock time, and cumulative MNIST model evaluations.
 - Main-text Pipeline II comparison figures are written per `(n_terms, approximate mode)`: blue is pure exact, orange/vermilion is pure approximate from initialization, and green is approximate checkpoint-transfer. Loss and true-sum posterior are separate figures, not dual-axis plots. Aggregate exact posterior checkpoint **steps** are selected with `checkpointing.rolling_window_updates`, while purple X marker heights and visual green anchors are sampled from the exact curve after the current `visualization.trace_smoothing_window_points` setting is applied. This keeps markers attached to the displayed blue curve even when the two rolling windows differ. The green checkpoint-transfer curve is intentionally split into disconnected segment pieces at those boundaries.
 - Pipeline II combined comparison figures use a shared figure-level legend, no gray subtitle under the title, no legend title, and slim curve widths: about 1.05 for pure exact and 1.0 for pure approximate / approximate continuation. All Pipeline I and Pipeline II PNG figures use the shared 300 dpi export setting for A4 page-width thesis embedding.
 - Pipeline II visualization uses the shared thesis palette from `plot_palette.py`; keep color and line-style conventions synchronized between the plotting code, README, and this knowledge base.
-- Main-text Pipeline II trace figures compute rolling traces per seed first, then plot the across-seed mean with configurable uncertainty bands. This avoids hiding seed variability by smoothing only after aggregation. Raw traces are still exported to appendix figures with `_raw_trace` in the file name; raw uncertainty bands are disabled by default to keep appendix plots readable. Adaptive top-k cutoff and mass traces intentionally do **not** use rolling means because the values are calibrated control settings and deterministic bisection probes; smoothing would hide refresh jumps and convergence behavior.
+- Main-text Pipeline II trace figures compute rolling traces per seed first, then plot the across-seed mean with configurable uncertainty bands. This avoids hiding seed variability by smoothing only after aggregation. Raw traces are still exported to appendix figures with `_raw_trace` in the file name; raw uncertainty bands are disabled by default to keep appendix plots readable.
 - Posterior-checkpoint bar figures plot a mode/checkpoint pair only when every configured seed reached the target and supplied the required metric values. Partial-seed aggregates remain explicit in `milestone_aggregate_summary.*` through `reached_seed_count`, but their bars are omitted so a successful-subset mean cannot be mistaken for a completed experiment. Appendix milestone figures may still include a censoring footnote for the omitted runs.
 - Wall-clock milestone plots may use a log y-axis when values span more than about 5x; tick labels should remain readable scalar seconds, not opaque scientific notation.
 

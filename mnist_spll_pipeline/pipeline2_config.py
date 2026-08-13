@@ -5,8 +5,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-from pipeline1_config import ADAPTIVE_TOP_K_ARTIFACT_LABEL
 from pipeline_support import ensure_dir, resolve_path
+
+PIPELINE2_READ_MNIST_POLICY = "direct_uncached_model_forward_per_generated_call"
+
+
+def validate_pipeline2_config(config: Dict[str, Any]) -> None:
+    """Fail fast on settings that invalidate the direct-uncached benchmark."""
+
+    # Mode validation also rejects all retired Pipeline-II adaptive-cutoff forms.
+    get_inference_modes(config)
+
+    data_cfg = config.get("data", {}) or {}
+    obsolete_cache_keys = sorted(
+        key
+        for key in ("image_cache_device", "image_cache_strategy", "image_cache_max_items")
+        if key in data_cfg
+    )
+    if obsolete_cache_keys:
+        raise ValueError(
+            "Pipeline II no longer supports application-level MNIST caching. Remove obsolete "
+            f"data settings: {', '.join(obsolete_cache_keys)}."
+        )
+
+    dropout = float((config.get("model", {}) or {}).get("dropout", 0.0))
+    if dropout != 0.0:
+        raise ValueError(
+            "Pipeline II direct-uncached training requires model.dropout=0.0. Generated SPLL "
+            "inference can revisit the same MNIST image multiple times in one query; active "
+            "dropout would make readMNist return a different distribution across symbolic "
+            "branches and would couple pruning to classifier RNG consumption."
+        )
 
 
 @dataclass(frozen=True)
@@ -115,92 +144,17 @@ def get_seeds(config: Dict[str, Any]) -> List[int]:
     return [int(seed) for seed in seeds]
 
 
-def _as_float(value: Any, *, field_name: str, default: float) -> float:
-    if value is None:
-        return float(default)
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be numeric, got {value!r}") from exc
-
-
-def _as_int(value: Any, *, field_name: str, default: int) -> int:
-    if value is None:
-        return int(default)
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be an integer, got {value!r}") from exc
-
-
-def _normalize_cutoff_search_config(
-    config: Dict[str, Any],
-    raw_mode: Dict[str, Any],
-) -> Dict[str, Any]:
-    global_cfg = config.get("adaptive_top_k", {}) or {}
-    mode_cfg = raw_mode.get("cutoff_search", {}) or {}
-    if not isinstance(global_cfg, dict):
-        raise ValueError("adaptive_top_k must be a mapping when provided.")
-    if not isinstance(mode_cfg, dict):
-        raise ValueError(f"cutoff_search for mode {raw_mode.get('name')!r} must be a mapping.")
-
-    def value(key: str, default: Any) -> Any:
-        return mode_cfg.get(key, global_cfg.get(key, default))
-
-    probe_cases = _as_int(
-        value("probe_cases", 20),
-        field_name="adaptive_top_k.probe_cases",
-        default=20,
-    )
-    max_iterations = _as_int(
-        value("max_iterations", 14),
-        field_name="adaptive_top_k.max_iterations",
-        default=14,
-    )
-    tolerance = _as_float(
-        value("tolerance", 0.02),
-        field_name="adaptive_top_k.tolerance",
-        default=0.02,
-    )
-    min_cutoff = _as_float(
-        value("min_cutoff", 0.0),
-        field_name="adaptive_top_k.min_cutoff",
-        default=0.0,
-    )
-    max_cutoff = _as_float(
-        value("max_cutoff", 1.0),
-        field_name="adaptive_top_k.max_cutoff",
-        default=1.0,
-    )
-
-    if probe_cases <= 0:
-        raise ValueError("adaptive_top_k.probe_cases must be positive.")
-    if max_iterations <= 0:
-        raise ValueError("adaptive_top_k.max_iterations must be positive.")
-    if tolerance < 0.0:
-        raise ValueError("adaptive_top_k.tolerance must be non-negative.")
-    if not 0.0 <= min_cutoff <= max_cutoff <= 1.0:
-        raise ValueError(
-            "adaptive_top_k min_cutoff/max_cutoff must satisfy "
-            "0 <= min_cutoff <= max_cutoff <= 1."
-        )
-
-    return {
-        "probe_cases": probe_cases,
-        "max_iterations": max_iterations,
-        "tolerance": tolerance,
-        "min_cutoff": min_cutoff,
-        "max_cutoff": max_cutoff,
-    }
-
-
 def get_inference_modes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Validate Pipeline II inference modes.
+
+    Pipeline II intentionally supports only exact inference (``top_k_cutoff: null``)
+    and fixed numeric cutoffs. Adaptive cutoff selection belongs to Pipeline I and
+    must not be reintroduced here because it changes the experiment definition.
+    """
+
     modes = config.get("inference_modes", [])
     if not isinstance(modes, list) or not modes:
         raise ValueError("Pipeline II config must define a non-empty inference_modes list.")
-    global_adaptive_cfg = config.get("adaptive_top_k", {}) or {}
-    if not isinstance(global_adaptive_cfg, dict):
-        raise ValueError("adaptive_top_k must be a mapping when provided.")
 
     normalized: List[Dict[str, Any]] = []
     seen_names = set()
@@ -214,51 +168,29 @@ def get_inference_modes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             raise ValueError(f"Duplicate inference mode name: {name}")
         seen_names.add(name)
 
-        adaptive = bool(raw.get("adaptive_top_k", False)) or (
-            raw.get("posterior_mass_target") is not None
-        )
+        forbidden_adaptive_fields = {
+            key for key in ("adaptive_top_k", "posterior_mass_target", "cutoff_search")
+            if key in raw
+        }
         raw_cutoff = raw.get("top_k_cutoff")
-        if isinstance(raw_cutoff, str) and raw_cutoff.strip().lower() in {"auto", "adaptive"}:
-            if not adaptive:
-                raise ValueError(
-                    f"Mode {name!r} uses top_k_cutoff={raw_cutoff!r} but is not adaptive."
-                )
-            raw_cutoff = 0.0
-        if adaptive and raw_cutoff is None:
-            raw_cutoff = 0.0
+        if forbidden_adaptive_fields or (
+            isinstance(raw_cutoff, str) and raw_cutoff.strip().lower() in {"auto", "adaptive"}
+        ):
+            raise ValueError(
+                f"Pipeline II mode {name!r} contains adaptive-cutoff configuration. "
+                "Pipeline II supports only exact inference or fixed numeric top_k_cutoff values; "
+                "adaptive top-k remains a Pipeline I feature."
+            )
 
         cutoff = None if raw_cutoff is None else float(raw_cutoff)
         if cutoff is not None and not 0.0 <= cutoff <= 1.0:
             raise ValueError(f"top_k_cutoff must be in [0, 1], got {cutoff}")
 
-        posterior_mass_target = None
-        cutoff_search = None
-        if adaptive:
-            posterior_mass_target = float(
-                raw.get(
-                    "posterior_mass_target",
-                    global_adaptive_cfg.get("posterior_mass_target", 0.8),
-                )
-            )
-            if not 0.0 < posterior_mass_target <= 1.0:
-                raise ValueError(
-                    f"posterior_mass_target for adaptive mode {name!r} must be in (0, 1], "
-                    f"got {posterior_mass_target}"
-                )
-            if cutoff is None:
-                raise ValueError(
-                    f"Adaptive mode {name!r} must compile with a numeric top_k_cutoff seed."
-                )
-            cutoff_search = _normalize_cutoff_search_config(config, raw)
-
         normalized.append(
             {
                 "name": name,
-                "artifact_name": ADAPTIVE_TOP_K_ARTIFACT_LABEL if adaptive else name,
+                "artifact_name": name,
                 "top_k_cutoff": cutoff,
-                "adaptive_top_k": adaptive,
-                "posterior_mass_target": posterior_mass_target,
-                "cutoff_search": cutoff_search,
             }
         )
     return normalized

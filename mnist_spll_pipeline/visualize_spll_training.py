@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from pipeline2_analysis import (
-    _collect_adaptive_topk_trace_rows,
     _collect_checkpoint_transfer_rows,
     _collect_milestone_aggregates,
     _collect_rows,
@@ -11,14 +10,12 @@ from pipeline2_analysis import (
     _non_anchor_mode_names,
     _write_csv,
 )
-from pipeline2_config import get_checkpoint_transfer_config, get_experiments, get_inference_modes, training_paths
+from pipeline2_config import get_checkpoint_transfer_config, get_experiments, get_inference_modes, training_paths, validate_pipeline2_config
 from pipeline2_plotting import (
-    _plot_adaptive_topk_event_trace,
-    _plot_adaptive_topk_search_iterations,
     _plot_checkpoint_transfer_metric_trajectory,
     _plot_combined_checkpoint_transfer_metric,
     _plot_dual_axis_checkpoint_bars,
-    _plot_dual_axis_checkpoint_lookup_bars,
+    _plot_dual_axis_checkpoint_model_evaluation_bars,
     _plot_metric_for_terms,
     _plot_trace,
 )
@@ -26,6 +23,7 @@ from pipeline_support import run_configured_stage_cli, save_config, stage_messag
 
 
 def run_visualization_stage(config: Dict[str, Any]) -> None:
+    validate_pipeline2_config(config)
     paths = training_paths(config)
     paths.ensure_visualization_dirs()
     stage_message(1, 3, "Writing resolved Pipeline II config snapshot")
@@ -35,16 +33,12 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     rows = _collect_rows(config)
     milestone_aggregates = _collect_milestone_aggregates(config, rows)
     run_summaries = _collect_run_summaries(config)
-    adaptive_topk_events = _collect_adaptive_topk_trace_rows(config, "adaptive_topk_events.csv")
-    adaptive_topk_search_rows = _collect_adaptive_topk_trace_rows(config, "adaptive_topk_search_trace.csv")
     checkpoint_transfer_rows = _collect_checkpoint_transfer_rows(config)
     milestone_fields = [
         "seed",
         "n_terms",
         "mode_name",
         "top_k_cutoff",
-        "adaptive_top_k",
-        "posterior_mass_target",
         "runtime_top_k_cutoff",
         "milestone",
         "reached",
@@ -53,16 +47,15 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "digit_accuracy",
         "sum_posterior_accuracy",
         "validation_metric",
-        "cumulative_read_mnist_lookup_calls",
+        "cumulative_read_mnist_model_evaluations",
     ]
     run_summary_fields = [
         "seed",
         "n_terms",
         "mode_name",
         "top_k_cutoff",
-        "adaptive_top_k",
-        "posterior_mass_target",
         "runtime_top_k_cutoff",
+        "read_mnist_policy",
         "status",
         "failure_report",
         "final_step",
@@ -80,13 +73,13 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "final_true_mass",
         "final_loss_recent_mean",
         "final_true_mass_recent_mean",
+        "final_cumulative_read_mnist_calls",
+        "final_cumulative_read_mnist_model_evaluations",
     ]
     milestone_aggregate_fields = [
         "n_terms",
         "mode_name",
         "top_k_cutoff",
-        "adaptive_top_k",
-        "posterior_mass_target",
         "runtime_top_k_cutoff_mean",
         "milestone",
         "configured_seed_count",
@@ -105,9 +98,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         "digit_accuracy_mean",
         "digit_accuracy_std",
         "digit_accuracy_uncertainty_half_width",
-        "cumulative_read_mnist_lookup_calls_mean",
-        "cumulative_read_mnist_lookup_calls_std",
-        "cumulative_read_mnist_lookup_calls_uncertainty_half_width",
+        "cumulative_read_mnist_model_evaluations_mean",
+        "cumulative_read_mnist_model_evaluations_std",
+        "cumulative_read_mnist_model_evaluations_uncertainty_half_width",
     ]
     _write_csv(paths.tables_root / "milestone_summary.csv", rows, milestone_fields)
     write_json(paths.tables_root / "milestone_summary.json", rows)
@@ -115,46 +108,6 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
     write_json(paths.tables_root / "milestone_aggregate_summary.json", milestone_aggregates)
     _write_csv(paths.tables_root / "run_summary.csv", run_summaries, run_summary_fields)
     write_json(paths.tables_root / "run_summary.json", run_summaries)
-    _write_csv(
-        paths.tables_root / "adaptive_topk_events.csv",
-        adaptive_topk_events,
-        [
-            "seed",
-            "n_terms",
-            "mode_name",
-            "step",
-            "reason",
-            "runtime_top_k_cutoff",
-            "posterior_mass_target",
-            "mean_surviving_posterior_mass",
-            "abs_error",
-            "iterations",
-            "converged",
-            "probe_cases",
-            "search_runtime_sec",
-            "evaluation_count",
-        ],
-    )
-    _write_csv(
-        paths.tables_root / "adaptive_topk_search_trace.csv",
-        adaptive_topk_search_rows,
-        [
-            "seed",
-            "n_terms",
-            "mode_name",
-            "step",
-            "reason",
-            "evaluation_index",
-            "candidate_cutoff",
-            "mean_surviving_mass",
-            "posterior_mass_target",
-            "runtime_top_k_cutoff",
-            "selected_mean_surviving_posterior_mass",
-            "selected_abs_error",
-            "iterations",
-            "converged",
-        ],
-    )
     _write_csv(
         paths.tables_root / "checkpoint_transfer_summary.csv",
         checkpoint_transfer_rows,
@@ -184,11 +137,9 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             "end_true_mass_recent_mean_transfer",
             "end_zero_true_mass_recent_rate_transfer",
             "top_k_cutoff_runtime",
-            "posterior_mass_target",
+            "read_mnist_model_evaluations",
         ],
     )
-    write_json(paths.tables_root / "adaptive_topk_events.json", adaptive_topk_events)
-    write_json(paths.tables_root / "adaptive_topk_search_trace.json", adaptive_topk_search_rows)
     write_json(paths.tables_root / "checkpoint_transfer_summary.json", checkpoint_transfer_rows)
     print(f"Saved milestone summary to: {paths.tables_root / 'milestone_summary.csv'}")
     print(f"Saved milestone aggregate summary to: {paths.tables_root / 'milestone_aggregate_summary.csv'}")
@@ -207,12 +158,12 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_progress_dual_axis.png",
         )
-        _plot_dual_axis_checkpoint_lookup_bars(
+        _plot_dual_axis_checkpoint_model_evaluation_bars(
             config=config,
             rows=rows,
             run_summaries=run_summaries,
             n_terms=n_terms,
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_lookup_progress_dual_axis.png",
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_model_evaluations_dual_axis.png",
         )
         _plot_metric_for_terms(
             config=config,
@@ -330,38 +281,6 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
                 smooth_window=smooth_window,
                 as_percent=True,
             )
-        _plot_adaptive_topk_event_trace(
-            config=config,
-            n_terms=n_terms,
-            value_key="runtime_top_k_cutoff",
-            ylabel="runtime TOP_K_CUTOFF",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_adaptive_topk_runtime_cutoff_trace.png",
-        )
-        _plot_adaptive_topk_event_trace(
-            config=config,
-            n_terms=n_terms,
-            value_key="mean_surviving_posterior_mass",
-            ylabel="mean surviving posterior mass",
-            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_adaptive_topk_surviving_mass_trace.png",
-            show_target=True,
-            ylim=(0.0, 1.05),
-        )
-        _plot_adaptive_topk_search_iterations(
-            config=config,
-            n_terms=n_terms,
-            value_key="candidate_cutoff",
-            ylabel="candidate TOP_K_CUTOFF",
-            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_adaptive_topk_search_cutoff_iterations.png",
-        )
-        _plot_adaptive_topk_search_iterations(
-            config=config,
-            n_terms=n_terms,
-            value_key="mean_surviving_mass",
-            ylabel="mean surviving posterior mass",
-            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_adaptive_topk_search_mass_iterations.png",
-            show_target=True,
-            ylim=(0.0, 1.05),
-        )
         _plot_trace(
             config=config,
             n_terms=n_terms,

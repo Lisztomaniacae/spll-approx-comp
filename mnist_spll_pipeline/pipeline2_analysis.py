@@ -138,8 +138,6 @@ def _collect_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "n_terms": n_terms,
                             "mode_name": mode_name,
                             "top_k_cutoff": mode.get("top_k_cutoff"),
-                            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
-                            "posterior_mass_target": mode.get("posterior_mass_target"),
                             "runtime_top_k_cutoff": summary.get("runtime_top_k_cutoff"),
                             "milestone": float(milestone),
                             "reached": bool(info.get("reached", False)),
@@ -148,7 +146,9 @@ def _collect_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "digit_accuracy": info.get("digit_accuracy"),
                             "sum_posterior_accuracy": info.get("sum_posterior_accuracy", info.get("digit_accuracy")),
                             "validation_metric": info.get("validation_metric", "sum_posterior_accuracy"),
-                            "cumulative_read_mnist_lookup_calls": info.get("cumulative_read_mnist_lookup_calls"),
+                            "cumulative_read_mnist_model_evaluations": info.get(
+                                "cumulative_read_mnist_model_evaluations"
+                            ),
                         }
                     )
     return rows
@@ -190,22 +190,20 @@ def _collect_milestone_aggregates(config: Dict[str, Any], rows: List[Dict[str, A
         step_values = [float(row["step"]) for row in reached_rows if row.get("step") not in {None, ""}]
         time_values = [float(row["elapsed_seconds"]) for row in reached_rows if row.get("elapsed_seconds") not in {None, ""}]
         accuracy_values = [float(row["digit_accuracy"]) for row in reached_rows if row.get("digit_accuracy") not in {None, ""}]
-        lookup_values = [
-            float(row["cumulative_read_mnist_lookup_calls"])
+        evaluation_values = [
+            float(row["cumulative_read_mnist_model_evaluations"])
             for row in reached_rows
-            if row.get("cumulative_read_mnist_lookup_calls") not in {None, ""}
+            if row.get("cumulative_read_mnist_model_evaluations") not in {None, ""}
         ]
         step_summary = _metric_summary(step_values, config)
         time_summary = _metric_summary(time_values, config)
         accuracy_summary = _metric_summary(accuracy_values, config)
-        lookup_summary = _metric_summary(lookup_values, config)
+        evaluation_summary = _metric_summary(evaluation_values, config)
         aggregate_rows.append(
             {
                 "n_terms": n_terms,
                 "mode_name": mode_name,
                 "top_k_cutoff": group_rows[0].get("top_k_cutoff") if group_rows else None,
-                "adaptive_top_k": group_rows[0].get("adaptive_top_k") if group_rows else None,
-                "posterior_mass_target": group_rows[0].get("posterior_mass_target") if group_rows else None,
                 "runtime_top_k_cutoff_mean": _mean([float(row["runtime_top_k_cutoff"]) for row in group_rows if row.get("runtime_top_k_cutoff") not in {None, ""}]),
                 "milestone": milestone,
                 "configured_seed_count": configured_seed_count,
@@ -224,9 +222,9 @@ def _collect_milestone_aggregates(config: Dict[str, Any], rows: List[Dict[str, A
                 "digit_accuracy_mean": accuracy_summary["mean"],
                 "digit_accuracy_std": accuracy_summary["std"],
                 "digit_accuracy_uncertainty_half_width": accuracy_summary["uncertainty_half_width"],
-                "cumulative_read_mnist_lookup_calls_mean": lookup_summary["mean"],
-                "cumulative_read_mnist_lookup_calls_std": lookup_summary["std"],
-                "cumulative_read_mnist_lookup_calls_uncertainty_half_width": lookup_summary["uncertainty_half_width"],
+                "cumulative_read_mnist_model_evaluations_mean": evaluation_summary["mean"],
+                "cumulative_read_mnist_model_evaluations_std": evaluation_summary["std"],
+                "cumulative_read_mnist_model_evaluations_uncertainty_half_width": evaluation_summary["uncertainty_half_width"],
             }
         )
     return aggregate_rows
@@ -302,9 +300,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "n_terms": n_terms,
                             "mode_name": mode_name,
                             "top_k_cutoff": mode.get("top_k_cutoff"),
-                            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
-                            "posterior_mass_target": mode.get("posterior_mass_target"),
                             "runtime_top_k_cutoff": None,
+                            "read_mnist_policy": None,
                             "status": "failed_or_missing" if failure_path.exists() else "missing",
                             "failure_report": str(failure_path) if failure_path.exists() else "",
                             "final_step": None,
@@ -322,6 +319,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "final_true_mass": None,
                             "final_loss_recent_mean": None,
                             "final_true_mass_recent_mean": None,
+                            "final_cumulative_read_mnist_calls": None,
+                            "final_cumulative_read_mnist_model_evaluations": None,
                         }
                     )
                     continue
@@ -355,9 +354,8 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "n_terms": n_terms,
                         "mode_name": mode_name,
                         "top_k_cutoff": mode.get("top_k_cutoff"),
-                        "adaptive_top_k": bool(summary.get("adaptive_top_k", mode.get("adaptive_top_k", False))),
-                        "posterior_mass_target": summary.get("posterior_mass_target", mode.get("posterior_mass_target")),
                         "runtime_top_k_cutoff": summary.get("runtime_top_k_cutoff"),
+                        "read_mnist_policy": summary.get("read_mnist_policy"),
                         "status": "ok",
                         "failure_report": "",
                         "final_step": final_step,
@@ -375,33 +373,12 @@ def _collect_run_summaries(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "final_true_mass": final_true_mass,
                         "final_loss_recent_mean": summary.get("final_loss_recent_mean"),
                         "final_true_mass_recent_mean": summary.get("final_true_mass_recent_mean"),
+                        "final_cumulative_read_mnist_calls": summary.get("final_cumulative_read_mnist_calls"),
+                        "final_cumulative_read_mnist_model_evaluations": summary.get(
+                            "final_cumulative_read_mnist_model_evaluations"
+                        ),
                     }
                 )
-    return rows
-
-
-def _collect_adaptive_topk_trace_rows(config: Dict[str, Any], filename: str) -> List[Dict[str, Any]]:
-    paths = training_paths(config)
-    rows: List[Dict[str, Any]] = []
-    for seed in get_seeds(config):
-        for experiment in get_experiments(config):
-            n_terms = int(experiment["n_terms"])
-            for mode in get_inference_modes(config):
-                if not bool(mode.get("adaptive_top_k", False)):
-                    continue
-                mode_name = str(mode["name"])
-                trace_path = run_dir(paths, seed, n_terms, mode_name) / filename
-                for row in _read_trace_csv(trace_path):
-                    enriched = dict(row)
-                    enriched.update(
-                        {
-                            "seed": int(seed),
-                            "n_terms": int(n_terms),
-                            "mode_name": mode_name,
-                            "posterior_mass_target_config": mode.get("posterior_mass_target"),
-                        }
-                    )
-                    rows.append(enriched)
     return rows
 
 

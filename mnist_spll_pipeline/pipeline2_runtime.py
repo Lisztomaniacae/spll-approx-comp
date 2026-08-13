@@ -4,7 +4,6 @@ import csv
 import inspect
 import math
 import numbers
-from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
@@ -12,6 +11,7 @@ from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from pipeline2_config import PIPELINE2_READ_MNIST_POLICY
 from pipeline_support import ensure_dir, utc_now_iso, write_json
 from spll_artifacts import _get_tuple_item, extract_branch_count
 
@@ -96,99 +96,54 @@ def call_true_sum(
     return probability, extract_branch_count(result)
 
 
-class TensorLRUCache:
-    def __init__(
-        self,
-        dataset: Any,
-        *,
-        device: torch.device,
-        cache_device: str,
-        max_items: int,
-        strategy: str,
-    ) -> None:
+class DirectReadMNIST:
+    """Generated ``readMNist`` callback for Pipeline II training.
+
+    Every generated callback invocation reloads the requested MNIST tensor from
+    the dataset and executes a fresh CNN forward pass.  No image tensor cache,
+    probability lookup, memoization, or cross-call reuse is permitted in this
+    benchmark path.  The returned softmax row remains attached to autograd.
+    """
+
+    def __init__(self, model: nn.Module, dataset: Any, device: torch.device) -> None:
+        self.model = model
         self.dataset = dataset
         self.device = device
-        self.cache_device = cache_device
-        self.max_items = max(0, int(max_items))
-        self.strategy = str(strategy).lower()
-        if self.strategy not in {"none", "lru"}:
-            raise ValueError("data.image_cache_strategy currently supports 'none' or 'lru'.")
-        if self.cache_device not in {"cpu", "device"}:
-            raise ValueError("data.image_cache_device must be 'cpu' or 'device'.")
-        self._items: OrderedDict[int, torch.Tensor] = OrderedDict()
-
-    def get(self, index: int) -> torch.Tensor:
-        index = int(index)
-        if self.strategy == "lru" and index in self._items:
-            tensor = self._items.pop(index)
-            self._items[index] = tensor
-            return tensor.to(self.device) if tensor.device != self.device else tensor
-
-        tensor, _ = self.dataset[index]
-        target_device = self.device if self.cache_device == "device" else torch.device("cpu")
-        tensor = tensor.to(target_device)
-        if self.strategy == "lru" and self.max_items > 0:
-            self._items[index] = tensor
-            while len(self._items) > self.max_items:
-                self._items.popitem(last=False)
-        return tensor.to(self.device) if tensor.device != self.device else tensor
-
-    def clear(self) -> None:
-        self._items.clear()
-
-
-class DifferentiableReadMNIST:
-    def __init__(self, model: nn.Module, tensor_cache: TensorLRUCache, device: torch.device) -> None:
-        self.model = model
-        self.tensor_cache = tensor_cache
-        self.device = device
-
-    def __call__(self, global_index: int) -> torch.Tensor:
-        inputs = self.tensor_cache.get(int(global_index)).unsqueeze(0).to(self.device)
-        return torch.softmax(self.model(inputs), dim=-1)[0]
-
-
-class PrecomputedReadMNIST:
-    """Differentiable per-batch probability lookup installed as generated readMNist."""
-
-    def __init__(self, probabilities_by_index: Dict[int, torch.Tensor]) -> None:
-        self.probabilities_by_index = {
-            int(index): probability for index, probability in probabilities_by_index.items()
-        }
         self.call_count = 0
+        self.model_evaluation_count = 0
+        self.unique_indices_seen: set[int] = set()
+
+    def reset_counts(self) -> None:
+        self.call_count = 0
+        self.model_evaluation_count = 0
+        self.unique_indices_seen.clear()
 
     def __call__(self, global_index: int) -> torch.Tensor:
         index = int(global_index)
         self.call_count += 1
-        try:
-            return self.probabilities_by_index[index]
-        except KeyError as exc:
-            raise KeyError(
-                f"SPLL requested MNIST index {index}, but it was not precomputed for this batch."
-            ) from exc
+        self.unique_indices_seen.add(index)
+        inputs, _ = self.dataset[index]
+        inputs = inputs.unsqueeze(0).to(self.device)
+        self.model_evaluation_count += 1
+        return torch.softmax(self.model(inputs), dim=-1)[0]
 
-
-def make_precomputed_read_mnist(
-    *,
-    model: nn.Module,
-    tensor_cache: TensorLRUCache,
-    device: torch.device,
-    global_indices: Sequence[int],
-) -> PrecomputedReadMNIST:
-    ordered_unique_indices = list(dict.fromkeys(int(value) for value in global_indices))
-    if not ordered_unique_indices:
-        raise ValueError("Cannot build a precomputed readMNist lookup for an empty batch.")
-    inputs = torch.stack(
-        [tensor_cache.get(index).to(device) for index in ordered_unique_indices],
-        dim=0,
-    )
-    probabilities = torch.softmax(model(inputs), dim=-1)
-    return PrecomputedReadMNIST(
-        {
-            index: probabilities[row_index]
-            for row_index, index in enumerate(ordered_unique_indices)
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "policy": PIPELINE2_READ_MNIST_POLICY,
+            "calls": int(self.call_count),
+            "model_evaluations": int(self.model_evaluation_count),
+            "unique_indices": int(len(self.unique_indices_seen)),
         }
-    )
+
+
+def get_runtime_top_k_cutoff(module: Any, mode: Dict[str, Any]) -> Optional[float]:
+    """Return the fixed cutoff actually exposed by the generated artifact."""
+
+    configured = mode.get("top_k_cutoff")
+    if configured is None:
+        return None
+    runtime = getattr(module, "TOP_K_CUTOFF", configured)
+    return float(runtime)
 
 
 def tensor_to_float(value: torch.Tensor) -> float:
@@ -259,9 +214,7 @@ def save_training_checkpoint(
             "inference_mode": mode["name"],
             "artifact_name": mode.get("artifact_name", mode["name"]),
             "top_k_cutoff": mode.get("top_k_cutoff"),
-            "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
-            "posterior_mass_target": mode.get("posterior_mass_target"),
-            "cutoff_search": mode.get("cutoff_search"),
+            "read_mnist_policy": PIPELINE2_READ_MNIST_POLICY,
             "config_path": str(config.get("_config_path", "")),
             "created_at_utc": utc_now_iso(),
         },
@@ -319,8 +272,7 @@ def train_sum_batch(
     module: Any,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    cache: TensorLRUCache,
-    device: torch.device,
+    read_mnist: DirectReadMNIST,
     cases: list[Dict[str, Any]],
     loss_epsilon: float,
 ) -> Dict[str, Any]:
@@ -331,18 +283,10 @@ def train_sum_batch(
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    all_indices = [
-        int(index)
-        for case in cases
-        for index in case["global_indices"]
-    ]
-    batch_read_mnist = make_precomputed_read_mnist(
-        model=model,
-        tensor_cache=cache,
-        device=device,
-        global_indices=all_indices,
-    )
-    setattr(module, "readMNist", batch_read_mnist)
+    if read_mnist.model is not model:
+        raise RuntimeError("DirectReadMNIST is bound to a different model than train_sum_batch().")
+    read_mnist.reset_counts()
+    setattr(module, "readMNist", read_mnist)
 
     zero_anchor = zero_anchor_from_model(model)
     probabilities = []
@@ -381,7 +325,13 @@ def train_sum_batch(
     loss_values = [tensor_to_float(value) for value in per_case_losses]
     zero_flags = [int(value <= 0.0) for value in probability_values]
     numeric_branch_counts = [int(value) for value in branch_counts if value is not None]
-    read_mnist_lookup_total = int(getattr(batch_read_mnist, "call_count", 0))
+    read_mnist_calls = int(read_mnist.call_count)
+    read_mnist_model_evaluations = int(read_mnist.model_evaluation_count)
+    if read_mnist_calls != read_mnist_model_evaluations:
+        raise RuntimeError(
+            "Pipeline II direct readMNist invariant violated: every generated readMNist call "
+            "must execute exactly one MNIST model forward."
+        )
     return {
         "batch_size": len(cases),
         "loss": float(sum(loss_values) / len(loss_values)),
@@ -395,8 +345,12 @@ def train_sum_batch(
         "branch_count_total": (
             int(sum(numeric_branch_counts)) if numeric_branch_counts else None
         ),
-        "read_mnist_lookup_mean": (read_mnist_lookup_total / len(cases)) if cases else None,
-        "read_mnist_lookup_total": read_mnist_lookup_total,
+        "read_mnist_calls_mean": (read_mnist_calls / len(cases)) if cases else None,
+        "read_mnist_calls_total": read_mnist_calls,
+        "read_mnist_model_evaluations_mean": (
+            read_mnist_model_evaluations / len(cases)
+        ) if cases else None,
+        "read_mnist_model_evaluations_total": read_mnist_model_evaluations,
         "grad_norm": gradient_norm,
         "case_loss_values": loss_values,
         "case_true_mass_values": probability_values,

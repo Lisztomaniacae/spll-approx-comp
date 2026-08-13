@@ -20,7 +20,7 @@ from inference_engine import (
 )
 from pipeline1_config import get_thresholds
 from pipeline1_models import get_model_variants
-from pipeline2_config import get_inference_modes
+from pipeline2_config import get_inference_modes, validate_pipeline2_config
 from spll_artifacts import build_compile_command, extract_branch_count, extract_probability, make_spll_program
 
 
@@ -95,32 +95,59 @@ class SpllContractTests(unittest.TestCase):
         self.assertEqual(adaptive["compile_cutoff"], 0.0)
         self.assertEqual(adaptive["cutoff_search"]["max_cutoff"], 0.5)
 
-    def test_pipeline2_mode_normalization_preserves_artifact_contract(self) -> None:
+    def test_pipeline2_mode_normalization_supports_only_exact_and_fixed_cutoffs(self) -> None:
         config = {
-            "adaptive_top_k": {
-                "posterior_mass_target": 0.8,
-                "probe_cases": 5,
-                "max_iterations": 8,
-                "tolerance": 0.05,
-                "min_cutoff": 0.0,
-                "max_cutoff": 1.0,
-            },
             "inference_modes": [
                 {"name": "exact", "top_k_cutoff": None},
-                {
-                    "name": "approx_mass_0p8",
-                    "top_k_cutoff": "auto",
-                    "adaptive_top_k": True,
-                    "posterior_mass_target": 0.8,
-                },
+                {"name": "approx_0p01", "top_k_cutoff": 0.01},
                 {"name": "approx_0p1", "top_k_cutoff": 0.1},
             ],
         }
         modes = get_inference_modes(config)
-        self.assertEqual([mode["name"] for mode in modes], ["exact", "approx_mass_0p8", "approx_0p1"])
-        self.assertEqual(modes[1]["artifact_name"], "cutoff_topk")
-        self.assertEqual(modes[1]["top_k_cutoff"], 0.0)
-        self.assertEqual(modes[2]["artifact_name"], "approx_0p1")
+        self.assertEqual([mode["name"] for mode in modes], ["exact", "approx_0p01", "approx_0p1"])
+        self.assertEqual(modes[0]["artifact_name"], "exact")
+        self.assertIsNone(modes[0]["top_k_cutoff"])
+        self.assertEqual(modes[1]["artifact_name"], "approx_0p01")
+        self.assertEqual(modes[1]["top_k_cutoff"], 0.01)
+
+        with self.assertRaisesRegex(ValueError, "adaptive-cutoff"):
+            get_inference_modes(
+                {
+                    "inference_modes": [
+                        {
+                            "name": "retired_adaptive",
+                            "top_k_cutoff": "auto",
+                            "adaptive_top_k": True,
+                            "posterior_mass_target": 0.8,
+                        }
+                    ]
+                }
+            )
+
+
+    def test_pipeline2_direct_uncached_config_guards(self) -> None:
+        base = {
+            "model": {"dropout": 0.0},
+            "data": {},
+            "inference_modes": [{"name": "exact", "top_k_cutoff": None}],
+        }
+        validate_pipeline2_config(base)
+
+        with self.assertRaisesRegex(ValueError, "dropout=0.0"):
+            validate_pipeline2_config(
+                {
+                    **base,
+                    "model": {"dropout": 0.25},
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "no longer supports application-level MNIST caching"):
+            validate_pipeline2_config(
+                {
+                    **base,
+                    "data": {"image_cache_strategy": "none"},
+                }
+            )
 
     def test_model_variants_are_required_and_base_model_is_merged(self) -> None:
         config = {

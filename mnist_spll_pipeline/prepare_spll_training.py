@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from mnist_model import set_seed
-from pipeline2_config import training_paths
+from pipeline2_config import training_paths, validate_pipeline2_config
 from pipeline2_data import (
     build_balanced_split_manifest,
     write_initial_checkpoints,
@@ -18,6 +18,7 @@ from pipeline_support import (
 
 
 def run_prepare_stage(config: Dict[str, Any]) -> None:
+    validate_pipeline2_config(config)
     set_seed(int(config.get("seed", 42)))
     paths = training_paths(config)
     paths.ensure_prepare_dirs()

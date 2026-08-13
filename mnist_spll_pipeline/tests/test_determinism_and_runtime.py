@@ -13,7 +13,13 @@ if str(PIPELINE_DIR) not in sys.path:
 from mnist_model import compute_split_lengths
 from pipeline2_checkpoint_transfer import _full_window_rolling_mean_float
 from pipeline2_data import generate_sum_case
-from pipeline2_runtime import _as_probability_tensor, validate_probability_and_loss, zero_anchor_from_model
+from pipeline2_runtime import (
+    DirectReadMNIST,
+    _as_probability_tensor,
+    train_sum_batch,
+    validate_probability_and_loss,
+    zero_anchor_from_model,
+)
 
 
 class DeterminismAndRuntimeTests(unittest.TestCase):
@@ -81,7 +87,7 @@ class DeterminismAndRuntimeTests(unittest.TestCase):
             validate_probability_and_loss(torch.tensor(0.5), torch.tensor(float("nan")), step=3)
 
 
-class CheckpointAndAdaptiveTests(unittest.TestCase):
+class CheckpointAndTrainingTests(unittest.TestCase):
     def test_aggregate_checkpoint_crossings_use_across_seed_full_windows(self) -> None:
         import csv
         import tempfile
@@ -130,51 +136,98 @@ class CheckpointAndAdaptiveTests(unittest.TestCase):
             self.assertEqual(payload["posterior_checkpoints"]["0.60"]["step"], 4)
             self.assertEqual([anchor["step"] for anchor in payload["anchors"]], [0, 3, 4])
 
-    def test_adaptive_cutoff_search_evaluation_order_is_stable(self) -> None:
+    def test_direct_read_mnist_repeats_dataset_access_and_model_forward(self) -> None:
+        class CountingDataset:
+            def __init__(self) -> None:
+                self.get_count = 0
+                self.image = torch.ones((1, 28, 28), dtype=torch.float32)
+
+            def __getitem__(self, index: int):
+                self.get_count += 1
+                return self.image.clone(), 3
+
+        class CountingModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.forward_count = 0
+                self.linear = torch.nn.Linear(28 * 28, 10)
+
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                self.forward_count += 1
+                return self.linear(inputs.flatten(1))
+
+        dataset = CountingDataset()
+        model = CountingModel()
+        callback = DirectReadMNIST(model, dataset, torch.device("cpu"))
+        first = callback(7)
+        second = callback(7)
+
+        self.assertEqual(dataset.get_count, 2)
+        self.assertEqual(model.forward_count, 2)
+        self.assertEqual(callback.stats()["calls"], 2)
+        self.assertEqual(callback.stats()["model_evaluations"], 2)
+        self.assertEqual(callback.stats()["unique_indices"], 1)
+        self.assertTrue(first.requires_grad)
+        self.assertTrue(second.requires_grad)
+        torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+
+    def test_pruned_generated_execution_reduces_real_model_evaluations(self) -> None:
         from types import SimpleNamespace
-        from unittest.mock import patch
 
-        from pipeline2_adaptive import tune_adaptive_top_k_cutoff
+        class TinyDataset:
+            def __init__(self) -> None:
+                self.image = torch.ones((1, 28, 28), dtype=torch.float32)
 
-        mode = {
-            "name": "adaptive",
-            "adaptive_top_k": True,
-            "posterior_mass_target": 0.8,
-            "cutoff_search": {
-                "probe_cases": 3,
-                "max_iterations": 4,
-                "tolerance": 0.02,
-                "min_cutoff": 0.0,
-                "max_cutoff": 1.0,
-            },
-        }
-        module = SimpleNamespace(TOP_K_CUTOFF=0.0)
+            def __getitem__(self, index: int):
+                return self.image, 0
 
-        def fake_mass(**kwargs):
-            return 1.0 - float(kwargs["cutoff"])
+        class TinyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(28 * 28, 10)
 
-        with patch("pipeline2_adaptive.mean_surviving_posterior_mass_for_cutoff", side_effect=fake_mass):
-            result = tune_adaptive_top_k_cutoff(
-                config={},
-                mode=mode,
-                module=module,
-                model=torch.nn.Linear(1, 1),
-                cache=object(),
-                device=torch.device("cpu"),
-                split_manifest={},
-                seed=42,
-                n_terms=2,
-                step=10,
-                reason="test",
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                return self.linear(inputs.flatten(1))
+
+        def make_module(call_count: int):
+            module = SimpleNamespace()
+
+            class FakeMain:
+                def forward(self, sample, acc_prob, x0, x1):
+                    probabilities = []
+                    for idx in range(call_count):
+                        image_index = x0 if idx % 2 == 0 else x1
+                        probabilities.append(module.readMNist(image_index)[0])
+                    probability = torch.stack(probabilities).mean()
+                    return probability, call_count
+
+            module.main = FakeMain()
+            return module
+
+        case = {"step": 1, "true_sum": 0, "global_indices": [0, 1]}
+        results = {}
+        for label, generated_calls in (("exact", 8), ("cutoff", 3)):
+            torch.manual_seed(11)
+            model = TinyModel()
+            optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)
+            callback = DirectReadMNIST(model, TinyDataset(), torch.device("cpu"))
+            results[label] = train_sum_batch(
+                module=make_module(generated_calls),
+                model=model,
+                optimizer=optimizer,
+                read_mnist=callback,
+                cases=[case],
+                loss_epsilon=1.0e-12,
             )
 
-        self.assertIsNotNone(result)
-        cutoffs = [entry["cutoff"] for entry in result["evaluations"]]
-        self.assertEqual(cutoffs, [0.0, 1.0, 0.5, 0.25, 0.125, 0.1875])
-        self.assertEqual(result["runtime_top_k_cutoff"], 0.1875)
-        self.assertAlmostEqual(result["mean_surviving_posterior_mass"], 0.8125)
-        self.assertTrue(result["converged"])
-        self.assertEqual(module.TOP_K_CUTOFF, 0.1875)
+        self.assertEqual(results["exact"]["read_mnist_calls_total"], 8)
+        self.assertEqual(results["exact"]["read_mnist_model_evaluations_total"], 8)
+        self.assertEqual(results["cutoff"]["read_mnist_calls_total"], 3)
+        self.assertEqual(results["cutoff"]["read_mnist_model_evaluations_total"], 3)
+        self.assertLess(
+            results["cutoff"]["read_mnist_model_evaluations_total"],
+            results["exact"]["read_mnist_model_evaluations_total"],
+        )
 
     def test_fixed_budget_training_coordinator_smoke(self) -> None:
         import csv
@@ -226,11 +279,6 @@ class CheckpointAndAdaptiveTests(unittest.TestCase):
                     "require_mps": False,
                     "sum_batch_size": 1,
                     "loss_epsilon": 1.0e-12,
-                },
-                "data": {
-                    "image_cache_device": "cpu",
-                    "image_cache_strategy": "none",
-                    "image_cache_max_items": 0,
                 },
                 "checkpointing": {
                     "enabled": False,
@@ -285,6 +333,9 @@ class CheckpointAndAdaptiveTests(unittest.TestCase):
             self.assertEqual(summary["completed_training_cases"], 2)
             self.assertEqual(summary["optimizer_updates"], 2)
             self.assertEqual(summary["mode_name"], "exact")
+            self.assertEqual(summary["read_mnist_policy"], "direct_uncached_model_forward_per_generated_call")
+            self.assertEqual([int(row["read_mnist_calls_total"]) for row in rows], [2, 2])
+            self.assertEqual([int(row["read_mnist_model_evaluations_total"]) for row in rows], [2, 2])
             self.assertTrue((output_dir / "checkpoints" / "final.pt").exists())
             self.assertFalse((output_dir / "failure_report.json").exists())
 
@@ -317,8 +368,7 @@ class CheckpointAndAdaptiveTests(unittest.TestCase):
                 "state_dict", "optimizer_state_dict", "step", "elapsed_seconds",
                 "digit_accuracy", "validation_metric_name", "sum_posterior_accuracy",
                 "model_config", "seed", "n_terms", "inference_mode", "artifact_name",
-                "top_k_cutoff", "adaptive_top_k", "posterior_mass_target", "cutoff_search",
-                "config_path", "created_at_utc",
+                "top_k_cutoff", "read_mnist_policy", "config_path", "created_at_utc",
             }
             self.assertEqual(set(payload), expected)
             self.assertEqual(payload["step"], 7)

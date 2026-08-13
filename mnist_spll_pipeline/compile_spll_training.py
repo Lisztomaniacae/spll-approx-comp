@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from pipeline2_artifacts import compile_training_artifacts
-from pipeline2_config import training_paths
+from pipeline2_config import training_paths, validate_pipeline2_config
 from pipeline_support import run_configured_stage_cli, save_config, stage_message
 
 
 def run_compile_stage(config: Dict[str, Any]) -> None:
+    validate_pipeline2_config(config)
     paths = training_paths(config)
     paths.ensure_compile_dirs()
 

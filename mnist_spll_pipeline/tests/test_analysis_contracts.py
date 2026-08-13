@@ -21,6 +21,8 @@ from pipeline2_analysis import _uncertainty_half_width
 from pipeline2_plotting import (
     _checkpoint_bar_axis_scaling,
     _fully_reached_milestone_rows,
+    _mean_trajectory_milestone_intervals_from_rows,
+    _reached_milestone_rows,
     _project_checkpoint_values_onto_displayed_series,
     _require_checkpoint_transfer_v2_rows,
 )
@@ -189,6 +191,14 @@ class AnalysisContractTests(unittest.TestCase):
             ),
             [],
         )
+        successful_subset = _reached_milestone_rows(
+            config,
+            rows,
+            mode_name="approx_0p1",
+            milestone=0.8,
+            required_fields=("step", "elapsed_seconds"),
+        )
+        self.assertEqual([row["seed"] for row in successful_subset], [11])
 
         rows[1].update(reached=True, step=2500, elapsed_seconds=145.0)
         complete = _fully_reached_milestone_rows(
@@ -199,6 +209,66 @@ class AnalysisContractTests(unittest.TestCase):
             required_fields=("step", "elapsed_seconds"),
         )
         self.assertEqual([row["seed"] for row in complete], [11, 22])
+
+    def test_mean_trajectory_milestones_average_before_crossing(self) -> None:
+        per_seed_rows = {
+            11: [
+                {"step": 1, "true_mass": 0.10, "elapsed_seconds": 1.0},
+                {"step": 2, "true_mass": 0.30, "elapsed_seconds": 2.0},
+                {"step": 3, "true_mass": 0.50, "elapsed_seconds": 3.0},
+                {"step": 4, "true_mass": 0.70, "elapsed_seconds": 4.0},
+                {"step": 5, "true_mass": 0.90, "elapsed_seconds": 5.0},
+            ],
+            22: [
+                {"step": 1, "true_mass": 0.10, "elapsed_seconds": 1.5},
+                {"step": 2, "true_mass": 0.10, "elapsed_seconds": 3.0},
+                {"step": 3, "true_mass": 0.30, "elapsed_seconds": 4.5},
+                {"step": 4, "true_mass": 0.50, "elapsed_seconds": 6.0},
+                {"step": 5, "true_mass": 0.70, "elapsed_seconds": 7.5},
+            ],
+        }
+        intervals = _mean_trajectory_milestone_intervals_from_rows(
+            per_seed_rows,
+            milestones=[0.2, 0.4, 0.6],
+            rolling_window=1,
+            secondary_key="elapsed_seconds",
+        )
+
+        # Mean posterior is [0.10, 0.20, 0.40, 0.60, 0.80], so crossings
+        # occur at steps 2, 3, and 4.  The wall-clock trace is averaged at
+        # those same common steps before interval differencing.
+        self.assertEqual(intervals[0.2]["crossing_step"], 2)
+        self.assertEqual(intervals[0.4]["crossing_step"], 3)
+        self.assertEqual(intervals[0.6]["crossing_step"], 4)
+        self.assertAlmostEqual(intervals[0.2]["step_delta"], 2.0)
+        self.assertAlmostEqual(intervals[0.4]["step_delta"], 1.0)
+        self.assertAlmostEqual(intervals[0.6]["step_delta"], 1.0)
+        self.assertAlmostEqual(intervals[0.2]["secondary_delta"], 2.5)
+        self.assertAlmostEqual(intervals[0.4]["secondary_delta"], 1.25)
+        self.assertAlmostEqual(intervals[0.6]["secondary_delta"], 1.25)
+        self.assertEqual(intervals[0.6]["seed_count"], 2)
+
+    def test_mean_trajectory_milestones_mark_unreached_endpoint(self) -> None:
+        per_seed_rows = {
+            11: [
+                {"step": 1, "true_mass": 0.10, "elapsed_seconds": 1.0},
+                {"step": 2, "true_mass": 0.30, "elapsed_seconds": 2.0},
+            ],
+            22: [
+                {"step": 1, "true_mass": 0.10, "elapsed_seconds": 1.0},
+                {"step": 2, "true_mass": 0.20, "elapsed_seconds": 2.0},
+            ],
+        }
+        intervals = _mean_trajectory_milestone_intervals_from_rows(
+            per_seed_rows,
+            milestones=[0.2, 0.4],
+            rolling_window=1,
+            secondary_key="elapsed_seconds",
+        )
+        self.assertTrue(intervals[0.2]["reached"])
+        self.assertFalse(intervals[0.4]["reached"])
+        self.assertIsNone(intervals[0.4]["step_delta"])
+        self.assertIsNone(intervals[0.4]["secondary_delta"])
 
     def test_checkpoint_markers_follow_the_display_smoothing_window(self) -> None:
         marker_xs, marker_ys = _project_checkpoint_values_onto_displayed_series(

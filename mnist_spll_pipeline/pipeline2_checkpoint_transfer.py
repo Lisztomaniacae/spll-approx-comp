@@ -10,9 +10,9 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from mnist_model import resolve_device, set_seed
-from pipeline2_adaptive import get_runtime_top_k_cutoff, tune_adaptive_top_k_cutoff
 from pipeline2_artifacts import load_compiled_training_module
 from pipeline2_config import (
+    PIPELINE2_READ_MNIST_POLICY,
     aggregate_checkpoint_path,
     checkpoint_transfer_checkpoint_path,
     checkpoint_transfer_run_dir,
@@ -28,9 +28,9 @@ from pipeline2_config import (
 )
 from pipeline2_data import build_model_from_config, generate_sum_case
 from pipeline2_runtime import (
-    DifferentiableReadMNIST,
-    TensorLRUCache,
+    DirectReadMNIST,
     cleanup_torch,
+    get_runtime_top_k_cutoff,
     load_initial_model,
     make_optimizer,
     move_optimizer_state_to_device,
@@ -395,8 +395,6 @@ def _materialize_aggregate_exact_anchor_checkpoints(
     device = resolve_device(str(train_cfg.get("device", "auto")), bool(train_cfg.get("require_mps", False)))
     loss_epsilon = float(train_cfg.get("loss_epsilon", 1.0e-12))
     sum_batch_size = max(1, int(train_cfg.get("sum_batch_size", 1)))
-    data_cfg = config.get("data", {})
-
     total_steps = sum(len(steps) for steps in requested_by_seed.values())
     print(
         f"Materializing {total_steps} exact anchor checkpoint(s) for "
@@ -409,14 +407,8 @@ def _materialize_aggregate_exact_anchor_checkpoints(
         model = load_initial_model(config, initial_checkpoint_path(paths, seed, n_terms), device)
         optimizer = make_optimizer(config, model)
         module = load_compiled_training_module(compiled_program_path(paths, n_terms, mode), n_terms, anchor_mode_name)
-        cache = TensorLRUCache(
-            dataset,
-            device=device,
-            cache_device=str(data_cfg.get("image_cache_device", "device")),
-            max_items=int(data_cfg.get("image_cache_max_items", 4096)),
-            strategy=str(data_cfg.get("image_cache_strategy", "lru")),
-        )
-        setattr(module, "readMNist", DifferentiableReadMNIST(model, cache, device))
+        read_mnist = DirectReadMNIST(model, dataset, device)
+        setattr(module, "readMNist", read_mnist)
         run_preflight(
             module=module,
             model=model,
@@ -453,8 +445,7 @@ def _materialize_aggregate_exact_anchor_checkpoints(
                     module=module,
                     model=model,
                     optimizer=optimizer,
-                    cache=cache,
-                    device=device,
+                    read_mnist=read_mnist,
                     cases=batch_cases,
                     loss_epsilon=loss_epsilon,
                 )
@@ -477,7 +468,6 @@ def _materialize_aggregate_exact_anchor_checkpoints(
                 progress.update(batch_stats["batch_size"], postfix=f"step={cases_seen}")
             progress.finish(postfix="anchors materialized")
         finally:
-            cache.clear()
             cleanup_torch()
 
 
@@ -569,12 +559,10 @@ def _run_checkpoint_transfer_for_mode(
         "anchor_mode_name": anchor_mode_name,
         "segments": len(anchors) - 1,
         "top_k_cutoff": mode.get("top_k_cutoff"),
-        "adaptive_top_k": bool(mode.get("adaptive_top_k", False)),
-        "posterior_mass_target": mode.get("posterior_mass_target"),
+        "read_mnist_policy": PIPELINE2_READ_MNIST_POLICY,
     }
 
     csv_stack = ExitStack()
-    active_cache: Optional[TensorLRUCache] = None
     try:
         segment_handle, segment_writer = csv_stack.enter_context(open_csv_trace(
             target_dir / "checkpoint_transfer_trace.csv",
@@ -604,7 +592,7 @@ def _run_checkpoint_transfer_for_mode(
                 "end_true_mass_recent_mean_transfer",
                 "end_zero_true_mass_recent_rate_transfer",
                 "top_k_cutoff_runtime",
-                "posterior_mass_target",
+                "read_mnist_model_evaluations",
             ],
         ))
         train_trace_handle, train_trace_writer = csv_stack.enter_context(open_csv_trace(
@@ -636,11 +624,11 @@ def _run_checkpoint_transfer_for_mode(
                 "branch_count",
                 "branch_count_mean",
                 "branch_count_total",
+                "read_mnist_calls_total",
+                "read_mnist_model_evaluations_total",
+                "read_mnist_model_evaluations_cumulative",
                 "grad_norm",
                 "top_k_cutoff_runtime",
-                "posterior_mass_target",
-                "cutoff_search_mean_surviving_posterior_mass",
-                "cutoff_search_abs_error",
             ],
         ))
 
@@ -650,8 +638,6 @@ def _run_checkpoint_transfer_for_mode(
         loss_epsilon = float(train_cfg.get("loss_epsilon", 1.0e-12))
         sum_batch_size = max(1, int(train_cfg.get("sum_batch_size", 1)))
         device = resolve_device(str(train_cfg.get("device", "auto")), bool(train_cfg.get("require_mps", False)))
-        data_cfg = config.get("data", {})
-
         progress = TerminalProgressBar(
             len(anchors) - 1,
             desc=f"Transfer {anchor_mode_name}->{mode_name} seed={seed} terms={n_terms}",
@@ -669,29 +655,7 @@ def _run_checkpoint_transfer_for_mode(
             set_seed(stable_int_seed("checkpoint_transfer", seed, n_terms, mode_name, start_step, end_step))
             model, optimizer, _payload = _load_training_checkpoint(config, Path(start_anchor["checkpoint_path"]), device)
             module = load_compiled_training_module(compiled_program_path(paths, n_terms, mode), n_terms, f"transfer_{mode_name}_{segment_index}")
-            cache = TensorLRUCache(
-                dataset,
-                device=device,
-                cache_device=str(data_cfg.get("image_cache_device", "device")),
-                max_items=int(data_cfg.get("image_cache_max_items", 4096)),
-                strategy=str(data_cfg.get("image_cache_strategy", "lru")),
-            )
-            active_cache = cache
-            read_mnist = DifferentiableReadMNIST(model, cache, device)
-            setattr(module, "readMNist", read_mnist)
-            adaptive_cutoff_state = tune_adaptive_top_k_cutoff(
-                config=config,
-                mode=mode,
-                module=module,
-                model=model,
-                cache=cache,
-                device=device,
-                split_manifest=split_manifest,
-                seed=seed,
-                n_terms=n_terms,
-                step=start_step,
-                reason="checkpoint_transfer_preflight",
-            )
+            read_mnist = DirectReadMNIST(model, dataset, device)
             setattr(module, "readMNist", read_mnist)
             run_preflight(
                 module=module,
@@ -725,6 +689,7 @@ def _run_checkpoint_transfer_for_mode(
                     target_posterior_stop_value = _optional_float(end_anchor.get("threshold"))
             reached_target_checkpoint = False
             optimizer_update = 0
+            cumulative_read_mnist_model_evaluations = 0
             last_loss: Optional[float] = None
             last_true_mass: Optional[float] = None
             last_zero_rate: Optional[float] = None
@@ -747,8 +712,7 @@ def _run_checkpoint_transfer_for_mode(
                     module=module,
                     model=model,
                     optimizer=optimizer,
-                    cache=cache,
-                    device=device,
+                    read_mnist=read_mnist,
                     cases=batch_cases,
                     loss_epsilon=loss_epsilon,
                 )
@@ -776,6 +740,11 @@ def _run_checkpoint_transfer_for_mode(
                     reached_target_this_update = True
                 branch_count_mean = batch_stats["branch_count_mean"]
                 branch_count_total = batch_stats["branch_count_total"]
+                read_mnist_calls_total = int(batch_stats["read_mnist_calls_total"] or 0)
+                read_mnist_model_evaluations_total = int(
+                    batch_stats["read_mnist_model_evaluations_total"] or 0
+                )
+                cumulative_read_mnist_model_evaluations += read_mnist_model_evaluations_total
                 train_trace_writer.writerow(
                     {
                         "segment_index": segment_index,
@@ -804,11 +773,11 @@ def _run_checkpoint_transfer_for_mode(
                         "branch_count": branch_count_mean,
                         "branch_count_mean": branch_count_mean,
                         "branch_count_total": branch_count_total,
+                        "read_mnist_calls_total": read_mnist_calls_total,
+                        "read_mnist_model_evaluations_total": read_mnist_model_evaluations_total,
+                        "read_mnist_model_evaluations_cumulative": cumulative_read_mnist_model_evaluations,
                         "grad_norm": last_grad_norm,
                         "top_k_cutoff_runtime": get_runtime_top_k_cutoff(module, mode),
-                        "posterior_mass_target": mode.get("posterior_mass_target"),
-                        "cutoff_search_mean_surviving_posterior_mass": (adaptive_cutoff_state or {}).get("mean_surviving_posterior_mass"),
-                        "cutoff_search_abs_error": (adaptive_cutoff_state or {}).get("abs_error"),
                     }
                 )
                 if optimizer_update % 25 == 0 or cases_seen >= end_step or reached_target_this_update:
@@ -859,13 +828,11 @@ def _run_checkpoint_transfer_for_mode(
                 "end_true_mass_recent_mean_transfer": rolling_true_mass,
                 "end_zero_true_mass_recent_rate_transfer": recent_mean(list(recent_zeros)),
                 "top_k_cutoff_runtime": get_runtime_top_k_cutoff(module, mode),
-                "posterior_mass_target": mode.get("posterior_mass_target"),
+                "read_mnist_model_evaluations": int(cumulative_read_mnist_model_evaluations),
             }
             segment_rows.append(row)
             segment_writer.writerow(row)
             segment_handle.flush()
-            cache.clear()
-            active_cache = None
             cleanup_torch()
             status_label = "reached" if reached_target_checkpoint else "budget"
             progress.update(postfix=f"{status_label} step {actual_end_step}/{end_step}, p={float(rolling_true_mass or 0.0):.3f}")
@@ -884,8 +851,6 @@ def _run_checkpoint_transfer_for_mode(
         raise
     finally:
         csv_stack.close()
-        if active_cache is not None:
-            active_cache.clear()
         cleanup_torch()
 
 

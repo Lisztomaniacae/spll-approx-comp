@@ -160,7 +160,7 @@ Pipeline II tests whether SPLL approximation changes the **training process itse
 | `train_spll_generated.py` | Coordinates the active fixed-budget training path. |
 | `visualize_spll_training.py` | Coordinates tables and figures. |
 | `pipeline2_config.py`, `pipeline2_data.py`, `pipeline2_artifacts.py` | Pipeline II configuration, dataset/schedule, and generated-artifact boundaries. |
-| `pipeline2_runtime.py`, `pipeline2_adaptive.py` | Differentiable runtime primitives and adaptive cutoff search. |
+| `pipeline2_runtime.py` | Differentiable direct-uncached `readMNist` runtime primitives. |
 | `pipeline2_checkpoint_transfer.py` | Aggregate exact-checkpoint selection and approximate transfer runs. |
 | `pipeline2_analysis.py`, `pipeline2_plotting.py` | Training-result aggregation and figure construction. |
 
@@ -172,23 +172,13 @@ Pipeline II uses the official MNIST training partition only. It builds a balance
 loss = mean_i(-log(p_true_sum_i + epsilon))
 ```
 
-The generated SPLL artifact remains the source of truth for exact/approximate pruning. The training loop batches CNN evaluation outside the scalar generated-SPLL calls so gradients still flow back to the CNN.
+The generated SPLL artifact remains the source of truth for exact/approximate pruning. Pipeline II deliberately uses a direct, uncached `readMNist` callback: every generated `readMNist(index)` invocation reloads that MNIST sample and executes a fresh CNN forward pass. There is no per-batch probability table, tensor LRU, memoization, or model-output lookup. This makes pruning-induced reductions in generated neural calls part of the measured training cost instead of hiding them behind precomputation.
 
-Adaptive posterior-mass approximation is available through an inference mode such as:
-
-```yaml
-inference_modes:
-  - name: approx_mass_0p8
-    top_k_cutoff: auto
-    adaptive_top_k: true
-    posterior_mass_target: 0.8
-```
-
-This compiles the adaptive approximate SPLL artifact under the fixed artifact directory `cutoff_topk`, then mutates the generated module-level `TOP_K_CUTOFF` at runtime. The deterministic bounded search targets the configured mean surviving posterior mass, with `0.8` as the default thesis-facing target. Training now writes `adaptive_topk_events.csv` for selected runtime cutoffs over training and `adaptive_topk_search_trace.csv` for the per-candidate bisection path.
+Pipeline II supports only exact inference and fixed numeric cutoffs. Adaptive posterior-mass cutoff selection is intentionally not part of Pipeline II; that mechanism remains available in Pipeline I.
 
 Trace `step` values are measured in **training iterations / sum cases seen**. The redesigned benchmark keeps `training.sum_batch_size: 1`, so one step is one iteration. Pure exact and pure approximate runs train for the configured fixed `max_steps`; there is no validation-driven early stopping.
 
-Checkpoints are now computed after all pure exact seeds finish. The pipeline first averages the exact training `p(true_sum)` trace across seeds, then applies a strict full-window rolling mean over `checkpointing.rolling_window_updates` (default 50), and then finds crossings of `checkpointing.posterior_thresholds`. The first 50-point rolling value is emitted only after 50 updates; shorter prefix windows are not used. These aggregate posterior checkpoints become the exact anchors for checkpoint-transfer approximate runs. Held-out full-posterior validation remains available as old diagnostic plumbing, but it is disabled in the default redesigned benchmark and is not used for checkpointing or plots.
+Checkpoints are now computed after all pure exact seeds finish. The pipeline first averages the exact training `p(true_sum)` trace across seeds, then applies a strict full-window rolling mean over `checkpointing.rolling_window_updates` (default 100), and then finds crossings of `checkpointing.posterior_thresholds`. The first 100-point rolling value is emitted only after 100 updates; shorter prefix windows are not used. These aggregate posterior checkpoints become the exact anchors for checkpoint-transfer approximate runs. Held-out full-posterior validation remains available as old diagnostic plumbing, but it is disabled in the default redesigned benchmark and is not used for checkpointing or plots.
 
 Checkpoint-transfer approximate runs load the per-seed exact step checkpoint at each aggregate anchor step and reuse the complete deterministic sum-case interval `s_A+1..s_B` that the aggregate exact curve used between anchors. Reaching or exceeding the next exact checkpoint's displayed rolling posterior value is recorded as diagnostic metadata, but it does not stop the continuation early. Therefore every green segment ends at the next anchor's training iteration, including when approximation rises above the target posterior before that iteration. In trajectory figures, exact aggregate posterior checkpoints are shown as distinct purple X markers on the displayed exact curve, and the green curve is drawn as separate pieces so segment restarts are visible. Checkpoint **steps** remain defined by `checkpointing.rolling_window_updates`, but marker heights and the visual green anchor are sampled from the currently displayed exact curve. Consequently, changing `visualization.trace_smoothing_window_points` cannot detach the X markers from the blue line.
 
@@ -254,7 +244,7 @@ Recovery-only checkpoint-transfer run:
 Default output root:
 
 ```text
-outputs/spll_training/
+outputs/spll_training_direct_uncached/
 ```
 
 Smoke-test output root:
@@ -275,12 +265,10 @@ Important artifacts:
 | `generated/compiled_python/**/program.py` | Generated Python inference artifacts. |
 | `runs/*/train_trace.csv` | Training trace. |
 | `aggregate_checkpoints/terms_*_exact_posterior_checkpoints.json` | Aggregate exact rolling-mean posterior checkpoints used as transfer anchors. |
-| `runs/*/adaptive_topk_events.csv` | Adaptive top-k refresh events: selected runtime cutoff, achieved mass, error, and search metadata. |
-| `runs/*/adaptive_topk_search_trace.csv` | Per-evaluation bisection trace for adaptive top-k cutoff search. |
 | `runs/*/milestones.json` | Backward-compatible alias for posterior checkpoint crossings. |
 | `runs/*/checkpoints/steps/step_*.pt`, `posterior_*.pt`, and `final.pt` | Exact step snapshots for aggregate-anchor transfer plus per-run posterior/final snapshots. |
-| `visualization/tables/*.csv` | Milestone, aggregate, and adaptive top-k calibration tables. |
-| `visualization/figures/**/*.png` | Fixed-budget loss/posterior, checkpoint-transfer, and adaptive top-k figures. |
+| `visualization/tables/*.csv` | Milestone, aggregate, run-summary, and checkpoint-transfer tables. |
+| `visualization/figures/**/*.png` | Fixed-budget loss/posterior, checkpoint-transfer, and MNIST-model-evaluation figures. |
 
 The training stage is intentionally strict: it refuses to run if prepared or compiled artifacts are missing, if generated probabilities are detached/non-finite, or if gradients become invalid.
 
@@ -439,7 +427,7 @@ Run the focused regression suite from the repository root after changing pipelin
 PYTHONPATH=mnist_spll_pipeline python -m unittest discover -s mnist_spll_pipeline/tests -v
 ```
 
-The tests cover deterministic source/case generation, config and path contracts, cache behavior, adaptive cutoff order, strict rolling windows, checkpoint selection/schema, analysis aggregation, lightweight imports, the diagnostic compatibility facades, and a tiny fixed-budget Pipeline II training run.
+The tests cover deterministic source/case generation, config and path contracts, Pipeline I cache/adaptive behavior, Pipeline II direct-uncached model-call invariants, strict rolling windows, checkpoint selection/schema, analysis aggregation, lightweight imports, the diagnostic compatibility facades, and a tiny fixed-budget Pipeline II training run.
 
 - Update [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md) in the same patch whenever behavior, workflow, schemas, commands, caveats, or architecture change.
 - Keep exact and approximate inference comparable. Avoid process-global caching or other run-order effects that can make one cutoff look faster for external reasons.
