@@ -1,5 +1,5 @@
 seed: 42
-seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
+seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61]
 show_progress: true
 
 paths:
@@ -39,7 +39,7 @@ training:
   # Number of SPLL sum cases accumulated into one optimizer update.
   # The redesigned benchmark uses batch=1 so one training step is one iteration.
   sum_batch_size: 1
-  max_steps: 4000     # fixed training iterations / sum cases; no early stopping
+  max_steps: 5000     # fixed training iterations / sum cases; no early stopping
   loss_epsilon: 1.0e-12
 
 checkpointing:
@@ -81,7 +81,7 @@ visualization:
 experiments:
   - n_terms: 2
     enabled: true
-    max_steps: 4000
+    max_steps: 5000
 
 inference_modes:
   - name: exact
