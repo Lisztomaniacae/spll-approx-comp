@@ -626,6 +626,7 @@ def _plot_combined_checkpoint_transfer_metric(
     output_path: Path,
     smooth_window: int,
     as_percent: bool = False,
+    y_min_override: Optional[float] = None,
 ) -> None:
     if not mode_names:
         return
@@ -703,8 +704,11 @@ def _plot_combined_checkpoint_transfer_metric(
                 # the logarithmic loss axis and prevents low-loss checkpoints
                 # or continuation segments from being clipped.
                 log_padding = (y_max / y_min) ** 0.05
+                lower_bound = y_min / log_padding
+                if y_min_override is not None:
+                    lower_bound = max(lower_bound, y_min_override)
                 for ax in axes:
-                    ax.set_ylim(y_min / log_padding, y_max * log_padding)
+                    ax.set_ylim(lower_bound, y_max * log_padding)
 
     colors = TRAINING_TRACE_COLORS
     legend_handles = [

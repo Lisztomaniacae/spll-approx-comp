@@ -242,6 +242,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             ylabel="Training loss",
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_loss_exact_vs_approx_combined.png",
             smooth_window=smooth_window,
+            y_min_override=1e-1 if n_terms == 2 else None,
         )
         _plot_combined_checkpoint_transfer_metric(
             config=config,
