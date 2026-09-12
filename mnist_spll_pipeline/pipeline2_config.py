@@ -91,7 +91,7 @@ def training_paths(config: Dict[str, Any]) -> TrainingPaths:
     generated_root = root / "generated"
     visualization_root = root / "visualization"
     schedules_root = root / "schedules"
-    figures_root = visualization_root / "figures"
+    figures_root = resolve_path(config, paths_cfg.get("figures_root", "./figures"))
     return TrainingPaths(
         root=root,
         config_used_path=root / "config_used.yaml",

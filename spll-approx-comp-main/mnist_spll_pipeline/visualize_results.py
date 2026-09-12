@@ -223,9 +223,12 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
                 appendix_true_probability_row,
             ],
             appendix_dir / "additional_inference_diagnostics_combined.png",
-            panel_labels=["", ""],
-            height_ratios=[1.0, 0.55],
-            figure_height=6.35,
+            panel_labels=[
+                "(a) Skewed-label runtime–accuracy tradeoff",
+                "(b) Normalized true-sum probability",
+            ],
+            height_ratios=[1.0, 0.82],
+            figure_height=6.55,
         )
 
     overhead_rows = plot_overhead_exact_vs_zero(

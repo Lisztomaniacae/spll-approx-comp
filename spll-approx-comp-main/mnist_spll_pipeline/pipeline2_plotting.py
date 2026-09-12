@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
@@ -10,10 +9,13 @@ import numpy as np
 import matplotlib.ticker as mticker
 from matplotlib.colors import to_rgb
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+from matplotlib.patches import FancyBboxPatch, Patch
 
 from plot_palette import (
     FIGURE_DPI,
+    LEGEND_BOX_ALPHA,
+    LEGEND_BOX_EDGE,
+    LEGEND_BOX_FACE,
     LIGHT_GREY,
     MID_GREY,
     THESIS_GRID_ALPHA,
@@ -74,63 +76,62 @@ def _mode_compact_label(config: Dict[str, Any], mode_name: str) -> str:
     return str(mode_name).replace("_", " ").capitalize()
 
 
-def _flatten_legend_blocks(
-    legend_blocks: Sequence[Tuple[Sequence[Any], str | None, int]],
-) -> List[Any]:
-    handles: List[Any] = []
-    for block_handles, _title, _ncol in legend_blocks:
-        handles.extend(list(block_handles))
-    return handles
+def _legend_container_patch(ax, *, x: float = 0.02, y: float = 0.08, width: float = 0.94, height: float = 0.84) -> FancyBboxPatch:
+    patch = FancyBboxPatch(
+        (x, y),
+        width,
+        height,
+        boxstyle="round,pad=0.02,rounding_size=0.035",
+        transform=ax.transAxes,
+        linewidth=0.9,
+        edgecolor=LEGEND_BOX_EDGE,
+        facecolor=LEGEND_BOX_FACE,
+        alpha=LEGEND_BOX_ALPHA,
+        zorder=0,
+    )
+    ax.add_patch(patch)
+    return patch
 
 
 def _draw_grouped_legend_box(
     legend_ax,
     legend_blocks: Sequence[Tuple[Sequence[Any], str | None, int]],
     *,
-    x: float = 0.06,
+    x: float = 0.07,
     title_fontsize: float = THESIS_LEGEND_SIZE,
     entry_fontsize: float = THESIS_LEGEND_SIZE - 0.2,
 ) -> None:
-    del title_fontsize
-    handles = _flatten_legend_blocks(legend_blocks)
-    legend_ax.axis("off")
-    if not handles:
+    blocks = [(list(handles), title, max(1, int(ncol))) for handles, title, ncol in legend_blocks if list(handles)]
+    if not blocks:
+        legend_ax.axis("off")
         return
-    legend = legend_ax.legend(
-        handles=handles,
-        loc="upper left",
-        bbox_to_anchor=(x, 0.92),
-        ncol=1,
-        fontsize=entry_fontsize,
-        frameon=True,
-        fancybox=True,
-        borderaxespad=0.0,
-        borderpad=0.75,
-        labelspacing=0.64,
-        handlelength=1.9,
-        handletextpad=0.65,
-    )
-    style_legend_frame(legend)
-
-
-def _legend_input_for_row_major_display(handles: Sequence[Any], ncol: int) -> List[Any]:
-    """Reorder handles so Matplotlib's column-major legend reads row-major."""
-
-    items = list(handles)
-    ncol = max(1, min(int(ncol), len(items))) if items else 1
-    nrows = int(math.ceil(len(items) / ncol)) if items else 0
-    rows: List[List[Any]] = []
-    cursor = 0
-    for _row in range(nrows):
-        take = min(ncol, len(items) - cursor)
-        rows.append(items[cursor:cursor + take])
-        cursor += take
-    ordered: List[Any] = []
-    for col in range(ncol):
-        for row in rows:
-            if col < len(row):
-                ordered.append(row[col])
-    return ordered
+    legend_ax.axis("off")
+    _legend_container_patch(legend_ax, x=x - 0.03, y=0.08, width=0.90, height=0.84)
+    if len(blocks) == 1:
+        title_positions, legend_positions = [0.86], [0.76]
+    elif len(blocks) == 2:
+        title_positions, legend_positions = [0.88, 0.50], [0.80, 0.42]
+    else:
+        title_positions, legend_positions = [0.90, 0.62, 0.33], [0.82, 0.54, 0.25]
+    for idx, ((handles, title, ncol), title_y, legend_y) in enumerate(zip(blocks, title_positions, legend_positions)):
+        if title:
+            legend_ax.text(x, title_y, title, transform=legend_ax.transAxes, ha="left", va="top", fontsize=title_fontsize)
+        legend = legend_ax.legend(
+            handles=handles,
+            loc="upper left",
+            bbox_to_anchor=(x, legend_y),
+            ncol=ncol,
+            fontsize=entry_fontsize,
+            frameon=False,
+            borderaxespad=0.0,
+            labelspacing=0.48,
+            handlelength=1.9,
+            handletextpad=0.55,
+            columnspacing=1.0,
+        )
+        legend._legend_box.align = "left"
+        if idx < len(blocks) - 1:
+            legend_ax.add_artist(legend)
 
 
 def _draw_horizontal_grouped_legend_box(
@@ -143,29 +144,33 @@ def _draw_horizontal_grouped_legend_box(
     title_fontsize: float = THESIS_LEGEND_SIZE,
     entry_fontsize: float = THESIS_LEGEND_SIZE - 0.15,
 ) -> None:
-    del bounds, title_x, legend_x, title_fontsize
-    handles = _flatten_legend_blocks(legend_rows)
-    if not handles:
+    rows = [(list(handles), title, max(1, int(ncol))) for handles, title, ncol in legend_rows if list(handles)]
+    if not rows:
         return
-    requested_columns = max((max(1, int(ncol)) for _handles, _title, ncol in legend_rows), default=1)
-    ncol = min(max(2, requested_columns), len(handles), 3)
-    handles = _legend_input_for_row_major_display(handles, ncol)
-    legend = fig.legend(
-        handles=handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.978),
-        ncol=ncol,
-        fontsize=entry_fontsize,
-        frameon=True,
-        fancybox=True,
-        borderaxespad=0.0,
-        borderpad=0.75,
-        labelspacing=0.62,
-        handlelength=1.9,
-        handletextpad=0.65,
-        columnspacing=1.00,
-    )
-    style_legend_frame(legend)
+    legend_ax = fig.add_axes(bounds)
+    legend_ax.axis("off")
+    _legend_container_patch(legend_ax, x=0.01, y=0.10, width=0.98, height=0.80)
+    title_positions = [0.74, 0.34] if len(rows) == 2 else list(np.linspace(0.78, 0.24, len(rows)))
+    legend_positions = [0.60, 0.20] if len(rows) == 2 else list(np.linspace(0.66, 0.12, len(rows)))
+    for idx, ((handles, title, ncol), title_y, legend_y) in enumerate(zip(rows, title_positions, legend_positions)):
+        if title:
+            legend_ax.text(title_x, float(title_y), title, transform=legend_ax.transAxes, ha="left", va="top", fontsize=title_fontsize)
+        legend = legend_ax.legend(
+            handles=handles,
+            loc="upper left",
+            bbox_to_anchor=(legend_x, float(legend_y)),
+            ncol=ncol,
+            fontsize=entry_fontsize,
+            frameon=False,
+            borderaxespad=0.0,
+            labelspacing=0.48,
+            handlelength=1.9,
+            handletextpad=0.55,
+            columnspacing=1.0,
+        )
+        legend._legend_box.align = "left"
+        if idx < len(rows) - 1:
+            legend_ax.add_artist(legend)
 
 
 def _reached_milestone_rows(
@@ -813,7 +818,7 @@ def _plot_combined_checkpoint_transfer_metric(
     colors = TRAINING_TRACE_COLORS
     legend_handles = [
         Line2D([0], [0], color=colors["exact"], linewidth=1.45, label="Exact"),
-        Line2D([0], [0], color=colors["pure"], linewidth=1.4, label="Approximate from\ninitialization"),
+        Line2D([0], [0], color=colors["pure"], linewidth=1.4, label="Approximate from initialization"),
         Line2D(
             [0],
             [0],
@@ -821,7 +826,7 @@ def _plot_combined_checkpoint_transfer_metric(
             marker="X",
             markersize=8,
             linewidth=0,
-            label="Exact milestone\nanchors",
+            label="Exact milestone anchors",
         ),
         Line2D([0], [0], color=colors["transfer"], linewidth=1.4, label="Checkpoint transfer"),
     ]
@@ -830,9 +835,8 @@ def _plot_combined_checkpoint_transfer_metric(
         _draw_grouped_legend_box(
             axes[len(mode_names)],
             [(legend_handles, "Training trajectory", 1)],
-            x=0.06,
             title_fontsize=THESIS_LEGEND_SIZE,
-            entry_fontsize=THESIS_LEGEND_SIZE - 0.15,
+            entry_fontsize=THESIS_LEGEND_SIZE - 0.1,
         )
         for ax in axes[len(mode_names) + 1:]:
             ax.axis("off")
@@ -848,7 +852,7 @@ def _plot_combined_checkpoint_transfer_metric(
         )
     fig.supxlabel("Training step", y=0.026, fontsize=THESIS_PANEL_LABEL_SIZE - 0.8)
     fig.supylabel(ylabel, x=0.032, fontsize=THESIS_PANEL_LABEL_SIZE - 0.8)
-    fig.subplots_adjust(left=0.11, right=0.98, top=0.96, bottom=0.13, hspace=0.40, wspace=0.20)
+    fig.subplots_adjust(left=0.11, right=0.98, top=0.96, bottom=0.13, hspace=0.34, wspace=0.16)
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
@@ -1142,7 +1146,7 @@ def _draw_checkpoint_cost_panel(
 
     ax.set_ylim(0.0, left_top)
     ax_right.set_ylabel(right_label)
-    ax.set_title(panel_label, loc="left", fontsize=THESIS_PANEL_LABEL_SIZE - 1.0, pad=5)
+    ax.set_title(panel_label, loc="left", fontsize=THESIS_PANEL_LABEL_SIZE, pad=6)
     ax.set_xticks(x_positions)
     interval_starts = [0.0, *milestones[:-1]]
     interval_labels = [
@@ -1179,7 +1183,7 @@ def _plot_combined_dual_axis_checkpoint_costs(
     fig, axes = plt.subplots(
         2,
         1,
-        figsize=(THESIS_TEXT_WIDTH_IN, 6.45),
+        figsize=(THESIS_TEXT_WIDTH_IN, 6.25),
         sharex=True,
         constrained_layout=False,
     )
@@ -1190,7 +1194,7 @@ def _plot_combined_dual_axis_checkpoint_costs(
         n_terms=n_terms,
         secondary_key="elapsed_seconds",
         right_label="Wall-clock time (s)",
-        panel_label="(a)",
+        panel_label="(a) Wall-clock time",
         show_x_ticklabels=False,
     )
     handles_bottom, unreached_bottom = _draw_checkpoint_cost_panel(
@@ -1200,7 +1204,7 @@ def _plot_combined_dual_axis_checkpoint_costs(
         n_terms=n_terms,
         secondary_key="read_mnist_model_evaluations_cumulative",
         right_label="Neural model evaluations",
-        panel_label="(b)",
+        panel_label="(b) Neural model evaluations",
         show_x_ticklabels=True,
     )
     mode_handles = handles_top or handles_bottom
@@ -1210,7 +1214,7 @@ def _plot_combined_dual_axis_checkpoint_costs(
 
     encoding_handles: List[Any] = [
         Patch(facecolor=LIGHT_GREY, edgecolor=MID_GREY, linewidth=1.0, label="Optimizer steps (outer)"),
-        Patch(facecolor=MID_GREY, edgecolor="#44515F", linewidth=1.0, label="Inner bars"),
+        Patch(facecolor=MID_GREY, edgecolor="#44515F", linewidth=1.0, label="Panel cost (inner)"),
     ]
     if unreached_top or unreached_bottom:
         encoding_handles.append(
@@ -1221,17 +1225,17 @@ def _plot_combined_dual_axis_checkpoint_costs(
         fig,
         bounds=(0.11, 0.865, 0.78, 0.09),
         legend_rows=[
-            (mode_handles, "Inference mode", 2),
-            (encoding_handles, "Bar encoding", 2),
+            (mode_handles, "Inference mode", max(2, min(4, len(mode_handles)))),
+            (encoding_handles, "Bar encoding", len(encoding_handles)),
         ],
         title_x=0.04,
         legend_x=0.28,
         title_fontsize=THESIS_LEGEND_SIZE - 0.05,
         entry_fontsize=THESIS_LEGEND_SIZE - 0.2,
     )
-    fig.supxlabel("True-sum probability milestone interval", y=0.030, fontsize=THESIS_PANEL_LABEL_SIZE - 1.0)
-    fig.supylabel("Optimizer steps", x=0.034, fontsize=THESIS_PANEL_LABEL_SIZE - 1.0)
-    fig.subplots_adjust(left=0.13, right=0.87, top=0.79, bottom=0.12, hspace=0.31)
+    fig.supxlabel("True-sum probability milestone interval", y=0.026, fontsize=THESIS_PANEL_LABEL_SIZE - 0.8)
+    fig.supylabel("Optimizer steps", x=0.032, fontsize=THESIS_PANEL_LABEL_SIZE - 0.8)
+    fig.subplots_adjust(left=0.13, right=0.87, top=0.82, bottom=0.11, hspace=0.34)
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
@@ -1785,8 +1789,7 @@ def _plot_checkpoint_transfer_metric_trajectory(
     ax.grid(True, alpha=THESIS_GRID_ALPHA)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    legend_loc = "lower right" if value_key in {"true_mass", "true_mass_recent_mean"} else "upper right"
-    style_legend_frame(ax.legend(loc=legend_loc, fontsize=THESIS_LEGEND_SIZE))
+    style_legend_frame(ax.legend(loc="best", fontsize=THESIS_LEGEND_SIZE))
     fig.tight_layout()
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
@@ -1934,7 +1937,7 @@ def _plot_metric_for_terms(
         )
 
     if plotted_modes:
-        handles, _labels = ax.get_legend_handles_labels()
+        handles, labels = ax.get_legend_handles_labels()
         if incomplete_markers:
             handles.append(
                 Line2D(
@@ -1947,26 +1950,10 @@ def _plot_metric_for_terms(
                     label="Not reached by all seeds",
                 )
             )
-        ncol = min(3, len(handles))
-        display_handles = _legend_input_for_row_major_display(handles, ncol)
-        legend = fig.legend(
-            handles=display_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 0.985),
-            ncol=ncol,
-            fontsize=THESIS_LEGEND_SIZE - 0.2,
-            frameon=True,
-            fancybox=True,
-            borderpad=0.60,
-            labelspacing=0.50,
-            handlelength=1.8,
-            handletextpad=0.55,
-            columnspacing=1.05,
-        )
-        style_legend_frame(legend)
-        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
-    else:
-        fig.tight_layout()
+            labels.append("Not reached by all seeds")
+        style_legend_frame(ax.legend(handles, labels, loc="best", fontsize=THESIS_LEGEND_SIZE))
+
+    fig.tight_layout()
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -2091,12 +2078,11 @@ def _combine_vertical_figure_assets(
     if not input_paths or any(not path.exists() for path in input_paths):
         return
     fig = plt.figure(figsize=(THESIS_TEXT_WIDTH_IN, float(figure_height)), constrained_layout=False)
-    grid = fig.add_gridspec(len(input_paths), 1, height_ratios=list(height_ratios), hspace=0.065)
+    grid = fig.add_gridspec(len(input_paths), 1, height_ratios=list(height_ratios), hspace=0.10)
     for idx, (path, label) in enumerate(zip(input_paths, panel_labels)):
         ax = fig.add_subplot(grid[idx, 0])
         ax.imshow(plt.imread(path))
         ax.set_axis_off()
-        ax.set_anchor("W")
         ax.text(
             0.002,
             1.002,
@@ -2104,7 +2090,7 @@ def _combine_vertical_figure_assets(
             transform=ax.transAxes,
             ha="left",
             va="bottom",
-            fontsize=THESIS_PANEL_LABEL_SIZE - 1.2,
+            fontsize=THESIS_PANEL_LABEL_SIZE,
         )
     ensure_dir(output_path.parent)
     fig.subplots_adjust(left=0.005, right=0.995, top=0.985, bottom=0.005)

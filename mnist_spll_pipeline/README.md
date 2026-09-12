@@ -127,6 +127,8 @@ Default output root:
 outputs/spll_experiments/
 ```
 
+Thesis figures are written separately to `./figures/` so both visualization stages populate one repo-local bundle.
+
 Important artifacts:
 
 | Path | Produced by | Contents |
@@ -136,7 +138,7 @@ Important artifacts:
 | `inference_manifest.json` | `infer` | Inference run metadata. |
 | `inference_runs.json` | `infer` | Raw posterior/runtime/branch-count records. |
 | `visualization/tables/*.csv` | `visualize` | Derived result tables. |
-| `visualization/figures/**/*.png` | `visualize` | Main and appendix figures. The standard runtime centerpiece remains `main_text/runtime_accuracy_tradeoff_by_terms.png`; `main_text/mnist_lookup_accuracy_tradeoff_by_terms.png` reports mean generated `readMNist` calls against retained accuracy; biased runtime counterparts are isolated in `main_text/runtime_accuracy_tradeoff_biased_models_by_terms.png`. |
+| `figures/**/*.png` | `visualize` | Main and appendix figures. The standard runtime centerpiece remains `main_text/runtime_accuracy_tradeoff_by_terms.png`; `main_text/mnist_lookup_accuracy_tradeoff_by_terms.png` reports mean generated `readMNist` calls against retained accuracy; biased runtime counterparts are isolated in `main_text/runtime_accuracy_tradeoff_biased_models_by_terms.png`. |
 
 Treat `inference_runs.json` as the main empirical artifact. Visualization should derive results from it rather than rerunning inference.
 
@@ -182,7 +184,7 @@ Checkpoints are now computed after all pure exact seeds finish. The pipeline fir
 
 Checkpoint-transfer approximate runs load the per-seed exact step checkpoint at each aggregate anchor step and reuse the complete deterministic sum-case interval `s_A+1..s_B` that the aggregate exact curve used between anchors. Reaching or exceeding the next exact checkpoint's displayed rolling posterior value is recorded as diagnostic metadata, but it does not stop the continuation early. Therefore every green segment ends at the next anchor's training iteration, including when approximation rises above the target posterior before that iteration. In trajectory figures, exact aggregate posterior checkpoints are shown as distinct purple X markers on the displayed exact curve, and the green curve is drawn as separate pieces so segment restarts are visible. Checkpoint **steps** remain defined by `checkpointing.rolling_window_updates`, but marker heights and the visual green anchor are sampled from the currently displayed exact curve. Consequently, changing `visualization.trace_smoothing_window_points` cannot detach the X markers from the blue line.
 
-Pipeline II thesis-facing combined trace figures use a shared figure-level legend, no gray subtitle under the title, no legend title, and slim lines for the pure exact, pure approximate, and approximate-continuation curves. Loss plots use data-driven logarithmic y-limits with padding; do not reintroduce fixed loss limits because low-loss checkpoints and continuation segments can be clipped. All thesis figures are exported as 300 dpi PNGs and should be sized as if they will be embedded at approximately A4 page width. Keep these conventions in sync with `plot_palette.py`, `pipeline1_plotting.py`, and `pipeline2_plotting.py` when changing the plots.
+Pipeline II thesis-facing combined trace figures use a shared figure-level legend, no global plot title, no legend title, and slim lines for the pure exact, pure approximate, and checkpoint-transfer curves. Loss plots use data-driven logarithmic y-limits with padding; do not reintroduce fixed loss limits because low-loss milestones and continuation segments can be clipped. Thesis figures are exported as 300 dpi PNGs at the TU report text-block width; three-condition panel figures use a compact 2x2 layout so labels remain readable after LaTeX embedding. Keep these conventions in sync with `plot_palette.py`, `pipeline1_plotting.py`, and `pipeline2_plotting.py` when changing the plots.
 
 Posterior-checkpoint bar figures show a mode/checkpoint pair only when **every configured seed** reached that target and supplied the plotted metric values. A target reached by only a subset of seeds remains visible in the CSV/JSON aggregate tables through `reached_seed_count`, but its bars are omitted instead of displaying a successful-subset mean as though the run had finished.
 
@@ -247,6 +249,8 @@ Default output root:
 outputs/spll_training_direct_uncached/
 ```
 
+Thesis figures are written to the same repo-local `./figures/` bundle used by Pipeline I.
+
 Smoke-test output root:
 
 ```text
@@ -268,7 +272,7 @@ Important artifacts:
 | `runs/*/milestones.json` | Backward-compatible alias for posterior checkpoint crossings. |
 | `runs/*/checkpoints/steps/step_*.pt`, `posterior_*.pt`, and `final.pt` | Exact step snapshots for aggregate-anchor transfer plus per-run posterior/final snapshots. |
 | `visualization/tables/*.csv` | Milestone, aggregate, run-summary, and checkpoint-transfer tables. |
-| `visualization/figures/**/*.png` | Fixed-budget loss/posterior, checkpoint-transfer, and MNIST-model-evaluation figures. |
+| `figures/**/*.png` | Fixed-budget loss/probability, checkpoint-transfer, and neural-model-evaluation figures. |
 
 The training stage is intentionally strict: it refuses to run if prepared or compiled artifacts are missing, if generated probabilities are detached/non-finite, or if gradients become invalid.
 

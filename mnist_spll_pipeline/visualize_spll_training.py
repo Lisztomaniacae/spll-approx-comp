@@ -12,8 +12,10 @@ from pipeline2_analysis import (
 )
 from pipeline2_config import get_checkpoint_transfer_config, get_experiments, get_inference_modes, training_paths, validate_pipeline2_config
 from pipeline2_plotting import (
+    _combine_vertical_figure_assets,
     _plot_checkpoint_transfer_metric_trajectory,
     _plot_combined_checkpoint_transfer_metric,
+    _plot_combined_dual_axis_checkpoint_costs,
     _plot_dual_axis_checkpoint_bars,
     _plot_dual_axis_checkpoint_model_evaluation_bars,
     _plot_metric_for_terms,
@@ -165,13 +167,20 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_posterior_checkpoint_model_evaluations_dual_axis.png",
         )
+        _plot_combined_dual_axis_checkpoint_costs(
+            config=config,
+            rows=rows,
+            run_summaries=run_summaries,
+            n_terms=n_terms,
+            output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_milestone_costs_combined.png",
+        )
         _plot_metric_for_terms(
             config=config,
             rows=rows,
             run_summaries=run_summaries,
             n_terms=n_terms,
             metric="step",
-            ylabel="Steps to posterior checkpoint",
+            ylabel="Optimizer steps to milestone",
             output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_steps_to_true_sum_posterior_checkpoint.png",
         )
         _plot_metric_for_terms(
@@ -180,7 +189,7 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             run_summaries=run_summaries,
             n_terms=n_terms,
             metric="elapsed_seconds",
-            ylabel="Seconds to posterior checkpoint",
+            ylabel="Wall-clock time to milestone (s)",
             output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_time_to_true_sum_posterior_checkpoint.png",
             maybe_log=True,
         )
@@ -204,16 +213,18 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             ylabel="Training loss",
             output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_training_loss_raw_trace.png",
             smooth_window=1,
+            legend_loc="upper right",
+            legend_bbox=None,
         )
         _plot_trace(
             config=config,
             n_terms=n_terms,
             trace_name="train_trace.csv",
             value_key="true_mass",
-            ylabel="True-sum mass",
+            ylabel="Training-time true-sum probability",
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_true_mass_trace.png",
             smooth_window=smooth_window,
-            legend_loc="upper left",
+            legend_loc="lower right",
             legend_bbox=None,
             show_footer=False,
         )
@@ -222,9 +233,11 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             n_terms=n_terms,
             trace_name="train_trace.csv",
             value_key="true_mass",
-            ylabel="True-sum mass",
+            ylabel="Training-time true-sum probability",
             output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_true_mass_raw_trace.png",
             smooth_window=1,
+            legend_loc="lower right",
+            legend_bbox=None,
         )
         checkpoint_transfer_cfg = get_checkpoint_transfer_config(config)
         anchor_mode_name = str(checkpoint_transfer_cfg.get("anchor_mode_name", "exact"))
@@ -250,10 +263,23 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
             mode_names=combined_transfer_modes,
             anchor_mode_name=anchor_mode_name,
             value_key="true_mass",
-            ylabel="True-sum posterior (%)",
+            ylabel="Training-time true-sum probability",
             output_path=paths.figures_main_text_root / f"terms_{n_terms:02d}_true_mass_exact_vs_approx_combined.png",
             smooth_window=smooth_window,
-            as_percent=True,
+            as_percent=False,
+        )
+        _combine_vertical_figure_assets(
+            input_paths=[
+                paths.figures_main_text_root / f"terms_{n_terms:02d}_training_loss_trace.png",
+                paths.figures_main_text_root / f"terms_{n_terms:02d}_loss_exact_vs_approx_combined.png",
+            ],
+            output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_training_loss_diagnostics_combined.png",
+            panel_labels=[
+                "(a) Pure-run training loss",
+                "(b) Checkpoint-transfer training loss",
+            ],
+            height_ratios=[0.43, 0.57],
+            figure_height=6.75,
         )
         for mode in get_inference_modes(config):
             mode_name = str(mode["name"])
@@ -277,10 +303,10 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
                 mode_name=mode_name,
                 anchor_mode_name=anchor_mode_name,
                 value_key="true_mass",
-                ylabel="True-sum posterior (%)",
+                ylabel="Training-time true-sum probability",
                 output_path=paths.figures_appendix_root / f"terms_{n_terms:02d}_true_mass_exact_vs_{mode_name}.png",
                 smooth_window=smooth_window,
-                as_percent=True,
+                as_percent=False,
             )
         _plot_trace(
             config=config,

@@ -3,6 +3,7 @@ seed: 42
 paths:
   data_root: ./data
   outputs_root: ./outputs
+  figures_root: ./figures
   repo_root: ../haskell-dppl-main
   models_root: ./outputs/models
   model_selection_manifest: ./outputs/models/model_selection_manifest.json

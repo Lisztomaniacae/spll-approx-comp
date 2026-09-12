@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from matplotlib.lines import Line2D
+
 PIPELINE_DIR = Path(__file__).resolve().parents[1]
 if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
@@ -17,6 +19,15 @@ from pipeline1_analysis import (
     summarize_groups,
     top_predictions,
 )
+from pipeline1_plotting import (
+    TRADEOFF_REGIME_LINESTYLES,
+    _legend_input_for_row_major_display,
+    classifier_regime_legend_handles,
+    format_cutoff_axis_value,
+    metric_has_usable_values,
+    term_panel_grid,
+    tradeoff_regime_linestyle,
+)
 from pipeline2_analysis import _uncertainty_half_width
 from pipeline2_plotting import (
     _checkpoint_bar_axis_scaling,
@@ -25,10 +36,51 @@ from pipeline2_plotting import (
     _reached_milestone_rows,
     _project_checkpoint_values_onto_displayed_series,
     _require_checkpoint_transfer_v2_rows,
+    _mode_compact_label,
 )
 
 
 class AnalysisContractTests(unittest.TestCase):
+    def test_three_term_panels_use_two_columns_for_thesis_readability(self) -> None:
+        self.assertEqual(term_panel_grid([2, 3, 4]), (2, 2))
+
+    def test_cutoff_axis_uses_consistent_decimal_labels(self) -> None:
+        self.assertEqual(
+            [format_cutoff_axis_value(value) for value in (0.0, 0.01, 0.05, 0.1, 0.25)],
+            ["0", "0.01", "0.05", "0.10", "0.25"],
+        )
+
+    def test_unavailable_branch_metrics_are_not_plotted_as_zero_results(self) -> None:
+        self.assertFalse(metric_has_usable_values([{"mean_true_candidate_branch_count": None}], "mean_true_candidate_branch_count"))
+        self.assertFalse(metric_has_usable_values([{"mean_total_branch_count": 0.0}], "mean_total_branch_count"))
+        self.assertTrue(metric_has_usable_values([{"mean_total_branch_count": 12.0}], "mean_total_branch_count"))
+        self.assertTrue(metric_has_usable_values([{"true_candidate_survival_rate": 0.0}], "true_candidate_survival_rate"))
+
+    def test_legend_row_major_order_survives_matplotlib_column_layout(self) -> None:
+        handles = [Line2D([0], [0], label=label) for label in ["A", "B", "C", "D", "E"]]
+        ordered = _legend_input_for_row_major_display(handles, 3)
+        self.assertEqual([handle.get_label() for handle in ordered], ["A", "D", "B", "E", "C"])
+
+    def test_tradeoff_regime_line_styles_match_legend_order(self) -> None:
+        self.assertEqual(TRADEOFF_REGIME_LINESTYLES, {50: ":", 70: "--", 90: "-"})
+        self.assertEqual(tradeoff_regime_linestyle("50%"), ":")
+        self.assertEqual(tradeoff_regime_linestyle("70%"), "--")
+        self.assertEqual(tradeoff_regime_linestyle("90%"), "-")
+
+        handles = classifier_regime_legend_handles((50, 70, 90))
+        self.assertEqual([handle.get_label() for handle in handles], ["50%", "70%", "90%"] )
+        self.assertEqual([handle.get_linestyle() for handle in handles], [":", "--", "-"])
+
+    def test_training_plot_labels_hide_repository_mode_ids(self) -> None:
+        config = {
+            "inference_modes": [
+                {"name": "exact", "top_k_cutoff": None},
+                {"name": "approx_0p01", "top_k_cutoff": 0.01},
+            ]
+        }
+        self.assertEqual(_mode_compact_label(config, "exact"), "Exact")
+        self.assertEqual(_mode_compact_label(config, "approx_0p01"), "Cutoff 0.01")
+
     def test_distribution_helpers(self) -> None:
         self.assertEqual(normalize_distribution([2.0, 2.0]), [0.5, 0.5])
         self.assertEqual(normalize_distribution([0.0, 0.0]), [0.0, 0.0])

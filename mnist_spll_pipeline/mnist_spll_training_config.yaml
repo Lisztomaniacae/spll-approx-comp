@@ -5,6 +5,7 @@ show_progress: true
 paths:
   data_root: ./data
   output_root: ./outputs/spll_training_direct_uncached
+  figures_root: ./figures
   repo_root: ../haskell-dppl-main
 
 data:
@@ -69,8 +70,8 @@ checkpoint_transfer:
 visualization:
   trace_smoothing_window_points: 100
   # Across-seed uncertainty shown in milestone error bars and smoothed traces.
-  # Options: std, sem, ci95, none. With three seeds, std is the most honest
-  # default because it shows run-to-run spread without overclaiming precision.
+  # Options: std, sem, ci95, none. Std is the thesis-facing default because it
+  # shows run-to-run spread across the matched seeds without implying a CI.
   uncertainty_interval: std
   min_uncertainty_samples: 2
   show_milestone_error_bars: true
