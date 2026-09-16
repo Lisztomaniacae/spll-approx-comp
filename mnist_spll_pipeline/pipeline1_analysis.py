@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import math
-import random
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean, median
@@ -16,12 +15,6 @@ from pipeline_support import load_json
 
 EPS = 1e-12
 
-
-def set_analysis_seed(seed: int) -> None:
-    """Seed the random generators used by analysis without importing PyTorch."""
-
-    random.seed(int(seed))
-    np.random.seed(int(seed))
 
 
 def normalize_distribution(values: Sequence[float]) -> List[float]:
@@ -454,86 +447,6 @@ def add_exact_baseline_columns(summary_rows: List[Dict[str, Any]], group_keys: S
         )
 
 
-def add_paired_accuracy_delta_intervals(
-        summary_rows: List[Dict[str, Any]],
-        detailed_rows: List[Dict[str, Any]],
-        group_keys: Sequence[str],
-        *,
-        bootstrap_samples: int = 2000,
-        seed: int = 42,
-) -> None:
-    keys_wo_threshold = [key for key in group_keys if key not in {"threshold_label", "cutoff"}]
-
-    summary_by_group: Dict[Tuple[Any, ...], Dict[str, Any]] = {
-        tuple(row[key] for key in group_keys): row
-        for row in summary_rows
-    }
-    baseline_summary_by_group: Dict[Tuple[Any, ...], Dict[str, Any]] = {
-        tuple(row[key] for key in keys_wo_threshold): row
-        for row in summary_rows
-        if str(row.get("threshold_label")) == "exact"
-    }
-
-    detailed_grouped: Dict[Tuple[Any, ...], Dict[int, Dict[str, Any]]] = defaultdict(dict)
-    for row in detailed_rows:
-        group = tuple(row[key] for key in group_keys)
-        detailed_grouped[group][int(row["experiment_id"])] = row
-
-    rng = np.random.default_rng(seed)
-
-    for row in summary_rows:
-        row["accuracy_delta_q25_vs_exact"] = float("nan")
-        row["accuracy_delta_q75_vs_exact"] = float("nan")
-        row["accuracy_delta_ci_lower_vs_exact"] = float("nan")
-        row["accuracy_delta_ci_upper_vs_exact"] = float("nan")
-
-        current_group = tuple(row[key] for key in group_keys)
-        baseline_group = tuple(row[key] for key in keys_wo_threshold)
-        baseline_summary = baseline_summary_by_group.get(baseline_group)
-        if baseline_summary is None:
-            continue
-
-        if str(row.get("threshold_label")) == "exact":
-            row["accuracy_delta_q25_vs_exact"] = 0.0
-            row["accuracy_delta_q75_vs_exact"] = 0.0
-            row["accuracy_delta_ci_lower_vs_exact"] = 0.0
-            row["accuracy_delta_ci_upper_vs_exact"] = 0.0
-            continue
-
-        baseline_key = tuple(list(baseline_group) + ["exact", baseline_summary.get("cutoff")])
-        approx_rows_by_exp = detailed_grouped.get(current_group, {})
-        exact_rows_by_exp = detailed_grouped.get(baseline_key, {})
-        common_ids = sorted(set(approx_rows_by_exp).intersection(exact_rows_by_exp))
-        if not common_ids:
-            continue
-
-        diffs = np.asarray(
-            [
-                float(approx_rows_by_exp[exp_id]["correct"]) - float(exact_rows_by_exp[exp_id]["correct"])
-                for exp_id in common_ids
-            ],
-            dtype=float,
-        )
-        if diffs.size == 0:
-            continue
-
-        row["accuracy_delta_q25_vs_exact"] = float(np.quantile(diffs, 0.25))
-        row["accuracy_delta_q75_vs_exact"] = float(np.quantile(diffs, 0.75))
-
-        if diffs.size == 1:
-            delta_value = float(diffs[0])
-            row["accuracy_delta_ci_lower_vs_exact"] = delta_value
-            row["accuracy_delta_ci_upper_vs_exact"] = delta_value
-            continue
-
-        bootstrap_means = np.empty(int(bootstrap_samples), dtype=float)
-        n = int(diffs.size)
-        for idx in range(int(bootstrap_samples)):
-            sample_indices = rng.integers(0, n, size=n)
-            bootstrap_means[idx] = float(np.mean(diffs[sample_indices]))
-
-        row["accuracy_delta_ci_lower_vs_exact"] = float(np.quantile(bootstrap_means, 0.025))
-        row["accuracy_delta_ci_upper_vs_exact"] = float(np.quantile(bootstrap_means, 0.975))
 
 
 def prepare_detailed_rows(raw_runs: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:

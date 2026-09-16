@@ -5,14 +5,12 @@ from typing import Any, Dict
 from pipeline1_analysis import (
     adaptive_topk_search_rows,
     add_exact_baseline_columns,
-    add_paired_accuracy_delta_intervals,
     load_payload_experiments,
     load_payload_runs,
     ordered_threshold_labels,
     prepare_detailed_rows,
     pretty_threshold_label,
     summarize_groups,
-    set_analysis_seed,
     write_csv,
 )
 from pipeline1_config import build_pipeline_context, GLOBAL_CUTOFF_MODE
@@ -46,8 +44,6 @@ from pipeline_support import (
 
 
 def run_visualization_stage(config: Dict[str, Any]) -> None:
-    set_analysis_seed(int(config.get("seed", 42)))
-
     ctx = build_pipeline_context(config)
     threshold_order = ordered_threshold_labels(config)
     cutoff_mode = GLOBAL_CUTOFF_MODE
@@ -70,13 +66,6 @@ def run_visualization_stage(config: Dict[str, Any]) -> None:
         threshold_order=threshold_order,
     )
     add_exact_baseline_columns(summary_by_terms, ["cutoff_mode", "model_id", "n_terms", "threshold_label", "cutoff"])
-    add_paired_accuracy_delta_intervals(
-        summary_by_terms,
-        detailed_rows,
-        ["cutoff_mode", "model_id", "n_terms", "threshold_label", "cutoff"],
-        bootstrap_samples=2000,
-        seed=int(config.get("seed", 42)),
-    )
 
     mode_rows = [row for row in summary_by_terms if str(row.get("cutoff_mode", "global")) == cutoff_mode]
     if not mode_rows:

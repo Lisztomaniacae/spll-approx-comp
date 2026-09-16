@@ -2209,10 +2209,9 @@ def plot_accuracy_delta_vs_cutoff(
         label = str(row.get("threshold_label"))
         if label not in positive_thresholds:
             continue
-        for key in ("accuracy_delta_ci_lower_vs_exact", "accuracy_delta_ci_upper_vs_exact", "accuracy_delta_vs_exact"):
-            value = finite_float_or_none(row.get(key))
-            if value is not None:
-                all_bounds.append(100.0 * float(value))
+        value = finite_float_or_none(row.get("accuracy_delta_vs_exact"))
+        if value is not None:
+            all_bounds.append(100.0 * float(value))
     min_delta = min(all_bounds, default=-5.0)
     y_lower = min(-5.0, 1.10 * min_delta if min_delta < 0.0 else -5.0)
     ylim = (y_lower, 5.0)
@@ -2236,8 +2235,6 @@ def plot_accuracy_delta_vs_cutoff(
                 row_by_label,
                 positive_thresholds,
                 "accuracy_delta_vs_exact",
-                lower_key="accuracy_delta_ci_lower_vs_exact",
-                upper_key="accuracy_delta_ci_upper_vs_exact",
                 value_scale=100.0,
             )
             color = model_styles[model_id]["color"]
@@ -2246,8 +2243,7 @@ def plot_accuracy_delta_vs_cutoff(
                 points,
                 color=color,
                 linewidth=1.9,
-                show_band=True,
-                band_alpha=0.12,
+                show_band=False,
             )
         configure_numeric_cutoff_axis(
             ax,
@@ -2325,14 +2321,9 @@ def plot_predictive_effects_combined(
     for row in summary_rows:
         if str(row.get("threshold_label")) not in approx_thresholds:
             continue
-        for key in (
-            "accuracy_delta_ci_lower_vs_exact",
-            "accuracy_delta_ci_upper_vs_exact",
-            "accuracy_delta_vs_exact",
-        ):
-            value = finite_float_or_none(row.get(key))
-            if value is not None:
-                all_accuracy_bounds.append(100.0 * float(value))
+        value = finite_float_or_none(row.get("accuracy_delta_vs_exact"))
+        if value is not None:
+            all_accuracy_bounds.append(100.0 * float(value))
     min_delta = min(all_accuracy_bounds, default=-5.0)
     max_delta = max(all_accuracy_bounds, default=0.0)
     accuracy_ymin = min(-5.0, 1.10 * min_delta if min_delta < 0.0 else -5.0)
@@ -2370,8 +2361,6 @@ def plot_predictive_effects_combined(
                 row_by_label,
                 approx_thresholds,
                 "accuracy_delta_vs_exact",
-                lower_key="accuracy_delta_ci_lower_vs_exact",
-                upper_key="accuracy_delta_ci_upper_vs_exact",
                 value_scale=100.0,
             )
             plot_cutoff_metric_series(
@@ -2379,8 +2368,7 @@ def plot_predictive_effects_combined(
                 accuracy_points,
                 color=color,
                 linewidth=1.9,
-                show_band=True,
-                band_alpha=0.12,
+                show_band=False,
             )
 
             survival_points = cutoff_series_points(
