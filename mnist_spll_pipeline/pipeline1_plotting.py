@@ -10,6 +10,7 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from matplotlib.patches import ConnectionPatch
 from matplotlib.transforms import blended_transform_factory
 
 from plot_palette import (
@@ -46,8 +47,12 @@ MODEL_MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*"]
 TRADEOFF_REGIME_ORDER = (50, 70, 90)
 TRADEOFF_REGIME_LINESTYLES = {50: ":", 70: "--", 90: "-"}
 TRADEOFF_LINE_WIDTH = 1.95
-TRADEOFF_MARKER_SIZE = 4.2
-TRADEOFF_ADAPTIVE_MARKER_SIZE = 128.0
+TRADEOFF_LINE_ALPHA = 0.80
+TRADEOFF_MARKER_SIZE = 3.15
+TRADEOFF_ADAPTIVE_MARKER_SIZE = 96.0
+TRADEOFF_CONNECTOR_COLOR = "#8A8A8A"
+TRADEOFF_CONNECTOR_ALPHA = 0.55
+TRADEOFF_CONNECTOR_WIDTH = 1.0
 
 
 @dataclass(frozen=True)
@@ -1124,7 +1129,6 @@ def plot_pareto_tradeoff(
     model_styles = build_model_styles(summary_rows)
     speedup_color = TRADEOFF_COLORS["speedup"]
     accuracy_color = TRADEOFF_COLORS["accuracy"]
-    baseline_color = TRADEOFF_COLORS["baseline"]
 
     # Preserve the familiar blue/orange metric colors. The gradient endpoints
     # are only a readability aid between the lowest/highest base-model traces.
@@ -1238,9 +1242,6 @@ def plot_pareto_tradeoff(
         ax = axes[panel_idx]
         ax_right = ax.twinx()
 
-        ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.90, zorder=1)
-        ax_right.axhline(100.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.90, zorder=1)
-
         available_models = [
             str(model_id)
             for model_id in model_ids
@@ -1274,7 +1275,7 @@ def plot_pareto_tradeoff(
                 high_speed,
                 speedup_band_low,
                 speedup_band_high,
-                alpha=0.18,
+                alpha=0.13,
                 zorder=1.2,
             )
 
@@ -1295,9 +1296,28 @@ def plot_pareto_tradeoff(
                 high_accuracy,
                 accuracy_band_low,
                 accuracy_band_high,
-                alpha=0.14,
+                alpha=0.11,
                 zorder=1.2,
             )
+
+        # Pair each mass-targeted point across the two y-axes.  These guides
+        # are deliberately subtle and drawn behind all data marks, so no
+        # additional legend entry is necessary.
+        for model_id in available_models:
+            points = panel_series[(model_id, int(n_terms))]["points"]
+            for point in [item for item in points if bool(item.get("adaptive", False))]:
+                connector = ConnectionPatch(
+                    xyA=(float(point["x"]), float(point["speedup"])),
+                    coordsA=ax.transData,
+                    xyB=(float(point["x"]), float(point["accuracy_retained"])),
+                    coordsB=ax_right.transData,
+                    color=TRADEOFF_CONNECTOR_COLOR,
+                    linewidth=TRADEOFF_CONNECTOR_WIDTH,
+                    linestyle=(0, (4, 3)),
+                    alpha=TRADEOFF_CONNECTOR_ALPHA,
+                    zorder=0.4,
+                )
+                fig.add_artist(connector)
 
         for model_id in available_models:
             series = panel_series[(model_id, int(n_terms))]
@@ -1316,6 +1336,7 @@ def plot_pareto_tradeoff(
                 linewidth=TRADEOFF_LINE_WIDTH,
                 marker="o",
                 markersize=TRADEOFF_MARKER_SIZE,
+                alpha=TRADEOFF_LINE_ALPHA,
                 zorder=2.6,
             )
             ax_right.plot(
@@ -1326,32 +1347,43 @@ def plot_pareto_tradeoff(
                 linewidth=TRADEOFF_LINE_WIDTH,
                 marker="o",
                 markersize=TRADEOFF_MARKER_SIZE,
+                alpha=TRADEOFF_LINE_ALPHA,
                 zorder=2.6,
             )
 
-            adaptive_points = [point for point in points if bool(point.get("adaptive", False))]
-            for point in adaptive_points:
-                star_size = TRADEOFF_ADAPTIVE_MARKER_SIZE
-                ax.scatter(
-                    [float(point["x"])],
-                    [float(point["speedup"])],
-                    marker="*",
-                    s=star_size,
-                    color=speedup_color,
-                    edgecolors="white",
-                    linewidths=0.8,
-                    zorder=5,
-                )
-                ax_right.scatter(
-                    [float(point["x"])],
-                    [float(point["accuracy_retained"])],
-                    marker="*",
-                    s=star_size,
-                    color=accuracy_color,
-                    edgecolors="white",
-                    linewidths=0.8,
-                    zorder=5,
-                )
+        # Where mass-targeted stars nearly coincide, draw order is chosen to
+        # preserve visibility: speedup 90 -> 70 -> 50; accuracy 50 -> 70 -> 90.
+        for pct in (90, 70, 50):
+            for model_id in available_models:
+                if tradeoff_regime_percent(panel_series[(model_id, int(n_terms))]["label"]) != pct:
+                    continue
+                for point in [item for item in panel_series[(model_id, int(n_terms))]["points"] if bool(item.get("adaptive", False))]:
+                    ax.scatter(
+                        [float(point["x"])],
+                        [float(point["speedup"])],
+                        marker="*",
+                        s=TRADEOFF_ADAPTIVE_MARKER_SIZE,
+                        color=speedup_color,
+                        edgecolors="white",
+                        linewidths=0.8,
+                        zorder=5,
+                    )
+
+        for pct in (50, 70, 90):
+            for model_id in available_models:
+                if tradeoff_regime_percent(panel_series[(model_id, int(n_terms))]["label"]) != pct:
+                    continue
+                for point in [item for item in panel_series[(model_id, int(n_terms))]["points"] if bool(item.get("adaptive", False))]:
+                    ax_right.scatter(
+                        [float(point["x"])],
+                        [float(point["accuracy_retained"])],
+                        marker="*",
+                        s=TRADEOFF_ADAPTIVE_MARKER_SIZE,
+                        color=accuracy_color,
+                        edgecolors="white",
+                        linewidths=0.8,
+                        zorder=5,
+                    )
 
         ax.set_title(f"{int(n_terms)} terms", fontsize=THESIS_PANEL_LABEL_SIZE, pad=6)
         configure_numeric_cutoff_axis(
@@ -1360,8 +1392,8 @@ def plot_pareto_tradeoff(
             point_values=all_x_values,
             include_zero=include_zero,
         )
-        ax.set_ylim(0.0, 2.0)
-        ax_right.set_ylim(0.0, 200.0)
+        ax.set_ylim(0.9, 2.1)
+        ax_right.set_ylim(-10.0, 110.0)
         ax.grid(axis="y", alpha=THESIS_GRID_ALPHA)
         ax.grid(axis="x", alpha=0.08)
         ax.set_axisbelow(True)
@@ -1372,23 +1404,23 @@ def plot_pareto_tradeoff(
         # makes the 2x2 layout look misaligned.
         show_right_axis = panel_idx % ncols == ncols - 1
 
-        ax.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0])
+        ax.set_yticks([1.0, 1.2, 1.4, 1.6, 1.8, 2.0])
         if show_left_axis:
             ax.tick_params(axis="y", colors=speedup_color)
             ax.spines["left"].set_color(speedup_color)
             ax.spines["left"].set_linewidth(1.0)
-            ax.set_yticklabels(["0", "0.5", "1.0", "1.5", "2.0"], color=speedup_color)
+            ax.set_yticklabels(["1.0", "1.2", "1.4", "1.6", "1.8", "2.0"], color=speedup_color)
         else:
             ax.tick_params(axis="y", labelleft=False, left=False)
             ax.spines["left"].set_visible(False)
 
-        ax_right.set_yticks([0.0, 50.0, 100.0, 150.0, 200.0])
+        ax_right.set_yticks([0.0, 20.0, 40.0, 60.0, 80.0, 100.0])
         if show_right_axis:
             ax_right.tick_params(axis="y", colors=accuracy_color)
             ax_right.spines["right"].set_visible(True)
             ax_right.spines["right"].set_color(accuracy_color)
             ax_right.spines["right"].set_linewidth(1.0)
-            ax_right.set_yticklabels(["0%", "50%", "100%", "150%", "200%"], color=accuracy_color)
+            ax_right.set_yticklabels(["0%", "20%", "40%", "60%", "80%", "100%"], color=accuracy_color)
         else:
             ax_right.tick_params(axis="y", labelright=False, right=False)
             ax_right.spines["right"].set_visible(False)
@@ -1400,7 +1432,8 @@ def plot_pareto_tradeoff(
             color=speedup_color,
             linewidth=2.6,
             marker="o",
-            markersize=4.8,
+            markersize=TRADEOFF_MARKER_SIZE,
+            alpha=TRADEOFF_LINE_ALPHA,
             label="Speedup",
         ),
         Line2D(
@@ -1409,7 +1442,8 @@ def plot_pareto_tradeoff(
             color=accuracy_color,
             linewidth=2.4,
             marker="o",
-            markersize=4.2,
+            markersize=TRADEOFF_MARKER_SIZE,
+            alpha=TRADEOFF_LINE_ALPHA,
             label="Retained accuracy",
         ),
     ]
@@ -1423,16 +1457,8 @@ def plot_pareto_tradeoff(
             markerfacecolor="#555555",
             markeredgecolor="white",
             linewidth=0.0,
-            markersize=13.5,
+            markersize=10.2,
             label="Mass-targeted (0.8)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color=baseline_color,
-            linestyle="--",
-            linewidth=1.0,
-            label="Exact reference",
         ),
     ]
     place_stacked_panel_legends(
@@ -1511,8 +1537,6 @@ def plot_mnist_lookup_accuracy_tradeoff(
 
     lookup_color = TRADEOFF_COLORS["speedup"]
     accuracy_color = TRADEOFF_COLORS["accuracy"]
-    baseline_color = TRADEOFF_COLORS["baseline"]
-    positive_zone_color = TRADEOFF_COLORS["positive_zone"]
 
     # Same visual family as the accepted runtime–accuracy template.
     lookup_band_low = "#9ecae1"
@@ -1520,7 +1544,6 @@ def plot_mnist_lookup_accuracy_tradeoff(
     accuracy_band_low = "#fdae6b"
     accuracy_band_high = "#a63603"
     model_linestyles = dict(TRADEOFF_REGIME_LINESTYLES)
-    adaptive_sizes = {pct: TRADEOFF_ADAPTIVE_MARKER_SIZE for pct in TRADEOFF_REGIME_ORDER}
 
     def gradient_band(
             ax: Any,
@@ -1610,16 +1633,14 @@ def plot_mnist_lookup_accuracy_tradeoff(
         and (value := cutoff_x_value_for_row(row)) is not None
     ]
 
+    lookup_ticks = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
     right_axes: List[Any] = []
     for panel_idx, (ax, n_terms) in enumerate(zip(panel_axes, term_counts)):
         ax_right = ax.twinx()
         right_axes.append(ax_right)
 
-        # Lookup ratio is inverted so fewer lookups appear upward.  The upper
-        # half therefore represents an improvement over the exact ratio of 1.
-        ax.axhspan(0.0, 1.0, color=positive_zone_color, alpha=0.055, zorder=0)
-        ax.axhline(1.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.9, zorder=1)
-        ax_right.axhline(100.0, color=baseline_color, linestyle="--", linewidth=1.0, alpha=0.9, zorder=1)
+        # Lookup ratio remains inverted so fewer lookups appear upward.
 
         panel_series = {
             pct: series_for(model_by_pct[pct], int(n_terms))
@@ -1646,7 +1667,7 @@ def plot_mnist_lookup_accuracy_tradeoff(
                 [fixed_band_rows[90][value]["lookup_ratio"] for value in common_fixed],
                 lookup_band_low,
                 lookup_band_high,
-                alpha=0.18,
+                alpha=0.13,
             )
             gradient_band(
                 ax_right,
@@ -1655,8 +1676,23 @@ def plot_mnist_lookup_accuracy_tradeoff(
                 [fixed_band_rows[90][value]["accuracy_retained"] for value in common_fixed],
                 accuracy_band_low,
                 accuracy_band_high,
-                alpha=0.14,
+                alpha=0.11,
             )
+
+        for pct in (50, 70, 90):
+            for point in [item for item in panel_series[pct] if bool(item["adaptive"])]:
+                connector = ConnectionPatch(
+                    xyA=(float(point["x"]), float(point["lookup_ratio"])),
+                    coordsA=ax.transData,
+                    xyB=(float(point["x"]), float(point["accuracy_retained"])),
+                    coordsB=ax_right.transData,
+                    color=TRADEOFF_CONNECTOR_COLOR,
+                    linewidth=TRADEOFF_CONNECTOR_WIDTH,
+                    linestyle=(0, (4, 3)),
+                    alpha=TRADEOFF_CONNECTOR_ALPHA,
+                    zorder=0.4,
+                )
+                fig.add_artist(connector)
 
         for pct in (50, 70, 90):
             points = panel_series[pct]
@@ -1675,6 +1711,7 @@ def plot_mnist_lookup_accuracy_tradeoff(
                 linestyle=linestyle,
                 marker="o",
                 markersize=TRADEOFF_MARKER_SIZE,
+                alpha=TRADEOFF_LINE_ALPHA,
                 zorder=2.6,
             )
             ax_right.plot(
@@ -1685,26 +1722,32 @@ def plot_mnist_lookup_accuracy_tradeoff(
                 linestyle=linestyle,
                 marker="o",
                 markersize=TRADEOFF_MARKER_SIZE,
+                alpha=TRADEOFF_LINE_ALPHA,
                 zorder=2.6,
             )
 
-            adaptive_points = [point for point in points if bool(point["adaptive"])]
+        for pct in (90, 70, 50):
+            adaptive_points = [point for point in panel_series[pct] if bool(point["adaptive"])]
             if adaptive_points:
                 ax.scatter(
                     [float(point["x"]) for point in adaptive_points],
                     [float(point["lookup_ratio"]) for point in adaptive_points],
                     marker="*",
-                    s=adaptive_sizes[pct],
+                    s=TRADEOFF_ADAPTIVE_MARKER_SIZE,
                     color=lookup_color,
                     edgecolors="white",
                     linewidths=0.8,
                     zorder=5,
                 )
+
+        for pct in (50, 70, 90):
+            adaptive_points = [point for point in panel_series[pct] if bool(point["adaptive"])]
+            if adaptive_points:
                 ax_right.scatter(
                     [float(point["x"]) for point in adaptive_points],
                     [float(point["accuracy_retained"]) for point in adaptive_points],
                     marker="*",
-                    s=adaptive_sizes[pct],
+                    s=TRADEOFF_ADAPTIVE_MARKER_SIZE,
                     color=accuracy_color,
                     edgecolors="white",
                     linewidths=0.8,
@@ -1718,8 +1761,8 @@ def plot_mnist_lookup_accuracy_tradeoff(
             point_values=all_x_values,
             include_zero=include_zero,
         )
-        ax.set_ylim(2.0, 0.0)
-        ax_right.set_ylim(0.0, 200.0)
+        ax.set_ylim(1.1, -0.1)
+        ax_right.set_ylim(-10.0, 110.0)
         ax.grid(axis="y", alpha=THESIS_GRID_ALPHA)
         ax.grid(axis="x", alpha=0.10)
         ax.set_axisbelow(True)
@@ -1730,23 +1773,23 @@ def plot_mnist_lookup_accuracy_tradeoff(
         # makes the 2x2 layout look misaligned.
         show_right_axis = panel_idx % ncols == ncols - 1
 
-        ax.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0])
+        ax.set_yticks(lookup_ticks)
         if show_left_axis:
             ax.tick_params(axis="y", colors=lookup_color)
             ax.spines["left"].set_color(lookup_color)
             ax.spines["left"].set_linewidth(1.0)
-            ax.set_yticklabels(["0", "0.5", "1.0", "1.5", "2.0"], color=lookup_color)
+            ax.set_yticklabels([f"{value:.1f}" for value in lookup_ticks], color=lookup_color)
         else:
             ax.tick_params(axis="y", labelleft=False, left=False)
             ax.spines["left"].set_visible(False)
 
-        ax_right.set_yticks([0.0, 50.0, 100.0, 150.0, 200.0])
+        ax_right.set_yticks([0.0, 20.0, 40.0, 60.0, 80.0, 100.0])
         if show_right_axis:
             ax_right.tick_params(axis="y", colors=accuracy_color)
             ax_right.spines["right"].set_visible(True)
             ax_right.spines["right"].set_color(accuracy_color)
             ax_right.spines["right"].set_linewidth(1.0)
-            ax_right.set_yticklabels(["0%", "50%", "100%", "150%", "200%"], color=accuracy_color)
+            ax_right.set_yticklabels(["0%", "20%", "40%", "60%", "80%", "100%"], color=accuracy_color)
         else:
             ax_right.tick_params(axis="y", labelright=False, right=False)
             ax_right.spines["right"].set_visible(False)
@@ -1758,7 +1801,8 @@ def plot_mnist_lookup_accuracy_tradeoff(
             color=lookup_color,
             linewidth=2.6,
             marker="o",
-            markersize=4.8,
+            markersize=TRADEOFF_MARKER_SIZE,
+            alpha=TRADEOFF_LINE_ALPHA,
             label="Lookup ratio",
         ),
         Line2D(
@@ -1767,7 +1811,8 @@ def plot_mnist_lookup_accuracy_tradeoff(
             color=accuracy_color,
             linewidth=2.4,
             marker="o",
-            markersize=4.2,
+            markersize=TRADEOFF_MARKER_SIZE,
+            alpha=TRADEOFF_LINE_ALPHA,
             label="Retained accuracy",
         ),
     ]
@@ -1779,10 +1824,9 @@ def plot_mnist_lookup_accuracy_tradeoff(
             color="#555555",
             linewidth=0.0,
             marker="*",
-            markersize=13.5,
+            markersize=10.2,
             label="Mass-targeted (0.8)",
         ),
-        Line2D([0], [0], color=baseline_color, linewidth=1.0, linestyle="--", label="Exact reference"),
     ]
     place_stacked_panel_legends(
         fig,
