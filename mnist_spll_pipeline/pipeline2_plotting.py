@@ -9,8 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.ticker as mticker
 from matplotlib.colors import to_rgb
+from matplotlib.legend_handler import HandlerBase
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 
 from plot_palette import (
     FIGURE_DPI,
@@ -74,6 +75,190 @@ def _mode_compact_label(config: Dict[str, Any], mode_name: str) -> str:
     return str(mode_name).replace("_", " ").capitalize()
 
 
+OUTER_BAR_LEGEND_FACE = "#E4E4E4"
+OUTER_BAR_LEGEND_EDGE = "#6E6E6E"
+INNER_BAR_LEGEND_FACE = "#6C727A"
+INNER_BAR_LEGEND_EDGE = "#555A62"
+LEGEND_CONTEXT_FACE = "#F4F4F4"
+LEGEND_CONTEXT_EDGE = "#CDCDCD"
+
+
+class _DualAxisBarLegendHandle:
+    """Proxy handle for the nested dual-axis bar legend glyph."""
+
+    def __init__(self, *, role: str, label: str) -> None:
+        self.role = str(role)
+        self._label = str(label)
+
+    def get_label(self) -> str:
+        return self._label
+
+
+class _DualAxisBarLegendHandler(HandlerBase):
+    """Draw thesis-specific outer/inner bar legend glyphs.
+
+    The outer-bars key is shown as a solid outer bar. The inner-bars key shows
+    a muted outer bar with a darker inset inner bar, matching the final thesis
+    visual design for the milestone cost plots.
+    """
+
+    def create_artists(
+        self,
+        legend,
+        orig_handle,
+        xdescent,
+        ydescent,
+        width,
+        height,
+        fontsize,
+        trans,
+    ):
+        role = getattr(orig_handle, "role", "outer")
+        outer_x = xdescent
+        outer_y = ydescent + 0.16 * height
+        outer_w = width
+        outer_h = 0.68 * height
+        outer_linewidth = 1.4 if role == "outer" else 1.0
+        outer_face = OUTER_BAR_LEGEND_FACE if role == "outer" else LEGEND_CONTEXT_FACE
+        outer_edge = OUTER_BAR_LEGEND_EDGE if role == "outer" else LEGEND_CONTEXT_EDGE
+
+        outer_rect = Rectangle(
+            (outer_x, outer_y),
+            outer_w,
+            outer_h,
+            facecolor=outer_face,
+            edgecolor=outer_edge,
+            linewidth=outer_linewidth,
+            transform=trans,
+            joinstyle="miter",
+        )
+        artists: List[Any] = [outer_rect]
+
+        if role == "inner":
+            inner_w = 0.56 * outer_w
+            inner_h = 0.58 * outer_h
+            inner_x = outer_x + 0.5 * (outer_w - inner_w)
+            inner_y = outer_y + 0.5 * (outer_h - inner_h)
+            inner_rect = Rectangle(
+                (inner_x, inner_y),
+                inner_w,
+                inner_h,
+                facecolor=INNER_BAR_LEGEND_FACE,
+                edgecolor=INNER_BAR_LEGEND_EDGE,
+                linewidth=1.0,
+                transform=trans,
+                joinstyle="miter",
+            )
+            artists.append(inner_rect)
+
+        return artists
+
+
+def _mode_legend_patch(*, facecolor: str, label: str) -> Patch:
+    return Patch(facecolor=facecolor, edgecolor="none", label=label)
+
+
+def _outer_bars_legend_handle(*, label: str = "Outer bars: optimizer steps") -> _DualAxisBarLegendHandle:
+    return _DualAxisBarLegendHandle(role="outer", label=label)
+
+
+def _inner_bars_legend_handle(label: str) -> _DualAxisBarLegendHandle:
+    return _DualAxisBarLegendHandle(role="inner", label=label)
+
+
+OUTER_BAR_LEGEND_FACE = "#E4E4E4"
+OUTER_BAR_LEGEND_EDGE = "#6E6E6E"
+INNER_BAR_LEGEND_FACE = "#6C727A"
+INNER_BAR_LEGEND_EDGE = "#555A62"
+LEGEND_CONTEXT_FACE = "#F4F4F4"
+LEGEND_CONTEXT_EDGE = "#CDCDCD"
+COMBINED_COST_LEFT_LABEL_X = 0.026
+COMBINED_COST_RIGHT_LABEL_X = 1.14
+
+
+class _DualAxisBarLegendHandle:
+    """Proxy handle for the nested dual-axis bar legend glyph."""
+
+    def __init__(self, *, role: str, label: str) -> None:
+        self.role = str(role)
+        self._label = str(label)
+
+    def get_label(self) -> str:
+        return self._label
+
+
+class _DualAxisBarLegendHandler(HandlerBase):
+    """Draw thesis-specific outer/inner bar legend glyphs.
+
+    The outer-bars key is shown as a solid outer bar. The inner-bars key shows
+    a muted outer bar with a darker inset inner bar, matching the final thesis
+    visual design for the milestone cost plots.
+    """
+
+    def create_artists(
+        self,
+        legend,
+        orig_handle,
+        xdescent,
+        ydescent,
+        width,
+        height,
+        fontsize,
+        trans,
+    ):
+        role = getattr(orig_handle, "role", "outer")
+        outer_x = xdescent
+        outer_y = ydescent + 0.16 * height
+        outer_w = width
+        outer_h = 0.68 * height
+        outer_linewidth = 1.4 if role == "outer" else 1.0
+        outer_face = OUTER_BAR_LEGEND_FACE if role == "outer" else LEGEND_CONTEXT_FACE
+        outer_edge = OUTER_BAR_LEGEND_EDGE if role == "outer" else LEGEND_CONTEXT_EDGE
+
+        outer_rect = Rectangle(
+            (outer_x, outer_y),
+            outer_w,
+            outer_h,
+            facecolor=outer_face,
+            edgecolor=outer_edge,
+            linewidth=outer_linewidth,
+            transform=trans,
+            joinstyle="miter",
+        )
+        artists: List[Any] = [outer_rect]
+
+        if role == "inner":
+            inner_w = 0.56 * outer_w
+            inner_h = 0.58 * outer_h
+            inner_x = outer_x + 0.5 * (outer_w - inner_w)
+            inner_y = outer_y + 0.5 * (outer_h - inner_h)
+            inner_rect = Rectangle(
+                (inner_x, inner_y),
+                inner_w,
+                inner_h,
+                facecolor=INNER_BAR_LEGEND_FACE,
+                edgecolor=INNER_BAR_LEGEND_EDGE,
+                linewidth=1.0,
+                transform=trans,
+                joinstyle="miter",
+            )
+            artists.append(inner_rect)
+
+        return artists
+
+
+def _mode_legend_patch(*, facecolor: str, label: str) -> Patch:
+    return Patch(facecolor=facecolor, edgecolor="none", label=label)
+
+
+def _outer_bars_legend_handle(*, label: str = "Outer bars: optimizer steps") -> _DualAxisBarLegendHandle:
+    return _DualAxisBarLegendHandle(role="outer", label=label)
+
+
+def _inner_bars_legend_handle(label: str) -> _DualAxisBarLegendHandle:
+    return _DualAxisBarLegendHandle(role="inner", label=label)
+
+
 def _flatten_legend_blocks(
     legend_blocks: Sequence[Tuple[Sequence[Any], str | None, int]],
 ) -> List[Any]:
@@ -109,6 +294,7 @@ def _draw_grouped_legend_box(
         labelspacing=0.64,
         handlelength=1.9,
         handletextpad=0.65,
+        handler_map={_DualAxisBarLegendHandle: _DualAxisBarLegendHandler()},
     )
     style_legend_frame(legend)
 
@@ -164,6 +350,7 @@ def _draw_horizontal_grouped_legend_box(
         handlelength=1.9,
         handletextpad=0.65,
         columnspacing=1.00,
+        handler_map={_DualAxisBarLegendHandle: _DualAxisBarLegendHandler()},
     )
     style_legend_frame(legend)
 
@@ -1137,11 +1324,16 @@ def _draw_checkpoint_cost_panel(
                 zorder=5,
             )
         mode_handles.append(
-            Patch(facecolor=inner_color, edgecolor="none", label=_mode_compact_label(config, mode_name))
+            _mode_legend_patch(facecolor=inner_color, label=_mode_compact_label(config, mode_name))
         )
 
     ax.set_ylim(0.0, left_top)
     ax_right.set_ylabel(right_label)
+    ax_right.yaxis.set_label_coords(
+        COMBINED_COST_RIGHT_LABEL_X,
+        0.5,
+        transform=ax.transAxes,
+    )
     ax.set_title(panel_label, loc="left", fontsize=THESIS_PANEL_LABEL_SIZE - 1.0, pad=5)
     ax.set_xticks(x_positions)
     interval_starts = [0.0, *milestones[:-1]]
@@ -1209,8 +1401,8 @@ def _plot_combined_dual_axis_checkpoint_costs(
         return
 
     encoding_handles: List[Any] = [
-        Patch(facecolor=LIGHT_GREY, edgecolor=MID_GREY, linewidth=1.0, label="Optimizer steps (outer)"),
-        Patch(facecolor=MID_GREY, edgecolor="#44515F", linewidth=1.0, label="Inner bars"),
+        _outer_bars_legend_handle(),
+        _inner_bars_legend_handle("Inner bars: cost (right axis)"),
     ]
     if unreached_top or unreached_bottom:
         encoding_handles.append(
@@ -1230,7 +1422,11 @@ def _plot_combined_dual_axis_checkpoint_costs(
         entry_fontsize=THESIS_LEGEND_SIZE - 0.2,
     )
     fig.supxlabel("True-sum probability milestone interval", y=0.030, fontsize=THESIS_PANEL_LABEL_SIZE - 1.0)
-    fig.supylabel("Optimizer steps", x=0.034, fontsize=THESIS_PANEL_LABEL_SIZE - 1.0)
+    fig.supylabel(
+        "Optimizer steps",
+        x=COMBINED_COST_LEFT_LABEL_X,
+        fontsize=THESIS_PANEL_LABEL_SIZE - 1.0,
+    )
     fig.subplots_adjust(left=0.13, right=0.87, top=0.79, bottom=0.12, hspace=0.31)
     ensure_dir(output_path.parent)
     fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.08)
@@ -1375,7 +1571,7 @@ def _plot_dual_axis_checkpoint_bars(
             )
 
         mode_handles.append(
-            Patch(facecolor=inner_color, edgecolor="none", label=_mode_compact_label(config, mode_name))
+            _mode_legend_patch(facecolor=inner_color, label=_mode_compact_label(config, mode_name))
         )
 
     ax.set_ylim(0.0, left_top)
@@ -1399,18 +1595,8 @@ def _plot_dual_axis_checkpoint_bars(
     ax.spines["right"].set_visible(False)
     ax_right.spines["top"].set_visible(False)
 
-    step_metric_handle = Patch(
-        facecolor=LIGHT_GREY,
-        edgecolor=MID_GREY,
-        linewidth=1.0,
-        label="Optimizer steps (outer)",
-    )
-    time_metric_handle = Patch(
-        facecolor=MID_GREY,
-        edgecolor="#44515F",
-        linewidth=1.0,
-        label="Wall-clock time (inner)",
-    )
+    step_metric_handle = _outer_bars_legend_handle()
+    time_metric_handle = _inner_bars_legend_handle("Inner bars: wall-clock time")
     has_unreached = any(
         not bool(data["reached_by_milestone"].get(float(milestone), False))
         for data in series
@@ -1586,7 +1772,7 @@ def _plot_dual_axis_checkpoint_model_evaluation_bars(
             )
 
         mode_handles.append(
-            Patch(facecolor=inner_color, edgecolor="none", label=_mode_compact_label(config, mode_name))
+            _mode_legend_patch(facecolor=inner_color, label=_mode_compact_label(config, mode_name))
         )
 
     ax.set_ylim(0.0, left_top)
@@ -1610,18 +1796,8 @@ def _plot_dual_axis_checkpoint_model_evaluation_bars(
     ax.spines["right"].set_visible(False)
     ax_right.spines["top"].set_visible(False)
 
-    step_metric_handle = Patch(
-        facecolor=LIGHT_GREY,
-        edgecolor=MID_GREY,
-        linewidth=1.0,
-        label="Optimizer steps (outer)",
-    )
-    evaluation_metric_handle = Patch(
-        facecolor=MID_GREY,
-        edgecolor="#44515F",
-        linewidth=1.0,
-        label="Neural model evaluations (inner)",
-    )
+    step_metric_handle = _outer_bars_legend_handle()
+    evaluation_metric_handle = _inner_bars_legend_handle("Inner bars: neural model evaluations")
     has_unreached = any(
         not bool(data["reached_by_milestone"].get(float(milestone), False))
         for data in series
